@@ -1,0 +1,64 @@
+name: Build Windows Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version used to name the artifacts, e.g. 1.0.0"
+        required: false
+        default: "1.0.0"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build installer + zip (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller (onedir)
+        run: pyinstaller --noconfirm --clean GIFManager.spec
+
+      - name: Prepare release directory
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force release | Out-Null
+
+      - name: Create portable ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist\GIFManager" `
+            -DestinationPath "release\GIFManager-${{ inputs.version }}-win64.zip" -Force
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            "/DMyAppVersion=${{ inputs.version }}" `
+            "installer\GIFManager.iss"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: GIFManager-${{ inputs.version }}
+          path: |
+            release/GIFManager-${{ inputs.version }}-win64.zip
+            release/GIFManager-Setup-${{ inputs.version }}.exe
+          if-no-files-found: error
