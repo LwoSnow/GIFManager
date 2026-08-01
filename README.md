@@ -64,9 +64,9 @@ manage them in groups, and send them to any chat window in one click.
 |                                                                  |
 |   [GIF1]   [GIF2]   [GIF3]   [GIF4]    ← image stickers (grid,   |
 |   [GIF5]   [GIF6]   ...                 masonry columns)         |
-|   ┌──────────────────┐                                            |
-|   │ (｡•̀ᴗ-)✧       │  ← text stickers (compact cards)         |
-|   └──────────────────┘                                            |
+|   ┌──────────────────┐                                           |
+|   │ (｡•̀ᴗ-)✧         │  ← text stickers (compact cards)          |
+|   └──────────────────┘                                           |
 |                                                                  |
 +------------------------------------------------------------------+
 |  All | Default | Memes | Pets | Kaomoji |  ＋                    |  ← bottom group tabs
