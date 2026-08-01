@@ -1,6 +1,7 @@
 """Data management SQLite & file management
 数据管理 SQLite & 文件管理"""
 import os
+import sys
 import shutil
 import uuid
 import hashlib
@@ -19,15 +20,23 @@ def _is_valid_group_name(name):
 def _app_data_dir():
     # Prioritize using the root directory of the project / 优先使用项目根目录下的 data/
     candidates = []
-    d = os.path.dirname(os.path.abspath(__file__))  # app/models
-    d = os.path.dirname(d)  # app
-    d = os.path.dirname(d)  # root
-    candidates.append(os.path.join(d, "data"))
+    if getattr(sys, "frozen", False):
+        # PyInstaller 打包版：数据写在 exe 同级（便携场景），
+        # 安装版（如 Program Files 不可写）自动回退到用户文档目录
+        candidates.append(os.path.join(os.path.dirname(sys.executable), "data"))
+    else:
+        d = os.path.dirname(os.path.abspath(__file__))  # app/models
+        d = os.path.dirname(d)  # app
+        d = os.path.dirname(d)  # root
+        candidates.append(os.path.join(d, "data"))
     candidates.append(
         os.path.join(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation), "GIFManager")
     )
     for c in candidates:
-        os.makedirs(c, exist_ok=True)
+        try:
+            os.makedirs(c, exist_ok=True)
+        except OSError:
+            continue  # 无写权限（如安装到 Program Files）则尝试下一个候选
         if os.path.isdir(c):
             return c
     return candidates[-1]
@@ -91,13 +100,24 @@ class DataManager:
         self._ensure_builtin("Default Expression", "image", 1)
 
     def _ensure_builtin(self, name, grp_type, sort_order):
-        cur = self._conn.execute("SELECT id FROM groups WHERE is_builtin=1 AND name=?", (name,))
-        if cur.fetchone() is None:
+        cur = self._conn.execute("SELECT id, name FROM groups WHERE is_builtin=1 AND sort_order=?", (sort_order,))
+        row = cur.fetchone()
+        if row is None:
             self._conn.execute(
                 "INSERT INTO groups (name, type, sort_order, is_builtin) VALUES (?,?,?,1)",
                 (name, grp_type, sort_order)
             )
             self._conn.commit()
+        elif row["name"] != name:
+            self._conn.execute("UPDATE groups SET name=? WHERE id=?", (name, row["id"]))
+            self._conn.commit()
+            old_dir = os.path.join(self._emojis_dir, row["name"])
+            new_dir = os.path.join(self._emojis_dir, name)
+            if os.path.isdir(old_dir) and not os.path.isdir(new_dir):
+                try:
+                    os.rename(old_dir, new_dir)
+                except OSError:
+                    pass
 
     @property
     def data_dir(self):

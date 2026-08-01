@@ -374,7 +374,7 @@ class MainWindow(QMainWindow):
         # Otherwise, get_emojis_by_group(all_id) will only find the emoticons under the name "All" (always empty).
         # "All"是虚拟聚合分组：其数据库 id 等价于"未选中任何分组"，
         # 否则会走 get_emojis_by_group(全部_id) 只查到"All"名下（恒为空）的表情。
-        all_g = self.data_manager.get_group_by_name(tr("all_group"))
+        all_g = self.data_manager.get_group_by_name("All")
         if all_g is not None and group_id == all_g["id"]:
             group_id = None
         self.current_group_id = group_id
@@ -427,7 +427,7 @@ class MainWindow(QMainWindow):
         if gid is None:
             keyword = self.search_bar.text().strip()
             shown = len(self.data_manager.get_all_emojis(keyword))
-            group_name = tr("all_group")
+            group_name = "All"
             if not keyword:
                 image_total = self.data_manager.count_image_emojis()
                 folded = image_total - shown
@@ -439,7 +439,7 @@ class MainWindow(QMainWindow):
             count = shown
         else:
             g = self.data_manager.get_group(gid)
-            group_name = g["name"] if g else tr("all_group")
+            group_name = g["name"] if g else "All"
             count = self.data_manager.count_emojis_in_group(gid)
         self.status_bar.showMessage(
             f"  {tr('emoji_count', group=group_name, count=count, total=total)}"
@@ -475,7 +475,7 @@ class MainWindow(QMainWindow):
     def _do_import(self, files):
         target_group = self.current_group_id
         if target_group is None:
-            default = self.data_manager.get_group_by_name(tr("default_group"))
+            default = self.data_manager.get_group_by_name("Default Expression")
             if default is None:
                 QMessageBox.warning(self, "GIFManager", tr("default_group_missing"))
                 return

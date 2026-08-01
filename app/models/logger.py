@@ -12,9 +12,23 @@ def _root_dir():
 
 
 def logs_dir():
-    logs = os.path.join(_root_dir(), "logs")
-    os.makedirs(logs, exist_ok=True)
-    return logs
+    candidates = []
+    if getattr(sys, "frozen", False):
+        # PyInstaller 打包版：优先 %LOCALAPPDATA%（安装到 Program Files 也可写），
+        # 其次 exe 同级（便携场景）
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            candidates.append(os.path.join(local, "GIFManager", "logs"))
+        candidates.append(os.path.join(os.path.dirname(sys.executable), "logs"))
+    else:
+        candidates.append(os.path.join(_root_dir(), "logs"))
+    for c in candidates:
+        try:
+            os.makedirs(c, exist_ok=True)
+            return c
+        except OSError:
+            continue  # 无写权限则尝试下一个候选
+    return candidates[-1]
 
 
 _logger = None
