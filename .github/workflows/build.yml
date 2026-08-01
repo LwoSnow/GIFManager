@@ -1,3 +1,17 @@
+# GitHub Actions — 手动构建 Windows 发布包
+#
+# 触发方式：
+#   GitHub 仓库页面 → Actions → "Build Windows Package" → Run workflow
+#   （可在输入框中指定版本号，默认 1.0.0）
+#
+# 产物（在 workflow 运行结果页的 Artifacts 中下载）：
+#   - release/GIFManager-<version>-win64.zip        便携压缩包（解压即用）
+#   - release/GIFManager-Setup-<version>.exe        Inno Setup 安装包
+#
+# 本地复现：
+#   pip install -r requirements.txt pyinstaller
+#   pyinstaller --noconfirm --clean GIFManager.spec
+
 name: Build Windows Package
 
 on:
@@ -24,7 +38,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
 
       - name: Install dependencies
         run: |
