@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 构建产物
+build/
+dist/
+release/
+*.spec.bak
+
+# 运行时数据（由程序自动创建）
+data/
+logs/
+
+# IDE
+.idea/
+.vscode/
+
+# 测试输出
+tests/output/
