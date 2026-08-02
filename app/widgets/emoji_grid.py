@@ -1,4 +1,5 @@
-"""表情包网格 — FlowLayout 自适应网格 + 居中占位层"""
+"""Emoji grid
+表情包网格"""
 from PySide6.QtWidgets import (
     QWidget, QLayout, QLayoutItem, QSizePolicy, QLabel, QVBoxLayout,
 )
@@ -21,28 +22,32 @@ def _grid_log():
     return _GRID_LOG
 
 
+# Fluid layout with adaptive column number / 自适应列数的流式布局
 class FlowLayout(QLayout):
-    """自适应列数的流式布局"""
 
     def __init__(self, parent=None, margin=8, spacing=8):
         super().__init__(parent)
         self._items = []
         self._margin = margin
         self._spacing = spacing
-        self._masonry = False  # True = 俄罗斯方块式紧凑堆叠
-        self._suppress_invalidate = False  # 批量增删期间抑制 LayoutRequest 事件风暴
+        self._masonry = False  # True = Tetris-style compact stacking / 俄罗斯方块式紧凑堆叠
+        # Suppress LayoutRequest events during batch add/remove (load_emojis rebuild)
+        # 批量增删（load_emojis 重建）期间抑制 LayoutRequest 事件
+        self._suppress_invalidate = False
         if parent:
             self.setContentsMargins(margin, margin, margin, margin)
             self.setSpacing(spacing)
 
     def invalidate(self):
-        # 批量操作（load_emojis 重建）时抑制逐次 postEvent，最后统一布局一次
+        # Suppress sequential postEvent during batch operation (load_emojis reconstruction)
+        # 批量操作（load_emojis 重建）时抑制逐次 postEvent
         if self._suppress_invalidate:
             return
         super().invalidate()
 
     def set_masonry(self, enabled):
-        """切换 masonry（紧凑堆叠）模式：卡片放入当前最短列，不按行对齐"""
+        # Toggle masonry mode: cards are placed in the current shortest column, not aligned by rows
+        # 切换 紧凑堆叠 模式：卡片放入当前最短列，不按行对齐
         if self._masonry != enabled:
             self._masonry = enabled
             self.invalidate()
@@ -81,8 +86,9 @@ class FlowLayout(QLayout):
         self._do_layout(rect, test_only=False)
 
     def sizeHint(self):
-        """返回实际布局高度（关键：滚动区域依赖此值判断内容高度；
-        minimumSize 只是单卡尺寸并集，会导致滚动范围不足、底部被裁）"""
+        # Returns the actual layout height (the scrolling area relies on this value
+        # to determine the content height)
+        # 返回实际布局高度（滚动区域依赖此值判断内容高度）
         pw = self.parentWidget()
         if pw is not None:
             w = max(pw.width(), 10)
@@ -91,12 +97,6 @@ class FlowLayout(QLayout):
         return self.minimumSize()
 
     def relayout(self):
-        """强制用父容器当前尺寸重新布局。
-
-        Qt 的 QLayout::activate() 在布局几何与父容器尺寸一致时（增删
-        item 但容器大小未变）会短路，不会调用 setGeometry，导致新加入的
-        item 不被布局。这里显式用当前尺寸重排所有 item。
-        """
         pw = self.parentWidget()
         if pw is None:
             return
@@ -126,10 +126,14 @@ class FlowLayout(QLayout):
             wid = item.widget()
             if not wid:
                 continue
-            # 注意：QLayoutItem.sizeHint() 对 isHidden() 的 widget（新卡片
-            # 尚未显示）返回 (0,0)，必须用 widget 自身的尺寸接口。
-            # 固定尺寸（min==max）用 minimumSize，可变宽度（文字卡片）
-            # 用 sizeHint，保证 hidden 状态下也能得到正确尺寸。
+            # Note: QLayoutItem.sizeHint() returns (0,0) for the widget of isHidden()
+            # (the new card has not yet been displayed)
+            # and the widget's own size interface must be used.
+            # Use minimumSize for fixed size (min==max)
+            # and sizeHint for variable width (text card) to ensure that the correct size
+            # can be obtained in the hidden state.
+            # 注意：QLayoutItem.sizeHint() 对 isHidden() 的 widget（新卡片尚未显示）返回 (0,0)，必须用 widget 自身的尺寸接口。
+            # 固定尺寸（min==max）用 minimumSize，可变宽度（文字卡片）用 sizeHint，保证 hidden 状态下也能得到正确尺寸。
             mn = wid.minimumSize()
             mx = wid.maximumSize()
             hint = mn if mn == mx else wid.sizeHint()
@@ -144,9 +148,6 @@ class FlowLayout(QLayout):
                 row_height = 0
 
             if not test_only:
-                # 直接用 QWidget.setGeometry：QWidgetItem.setGeometry 对
-                # isHidden() 的 widget（新卡片尚未显示）会因 isEmpty() 直接
-                # 返回而不生效，导致新卡片停留在 (0,0) 造成重叠。
                 wid.setGeometry(QRect(x, y, w, h))
 
             x += w + spacing
@@ -155,7 +156,6 @@ class FlowLayout(QLayout):
         return y + row_height + m.bottom()
 
     def _grid_widget(self):
-        """向上找到 EmojiGridWidget（数据驱动布局的宿主）"""
         pw = self.parentWidget()
         if pw is not None:
             gp = pw.parentWidget()
@@ -164,6 +164,8 @@ class FlowLayout(QLayout):
         return None
 
     def _do_masonry(self, rect: QRect, test_only=False):
+        # Data-driven layout (_items under lazy loading only contains visible cards,
+        # and the position must be calculated from the full amount of data)
         # 数据驱动布局（懒加载下 _items 只含可见卡，必须由全量数据计算位置）
         grid = self._grid_widget()
         if grid is not None and grid._data:
@@ -171,11 +173,10 @@ class FlowLayout(QLayout):
         return self._do_masonry_legacy(rect, test_only)
 
     def _do_masonry_legacy(self, rect: QRect, test_only=False):
-        """稳定列堆叠（全量 _items 兜底实现，正常情况下由数据驱动版本接管）"""
         m = self.contentsMargins()
         usable = max(rect.width() - m.left() - m.right(), 10)
         spacing = self._spacing
-
+        # Group by col_index (stable column members, no inference from layout)
         # 按 col_index 分组（稳定列成员，不从布局反推）
         col_map = {}
         for item in self._items:
@@ -186,7 +187,7 @@ class FlowLayout(QLayout):
             col_map.setdefault(ci, []).append((item, wid))
         if not col_map:
             return m.top() + m.bottom()
-        # 列内按 sort_order 排序
+        # Sort by sort_order within the column / 列内按 sort_order 排序
         for ci in col_map:
             col_map[ci].sort(key=lambda e: int(e[0].widget()._emoji.get("sort_order", 0)))
 
@@ -194,16 +195,13 @@ class FlowLayout(QLayout):
         y_max = m.top()
         for ci in sorted(col_map):
             col_entries = col_map[ci]
-            # 该列独立列宽
             nw_list = []
             for item, wid in col_entries:
                 if isinstance(wid, EmojiItem) and wid._is_text:
                     nw_list.append(wid.text_natural_width(wid._emoji.get("text_content", "")))
                 else:
-                    # 图片卡片固定尺寸；hidden 时 width() 可能不准，用 minimumSize 兜底
                     nw_list.append(max(wid.width(), wid.minimumSize().width(), 10))
             col_w = max(80, min(max(nw_list), usable))
-            # 所有列都布局（不跳过），超出可视部分由横向滚动展示
             cy = m.top()
             for item, wid in col_entries:
                 if isinstance(wid, EmojiItem) and wid._is_text:
@@ -219,12 +217,13 @@ class FlowLayout(QLayout):
                 cy += h + spacing
             y_max = max(y_max, cy - spacing)
             x += col_w + spacing
-
+        # Set the minimum width of the container = the total width of all columns
+        # and trigger horizontal scrolling when it exceeds the visible area
+        # (stable columns will not be rearranged)
         # 设置容器最小宽度 = 全部列总宽，超出可视区时触发横向滚动（稳定列不重排）
         pw = self.parentWidget()
         if pw is not None and not test_only:
             pw.setMinimumWidth(max(0, x - spacing) + m.right())
-            # 向上冒泡：让 QScrollArea 感知内容变宽
             gp = pw.parentWidget()
             if gp is not None:
                 gp.updateGeometry()
@@ -233,42 +232,44 @@ class FlowLayout(QLayout):
 
 
 class EmojiGridWidget(QWidget):
-    """表情包网格容器 — 有内容时 FlowLayout 网格，无内容时居中占位文字"""
 
     emoji_clicked = Signal(dict)
     emoji_right_clicked = Signal(dict, QPoint)
-    emojis_reordered = Signal()  # 内部排序完成，通知重载
+    emojis_reordered = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._dm = None
         self._items = []
-        self._data = []  # 当前视图全量数据（懒加载布局依据）
+        self._data = []
         self._preview_limits = (100, 200)
-        self._lazy_buffer = 300  # 懒加载上下缓冲像素
-        self.current_group_id = None  # 当前分组（None = 全部，不参与排序）
-        self._gif_limit = 8  # 同时播放的 GIF 数（由多线程核心数设置驱动，核心数×2）
+        self._lazy_buffer = 300  # Lazy loading of upper and lower buffer pixels / 懒加载上下缓冲像素
+        # Current group (None = All, not involved in sorting) / 当前分组（None = All，不参与排序）
+        self.current_group_id = None
+        # Number of GIFs played simultaneously (driven by the multi-threaded core-count
+        # setting, core count × 2)
+        # 同时播放的 GIF 数（由多线程核心数设置驱动，核心数×2）
+        self._gif_limit = 8
         self._playing_gifs = set()
-        self._drop_index = -1  # 图片分组：拖拽插入位置指示（-1 = 不显示）
-        self._drop_col = -1    # 文字分组：目标列
-        self._drop_order = 0   # 文字分组：列内插入位置
+        # Emoji grouping: drag-drop insertion position indicator (-1 = not displayed)
+        # 图片分组：拖拽插入位置指示（-1 = 不显示）
+        self._drop_index = -1
+        self._drop_col = -1    # Text grouping: target column / 文字分组：目标列
+        self._drop_order = 0   # Text grouping: insertion position within column / 文字分组：列内插入位置
         self._is_text_group = False
         self.setAcceptDrops(True)
 
-        # 融合防抖：resize 风暴（拖拽窗口边缘）期间只触发一次融合检查
         self._merge_timer = QTimer(self)
         self._merge_timer.setSingleShot(True)
         self._merge_timer.setInterval(150)
         self._merge_timer.timeout.connect(self._check_column_merge)
 
-        # 异步缩略图：统一接收完成信号并分发给对应卡片（只连接一次）
+        # Asynchronous thumbnails / 异步缩略图
         _loader.done.connect(self._on_thumb_ready)
 
-        # 外层垂直布局，包含占位文字层
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
 
-        # 占位文字（居中）
         self._placeholder = QLabel(self)
         self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._placeholder.setWordWrap(True)
@@ -278,13 +279,11 @@ class EmojiGridWidget(QWidget):
         self._placeholder.hide()
         outer.addWidget(self._placeholder)
 
-        # FlowLayout 区域
         self._flow_container = QWidget(self)
         self._flow = FlowLayout(self._flow_container, margin=10, spacing=8)
         outer.addWidget(self._flow_container, 1)
 
     def _on_thumb_ready(self, key, img):
-        """后台缩略图解码完成：写入缓存并分发给所有等待该图的卡片"""
         if img.isNull():
             return
         pix = QPixmap.fromImage(img)
@@ -296,13 +295,11 @@ class EmojiGridWidget(QWidget):
     def set_data_manager(self, dm):
         self._dm = dm
 
-    # ------------------------------------------------------------------
-    # 数据驱动 masonry 布局（懒加载：_items 只含可见卡，位置由全量数据计算）
-    # ------------------------------------------------------------------
-
     def _masonry_layout_data(self, usable):
-        """基于 self._data 全量计算 masonry 布局。
-        返回 (rects: {emoji_id: (x,y,w,h)}, total_w, total_h, col_info)"""
+        # Calculate the masonry layout in full based on self._data and return
+        # (rects: {emoji_id: (x,y,w,h)}, total_w, total_h, col_info)
+        # 基于 self._data 全量计算 masonry 布局，
+        # 返回 (rects: {emoji_id: (x,y,w,h)}, total_w, total_h, col_info)
         m = self._flow.contentsMargins()
         spacing = self._flow.spacing()
         cols = {}
@@ -312,7 +309,6 @@ class EmojiGridWidget(QWidget):
             cols[ci].sort(key=lambda e: int(e.get("sort_order", 0)))
         if not cols:
             return {}, 0, m.top() + m.bottom(), {}
-        # 列宽（内容自然宽，clamp 到可用宽）
         col_widths = {}
         for ci, lst in cols.items():
             nw = max(
@@ -321,14 +317,12 @@ class EmojiGridWidget(QWidget):
                 for e in lst
             )
             col_widths[ci] = max(80, min(nw, usable))
-        # 列 x 位置
         x = m.left()
         col_x = {}
         for ci in sorted(cols):
             col_x[ci] = x
             x += col_widths[ci] + spacing
         total_w = max(0, x - spacing) + m.right()
-        # 卡片位置（预估高度）
         rects = {}
         col_h = {}
         for ci in sorted(cols):
@@ -348,13 +342,11 @@ class EmojiGridWidget(QWidget):
         }
 
     def _do_masonry_data(self, rect, test_only=False):
-        """数据驱动 masonry：按全量数据计算位置，只对已创建卡片 setGeometry"""
         m = self._flow.contentsMargins()
         spacing = self._flow.spacing()
         usable = max(rect.width() - m.left() - m.right(), 10)
         _rects, total_w, total_h, info = self._masonry_layout_data(usable)
         if not test_only:
-            # 已创建卡按列逐张布局（实际高度累加，reflow 文字卡）
             by_col = {}
             for card in self._items:
                 by_col.setdefault(int(card._emoji.get("col_index", 0)), []).append(card)
@@ -383,8 +375,7 @@ class EmojiGridWidget(QWidget):
         return max(self._viewport_width() - 20, 10)
 
     def _ensure_visible(self):
-        """懒加载：创建当前可视区域（含缓冲）内的卡片，滚动时增量创建。
-        只增不销毁；已创建卡复用。"""
+        # Lazy loading / 懒加载
         if not self._data or self.current_group_id is None:
             return
         sc = self._find_scroll()
@@ -415,12 +406,9 @@ class EmojiGridWidget(QWidget):
             self._flow.invalidate()
             self._flow.activate()
             self._flow.relayout()
-            # 新卡就位后更新可见 GIF 播放集合（懒加载创建的底部卡片）
             self._update_visible_gifs()
 
     def _ensure_scroll_connected(self):
-        """连接滚动条：valueChanged（滚动）与 rangeChanged（内容高度变化后滚动条
-        范围更新，懒加载初始 range=0 时 setValue 不会触发 valueChanged）"""
         if getattr(self, "_scroll_connected", False):
             return
         sc = self._find_scroll()
@@ -434,8 +422,6 @@ class EmojiGridWidget(QWidget):
         self._scroll_connected = True
 
     def _update_visible_gifs(self):
-        """可见区域 GIF 自动播放：只渲染可视卡片内的动图，最多同时播放
-        _gif_limit 个（= 多线程核心数 × 2），其余显示静态首帧缩略图。"""
         if not self._items:
             return
         sc = self._find_scroll()
@@ -463,7 +449,6 @@ class EmojiGridWidget(QWidget):
                 new_playing.add(id(card))
             elif id(card) in playing:
                 card.stop_animation()
-        # 之前播放、现已不可见或超限的卡片停止动画
         for cid in playing - new_playing:
             for card in self._items:
                 if id(card) == cid:
@@ -472,20 +457,14 @@ class EmojiGridWidget(QWidget):
         self._playing_gifs = new_playing
 
     def load_emojis(self, emojis, group_type="image", preview_limits=(100, 200)):
-        """加载表情包。空列表时显示占位文字。
-        preview_limits: (单行预览上限, 多行预览上限) """
         self._is_text_group = (group_type == "text")
-        # 先清空 FlowLayout 的 QWidgetItem 包装（关键：deleteLater 不会自动移除）
-        # 批量抑制 invalidate：避免 takeAt/addWidget 逐次 post LayoutRequest 事件风暴
         self._flow._suppress_invalidate = True
         try:
             while self._flow.count() > 0:
                 self._flow.takeAt(0)
-            # （旧卡片的复用 / 停止动画 / 删除由下方统一处理）
 
             if not emojis:
                 self._flow_container.hide()
-                # 清空旧数据/卡片（避免空分组残留旧内容占用内存与误触发融合检查）
                 self._data = []
                 for card in self._items:
                     card._stop_gif()
@@ -501,8 +480,6 @@ class EmojiGridWidget(QWidget):
 
             self._placeholder.hide()
             self._flow_container.show()
-            # 具体分组（图片/文字）用 masonry 列堆叠（列成员由 col_index 持久化，
-            # 窗口 resize 只触发列融合不重排）；"全部"聚合视图保持流式布局
             self._flow.set_masonry(self.current_group_id is not None)
             self._data = list(emojis)
             self._preview_limits = preview_limits
@@ -510,7 +487,6 @@ class EmojiGridWidget(QWidget):
             dm = self._find_data_manager()
 
             if self.current_group_id is None:
-                # "全部"聚合视图：全量创建（流式布局，无懒加载）
                 old_cards = {card._emoji.get("id"): card for card in self._items}
                 new_items = []
                 for em in emojis:
@@ -528,47 +504,45 @@ class EmojiGridWidget(QWidget):
                     card.deleteLater()
                 self._items = new_items
             else:
-                # 具体分组：懒加载——只保留仍存在的旧卡（复用），可见区域增量创建
                 keep_ids = {em.get("id") for em in emojis}
                 emap = {em.get("id"): em for em in emojis}
                 survivors = []
                 for card in self._items:
                     cid = card._emoji.get("id")
                     if cid in keep_ids:
-                        card._emoji = emap[cid]  # 更新列/序等数据
+                        card._emoji = emap[cid]
                         survivors.append(card)
                     else:
                         card._stop_gif()
                         card.deleteLater()
                 self._items = survivors
                 self._ensure_scroll_connected()
-                # 创建可视区域内的卡片（懒加载，只增不销毁）
                 self._ensure_visible()
         finally:
             self._flow._suppress_invalidate = False
 
         self._flow.invalidate()
         self._flow.activate()
-        # 容器尺寸未变时 Qt 的 activate() 不会重排新 item，显式强制重排
         self._flow.relayout()
-        # 强制向上冒泡：更新容器几何 → 触发 QScrollArea 重新布局
         self._flow_container.updateGeometry()
         self.updateGeometry()
 
-        # 初始加载后检查列融合（窗口窄时无法完整显示的列自动并入前列）
         if self.current_group_id is not None:
             QTimer.singleShot(0, self._check_column_merge)
-        # 布局完成后更新可见 GIF 播放集合
         QTimer.singleShot(0, self._update_visible_gifs)
 
+    # After loading/resizing, check whether columns that cannot be fully shown should be merged
+    # into the front ones (lightweight internal refresh, no rebuild)
+    # 加载/调整后检查：无法完整显示的列融合进前列（内部轻量刷新，不重建）
     def _check_column_merge(self):
-        """加载/调整后检查：无法完整显示的列融合进前列（内部轻量刷新，不重建）"""
         if self.current_group_id is not None and self._data:
             self._merge_overflow_columns()
 
+    # Lightweight refresh after merge / drag reorder (write-back to DB): update all data and
+    # already-created cards, then relayout; avoids jank from a full rebuild (QPixmap re-decoding)
+    # 融合/拖拽写库后轻量刷新：更新全量数据与已创建卡片并重新布局，
+    # 避免全量重建（QPixmap 重新解码）造成卡顿。
     def _refresh_cards_after_merge(self):
-        """融合/拖拽写库后轻量刷新：更新全量数据与已创建卡片并重新布局，
-        避免全量重建（QPixmap 重新解码）造成卡顿。"""
         dm = self._find_data_manager()
         if dm is None:
             return
@@ -585,7 +559,7 @@ class EmojiGridWidget(QWidget):
         self._flow_container.updateGeometry()
         self.updateGeometry()
         self._ensure_visible()
-        # 位置变化后刷新可见 GIF 播放集合
+        # Refresh the visible GIF play set after positions changed / 位置变化后刷新可见 GIF 播放集合
         self._update_visible_gifs()
 
     def _find_data_manager(self):
@@ -609,6 +583,8 @@ class EmojiGridWidget(QWidget):
             self.emoji_right_clicked.emit(child._emoji, pos)
             event.accept()
             return
+        # Right-click on blank space: one-click rearrange (evenly re-distribute columns to the
+        # current window width, removing the gaps left after stretching the window)
         # 空白处右键：一键整理（按当前窗口宽度重新均匀分列，消除拉伸窗口后的空缺）
         if self.current_group_id is not None and self._data:
             from PySide6.QtWidgets import QMenu
@@ -618,9 +594,12 @@ class EmojiGridWidget(QWidget):
                 self._rearrange()
         event.accept()
 
+    # One-click rearrange: compute the column count from the current window width (icon column
+    # count is decided by window/screen size), then evenly re-distribute all cards in global
+    # order to remove the gaps left after stretching the window
+    # 一键整理：按当前窗口宽度计算列数（图标列数由窗口/屏幕大小决定），
+    # 所有卡片按全局顺序均匀重分配列，消除拉伸窗口后的空白空缺。
     def _rearrange(self):
-        """一键整理：按当前窗口宽度计算列数（图标列数由窗口/屏幕大小决定），
-        所有卡片按全局顺序均匀重分配列，消除拉伸窗口后的空白空缺。"""
         if self.current_group_id is None or not self._data:
             return
         dm = self._find_data_manager()
@@ -628,11 +607,14 @@ class EmojiGridWidget(QWidget):
             return
         usable = self._usable_width()
         spacing = self._flow.spacing()
+        # Column-width baseline: max natural width in the group (100 for images / text natural
+        # width), so every column is fully displayed
         # 列宽基准：组内最大自然宽（图片 100 / 文字自然宽），保证每列完整显示
         base_w = 100
         for em in self._data:
             if em.get("text_content"):
                 base_w = max(base_w, EmojiItem.text_natural_width(em.get("text_content", "")))
+        # Column count = the max number of columns the usable width can hold
         # 列数 = 可用宽度能容纳的最大列数
         k = max(1, (usable + spacing) // (base_w + spacing))
         dm.rearrange_columns(self.current_group_id, k)
@@ -641,6 +623,7 @@ class EmojiGridWidget(QWidget):
         self._refresh_cards_after_merge()
 
     # ------------------------------------------------------------------
+    # Drag & drop: text groups move across columns / image groups sort within the group
     # 拖拽：文字分组跨列移动 / 图片分组组内排序
     # ------------------------------------------------------------------
 
@@ -662,7 +645,8 @@ class EmojiGridWidget(QWidget):
             pos = event.position().toPoint()
             col, order = self._drop_target(pos)
             if col != self._drop_col or order != self._drop_order:
-                # 局部重绘：只刷新旧/新插入条区域，避免全量重绘卡顿
+                # Partial repaint: only refresh the old/new insert-bar regions to avoid full
+                # repaint jank / 局部重绘：只刷新旧/新插入条区域，避免全量重绘卡顿
                 old = self._drop_line_rect_h()
                 self._drop_col, self._drop_order = col, order
                 new = self._drop_line_rect_h()
@@ -699,20 +683,23 @@ class EmojiGridWidget(QWidget):
                 event.ignore()
                 return
             dm = self._find_data_manager()
-            # 统一列模式：拖拽到目标列的指定位置（列内/列间移动）
+            # Unified column mode: drop to the target position in the target column
+            # (move within/across columns) / 统一列模式：拖拽到目标列的指定位置（列内/列间移动）
             col, order = self._drop_target(event.position().toPoint(), exclude=dragged_id)
             dm.set_emoji_column(dragged_id, col, order)
             dm.compact_text_columns(self.current_group_id)
             event.acceptProposedAction()
             _grid_log().info("Drag reorder -> emoji=%s group=%s target_col=%s order=%s",
                              dragged_id, self.current_group_id, col, order)
+            # Lightweight refresh (update card data + relayout, avoiding full rebuild jank)
             # 轻量刷新（更新卡片数据 + 重排，避免全量重建卡顿）
             self._refresh_cards_after_merge()
         else:
             event.ignore()
 
+    # Draw the white drop-position indicator bar: horizontal inside a column,
+    # vertical for a new column / 绘制白色插入位置指示条：列内画水平条，新列画垂直条
     def paintEvent(self, event):
-        """绘制白色插入位置指示条：列内画水平条，新列画垂直条"""
         super().paintEvent(event)
         painter = None
         if self._drop_col < 0 or not self._data:
@@ -725,8 +712,10 @@ class EmojiGridWidget(QWidget):
         painter.fillRect(rect, QColor(255, 255, 255))
         painter.end()
 
+    # Horizontal separator bar inside a column (data-driven estimated position); for a new
+    # column, draw a vertical bar on the right of the last column
+    # 列内水平分界条（数据驱动预估位置）；新列时画垂直条在最后一列右侧
     def _drop_line_rect_h(self):
-        """列内水平分界条（数据驱动预估位置）；新列时画垂直条在最后一列右侧"""
         if self._drop_col < 0:
             return None
         rects, _tw, _th, _info = self._masonry_layout_data(self._usable_width())
@@ -735,6 +724,7 @@ class EmojiGridWidget(QWidget):
                        if int(em.get("col_index", 0)) == self._drop_col
                        and em["id"] in rects]
         if not col_entries:
+            # New column: draw a vertical separator bar on the right of the last column
             # 新列：在最后一列右侧画垂直分界条
             max_col = max((int(e.get("col_index", 0)) for e in self._data), default=-1)
             last_entries = [(em, rects[em["id"]]) for em in self._data
@@ -757,8 +747,10 @@ class EmojiGridWidget(QWidget):
         y = (prev[1] + prev[3] + nxt[1]) // 2 - 1
         return QRect(prev[0], y, prev[2], 3)
 
+    # Compute (target column, insertion order inside the column) from the full data set, since
+    # cards may not be created yet under lazy loading
+    # 计算 (目标列, 列内插入位置)——基于全量数据预估位置（懒加载下卡片可能未创建）
     def _drop_target(self, pos, exclude=None):
-        """计算 (目标列, 列内插入位置)——基于全量数据预估位置（懒加载下卡片可能未创建）"""
         rects, _tw, _th, _info = self._masonry_layout_data(self._usable_width())
         cols = {}
         for em in self._data:
@@ -770,19 +762,21 @@ class EmojiGridWidget(QWidget):
             cols.setdefault(int(em.get("col_index", 0)), []).append((em, r))
         if not cols:
             return (0, 0)
-        # 列的 x 范围
+        # x range of each column / 列的 x 范围
         col_xs = {}
         for ci, entries in cols.items():
             xs = [r[0] for _e, r in entries]
             xr = [r[0] + r[2] for _e, r in entries]
             col_xs[ci] = (min(xs), max(xr))
-        # 目标列：pos.x 所在列
+        # Target column: the column containing pos.x / 目标列：pos.x 所在列
         target_col = None
         for ci, (x0, x1) in col_xs.items():
             if x0 <= pos.x() <= x1:
                 target_col = ci
                 break
         if target_col is None:
+            # Not inside any column: blank space on the right (in the viewport, right of the
+            # last column) → try opening a new column; otherwise use the nearest column
             # 不在任何列内：右侧空白（视口内、最后一列右侧）→ 尝试开新列；否则最近列
             max_col = max(col_xs)
             last_right = col_xs[max_col][1]
@@ -793,7 +787,8 @@ class EmojiGridWidget(QWidget):
             if pos.x() > last_right and in_view:
                 new_col = self._blank_zone_col(exclude)
                 if new_col is not None:
-                    return (new_col, 0)  # 开新列
+                    return (new_col, 0)  # Open a new column / 开新列
+                # Cannot open a new column → append to the end of the last column
                 # 不能开新列 → 最后一列末尾
                 return (max_col, len(cols[max_col]))
             best, bd = None, float("inf")
@@ -802,6 +797,7 @@ class EmojiGridWidget(QWidget):
                 if d < bd:
                     bd, best = d, ci
             target_col = best
+        # Insertion order inside the column: compare pos.y with the card centers
         # 列内插入位置：比较 pos.y 与卡片中心
         col_items = sorted(cols[target_col], key=lambda e: e[1][1])
         order = len(col_items)
@@ -811,8 +807,9 @@ class EmojiGridWidget(QWidget):
                 break
         return (target_col, order)
 
+    # Right blank zone: if the dragged card can open a new column by itself, return the new
+    # column number, otherwise None / 右侧空白区：若被拖卡片能单独开一列则返回新列号，否则返回 None
     def _blank_zone_col(self, exclude=None):
-        """右侧空白区：若被拖卡片能单独开一列则返回新列号，否则返回 None"""
         dragged = None
         for em in self._data:
             if em.get("id") == exclude:
@@ -825,6 +822,7 @@ class EmojiGridWidget(QWidget):
         usable = self._usable_width()
         spacing = self._flow.spacing()
         new_w = min(max(nw, 80), usable)
+        # Current total width of the columns (data-driven, excluding the dragged card)
         # 当前列总宽（数据驱动，排除被拖卡）
         col_widths = {}
         for em in self._data:
@@ -839,16 +837,23 @@ class EmojiGridWidget(QWidget):
             return max(col_widths) + 1 if col_widths else 0
         return None
 
+    # When the window shrinks, columns that cannot be fully shown are merged, one by one in
+    # order, into the front columns that can be fully shown. "Fully shown" means the column's
+    # natural width ≤ visible width and the total width of all columns fits.
+    # Returns True when a merge happened (a reload is needed).
+    # 窗口缩小时，无法完整显示的列按顺序依次并入能完整显示的前列。
+    # 完整显示 = 该列自然宽 ≤ 可视宽，且各列总宽放得下。
+    # 返回 True 表示发生了融合（需要重新加载）。
     def _merge_overflow_columns(self):
-        """窗口缩小时，无法完整显示的列按顺序依次并入能完整显示的前列。
-        完整显示 = 该列自然宽 ≤ 可视宽，且各列总宽放得下。
-        返回 True 表示发生了融合（需要重新加载）。"""
         if self.current_group_id is None or not self._data:
             return False
         dm = self._find_data_manager()
         spacing = self._flow.spacing()
+        # Keep consistent with the real layout width used in _do_masonry (viewport width - 10*2)
         # 与 _do_masonry 的实际布局宽度保持一致（viewport 宽 - contentsMargins 10*2）
         usable = max(self._viewport_width() - 20, 10)
+        # Width per column (natural content width, un-clamped) — data-driven since cards may
+        # not be created yet under lazy loading
         # 每列宽度（按内容自然宽，不 clamp）——数据驱动（懒加载下卡片可能未创建）
         col_widths = {}
         for em in self._data:
@@ -856,16 +861,20 @@ class EmojiGridWidget(QWidget):
             if em.get("text_content"):
                 nw = EmojiItem.text_natural_width(em.get("text_content", ""))
             else:
-                nw = 100  # 图片卡片固定宽
+                nw = 100  # Image cards have a fixed width / 图片卡片固定宽
             col_widths[ci] = max(col_widths.get(ci, 0), nw)
         cols = sorted(col_widths)
         if not cols:
             return False
+        # Per column, decide whether it can be opened alone fully:
+        #   ① the column's natural width ≤ visible width (otherwise content is compressed → merge)
+        #   ② the accumulated total width (including this column) ≤ visible width
+        #   (otherwise overflow → merge)
         # 逐列判定"能否完整单开"：
         #   ① 该列自然宽 ≤ 可视宽（否则内容被压缩，显示不全 → 融合）
         #   ② 累加总宽（含该列）≤ 可视宽（否则溢出 → 融合）
-        keep = []      # 能完整显示且放得下的列
-        overflow = []  # 需要融合的列
+        keep = []      # Columns that can be fully shown and fit / 能完整显示且放得下的列
+        overflow = []  # Columns that need to be merged / 需要融合的列
         total = 0
         for ci in cols:
             w = max(80, col_widths[ci])
@@ -880,17 +889,24 @@ class EmojiGridWidget(QWidget):
             total = new_total
         if not overflow:
             return False
+        # Target columns: cycle among the columns that are fully shown
+        # (if keep is empty, merge everything into the first column)
         # 目标列：能完整显示的列循环（若 keep 为空则全部并入第一列）
         if not keep:
             keep = [cols[0]]
+        # Batch merge in a single transaction + column-number compaction
+        # (avoids jank from per-row commits)
         # 单事务批量融合 + 列号压缩（避免逐条 commit 造成卡顿）
         dm.merge_columns_into(self.current_group_id, overflow, keep)
+        # Lightweight refresh of existing cards (no rebuild, avoids QPixmap re-decoding jank)
         # 轻量刷新现有卡片（不重建，避免 QPixmap 重新解码卡顿）
         self._refresh_cards_after_merge()
         return True
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        # Merge overflowing columns when the window shrinks (150ms debounce: a resize storm
+        # from dragging the window edge triggers only one pass)
         # 缩小窗口时融合溢出列（150ms 防抖：拖拽窗口边缘的 resize 风暴只触发一次）
         if self.current_group_id is not None and self._data:
             self._merge_timer.start()
@@ -904,36 +920,46 @@ class EmojiGridWidget(QWidget):
             p = p.parent()
         return None
 
+    # Visible viewport width; when scrolled horizontally the grid is stretched, so the viewport
+    # width, not the grid width, must be used to detect blank space
+    # 可视视口宽度（横向滚动时网格被拉伸，需用视口而非网格宽度判断空白）
     def _viewport_width(self):
-        """可视视口宽度（横向滚动时网格被拉伸，需用视口而非网格宽度判断空白）"""
         sc = self._find_scroll()
         if sc is not None:
             return max(sc.viewport().width(), 100)
         return max(self.width(), 100)
 
     # ------------------------------------------------------------------
+    # Text grouping: on add, assign a column (open a new one if possible, else the shortest column)
     # 文字分组：添加时分配列（能开新列就开，否则放行高最小列）
     # ------------------------------------------------------------------
 
+    # Current layout width of each column (max card width per col_index group)
+    # 当前各列布局宽度（按 col_index 分组取最大卡片宽）
     def _current_col_widths(self):
-        """当前各列布局宽度（按 col_index 分组取最大卡片宽）"""
         cols = {}
         for it in self._items:
             ci = int(it._emoji.get("col_index", 0))
             cols[ci] = max(cols.get(ci, 0), it.width())
         return [cols[k] for k in sorted(cols)]
 
+    # New text-emoji column assignment: open a new column when possible, otherwise put the
+    # card into the column with the fewest cards / 新文字表情列分配：能单独开一列则开新列，否则放入卡片最少的列。
     def assign_new_text_column(self, emoji_id, group_id, text, usable_w):
-        """新文字表情列分配：能单独开一列则开新列，否则放入卡片最少的列。"""
         self._assign_to_column(
             emoji_id, group_id, EmojiItem.text_natural_width(text), usable_w
         )
 
+    # Unassigned cards (user_sorted=0, e.g. newly imported / migrated old data) are spread
+    # across columns automatically based on the current window width: open a new column when
+    # possible (wider window → more columns), otherwise append to the end of the column with
+    # the fewest cards. Writes to DB and sets user_sorted=1 (after that, the user/program
+    # assignment is kept; resize only merges, never resets). Returns whether any card was assigned.
+    # 未分配卡片（user_sorted=0，如新导入/旧数据迁移）按当前窗口宽自动摊列：
+    # 能开新列则开（窗口大 → 多列），否则放卡片最少的列末尾。
+    # 写入 DB 并置 user_sorted=1（从此保持用户/程序分配的列，resize 只融合不重置）。
+    # 返回是否分配了任何卡片。
     def assign_unassigned_columns(self, group_id):
-        """未分配卡片（user_sorted=0，如新导入/旧数据迁移）按当前窗口宽自动摊列：
-        能开新列则开（窗口大 → 多列），否则放卡片最少的列末尾。
-        写入 DB 并置 user_sorted=1（从此保持用户/程序分配的列，resize 只融合不重置）。
-        返回是否分配了任何卡片。"""
         dm = self._find_data_manager()
         if dm is None:
             return False
@@ -942,19 +968,24 @@ class EmojiGridWidget(QWidget):
             return (EmojiItem.text_natural_width(e.get("text_content", ""))
                     if e.get("text_content") else 100)
 
+        # Consistent with the _do_masonry layout (viewport width - contentsMargins 10*2)
         # 与 _do_masonry 布局一致（viewport 宽 - contentsMargins 10*2）
         usable = max(self._viewport_width() - 20, 10)
         return dm.assign_unassigned_columns(
             group_id, usable, self._flow.spacing(), width_of
         ) > 0
 
+    # Generic column assignment: open a new column when possible, otherwise put the card at the
+    # end of the column with the fewest cards. Column widths/counts are computed from the DB
+    # contents, not from the current UI grid state.
+    # 通用列分配：能开新列则开新列，否则放卡片最少的列末尾。
+    # 列宽/列计数从数据库内容计算（不依赖当前 UI 网格状态）。
     def _assign_to_column(self, emoji_id, group_id, natural_w, usable_w):
-        """通用列分配：能开新列则开新列，否则放卡片最少的列末尾。
-        列宽/列计数从数据库内容计算（不依赖当前 UI 网格状态）。"""
         dm = self._find_data_manager()
         spacing = self._flow.spacing()
         new_w = min(max(natural_w, 80), usable_w)
-        # 从 DB 读当前各列内容算列宽与卡片数（排除新卡自身）
+        # Compute column widths and card counts from the current DB contents
+        # (excluding the new card itself) / 从 DB 读当前各列内容算列宽与卡片数（排除新卡自身）
         emojis = dm.get_emojis_by_group(group_id)
         col_widths = {}
         col_counts = {}

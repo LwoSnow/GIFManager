@@ -1,4 +1,5 @@
-"""搜索栏 — QLineEdit + 中文右键菜单"""
+"""Search bar — QLineEdit with localized context menu
+搜索栏 — QLineEdit + 中文右键菜单"""
 from PySide6.QtWidgets import QLineEdit, QMenu, QWidget
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QContextMenuEvent

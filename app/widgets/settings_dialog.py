@@ -1,4 +1,5 @@
-"""设置对话框 — 左侧分类导航 + 右侧选项分页"""
+"""Settings dialog — left category navigation + right option pages
+设置对话框 — 左侧分类导航 + 右侧选项分页"""
 import os
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QRadioButton,
@@ -14,14 +15,16 @@ from app.models.lang_manager import tr, current_language, available_languages
 from app.widgets.hotkey_manager import key_event_to_hotkey_desc
 
 
+# Recommended worker thread count: keep 1 core for the UI, capped at 8
+# 推荐多线程核心数：留 1 核给 UI，上限 8
 def recommended_thread_count():
-    """推荐多线程核心数：留 1 核给 UI，上限 8"""
     n = os.cpu_count() or 4
     return max(2, min(8, n - 1))
 
 
+# Hotkey capture widget
+# 快捷键捕获控件
 class HotkeyCapture(QLineEdit):
-    """快捷键捕获控件"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -80,8 +83,9 @@ class HotkeyCapture(QLineEdit):
         return (self._mods, self._vk)
 
 
+# Clickable word-wrapped label: clicking selects the matching send-mode radio
+# 可点击的换行标签（发送选项文字，点击选中对应 radio）
 class _ClickableLabel(QLabel):
-    """可点击的换行标签（发送选项文字，点击选中对应 radio）"""
 
     clicked = Signal()
 
@@ -90,11 +94,12 @@ class _ClickableLabel(QLabel):
         super().mousePressEvent(event)
 
 
+# Non-modal settings dialog: Apply applies live, OK applies and closes
+# 设置对话框（非模态）：Apply 按钮实时应用，OK 应用并关闭
 class SettingsDialog(QDialog):
-    """设置对话框（非模态）：Apply 按钮实时应用，OK 应用并关闭"""
 
-    apply_clicked = Signal()  # 点击"应用"（不关闭）
-    clear_logs_requested = Signal()  # 点击"清除所有日志"
+    apply_clicked = Signal()  # Apply clicked (does not close) / 点击"应用"（不关闭）
+    clear_logs_requested = Signal()  # Clear-all-logs requested / 点击"清除所有日志"
 
     def __init__(self, current_mode=0, remember_group=True, autostart=False,
                  always_on_top=False, text_limit_single=100, text_limit_multi=200,
@@ -112,7 +117,7 @@ class SettingsDialog(QDialog):
         self._always_on_top = always_on_top
         self._text_limit_single = text_limit_single
         self._text_limit_multi = text_limit_multi
-        # 0 = 自动（使用推荐值）
+        # 0 = auto (use recommended value) / 0 = 自动（使用推荐值）
         self._thread_count = thread_count if thread_count > 0 else recommended_thread_count()
         self._theme = theme if theme in ("dark", "light") else "dark"
         self._dm = data_manager
@@ -151,7 +156,7 @@ class SettingsDialog(QDialog):
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
-            # 快捷键捕获中，点击空白处保存
+            # While capturing, clicking blank space saves / 快捷键捕获中，点击空白处保存
             hc = self._hotkey_capture
             if hc._capturing:
                 child = self.childAt(event.position().toPoint())
@@ -180,7 +185,9 @@ class SettingsDialog(QDialog):
 
         title_bar = QHBoxLayout()
         title_label = QLabel(tr("settings"))
-        title_label.setStyleSheet("font-size: 15px; font-weight: bold;")  # 颜色继承主题
+        # Color is inherited from the active theme
+        # 颜色继承主题
+        title_label.setStyleSheet("font-size: 15px; font-weight: bold;")
         title_bar.addWidget(title_label)
         title_bar.addStretch()
         btn_close = QPushButton("✕")
@@ -190,7 +197,7 @@ class SettingsDialog(QDialog):
         title_bar.addWidget(btn_close)
         layout.addLayout(title_bar)
 
-        # ---- 主体：左侧分类导航 + 右侧选项分页 ----
+        # Body: left category navigation + right option pages / 主体：左侧分类导航 + 右侧选项分页
         body = QHBoxLayout()
         body.setSpacing(10)
 
@@ -198,7 +205,9 @@ class SettingsDialog(QDialog):
         self._cat_list.setFixedWidth(118)
         for key in ("cat_general", "cat_send", "cat_hotkey", "cat_text", "cat_perf"):
             self._cat_list.addItem(tr(key))
-        self._cat_list.addItem(tr("cat_about"))  # 分类名走语言文件（可替换为"关于"），页面内容保持纯英文
+        # Category name comes from the language file, not hardcoded "About"
+        # 分类名走语言文件（可替换为"关于"），页面内容保持纯英文
+        self._cat_list.addItem(tr("cat_about"))
         self._cat_list.setCurrentRow(0)
         body.addWidget(self._cat_list)
 
@@ -218,7 +227,7 @@ class SettingsDialog(QDialog):
             | QDialogButtonBox.StandardButton.Cancel
             | QDialogButtonBox.StandardButton.Apply
         )
-        # 按钮文本走语言文件（zh_CN.json 可修改）
+        # Button texts come from the language file (zh_CN.json) / 按钮文本走语言文件（zh_CN.json 可修改）
         self._btn_apply = btn_box.button(QDialogButtonBox.StandardButton.Apply)
         self._btn_ok = btn_box.button(QDialogButtonBox.StandardButton.Ok)
         self._btn_cancel = btn_box.button(QDialogButtonBox.StandardButton.Cancel)
@@ -230,13 +239,14 @@ class SettingsDialog(QDialog):
         btn_box.clicked.connect(self._on_box_clicked)
         layout.addWidget(btn_box)
 
+    # Apply button: applies settings live without closing the dialog
+    # Apply 按钮：实时应用设置但不关闭对话框
     def _on_box_clicked(self, button):
-        """Apply 按钮：实时应用设置但不关闭对话框"""
         if button is self._btn_apply:
             self.apply_clicked.emit()
 
     # ------------------------------------------------------------------
-    # 各分类页面
+    # Category pages / 各分类页面
     # ------------------------------------------------------------------
 
     def _page_widget(self):
@@ -246,10 +256,11 @@ class SettingsDialog(QDialog):
         self._page_layout.setSpacing(10)
         return w
 
+    # General page: theme + language + other options
+    # 通用：主题 + 语言 + 其他
     def _build_general_page(self):
-        """通用：主题 + 语言 + 其他"""
         w = self._page_widget()
-        # 主题切换
+        # Theme switching / 主题切换
         self._theme_group = QGroupBox(tr("theme_group"))
         theme_layout = QHBoxLayout(self._theme_group)
         self._theme_combo = QComboBox()
@@ -288,7 +299,7 @@ class SettingsDialog(QDialog):
         other_layout.addWidget(self._cb_top)
         self._page_layout.addWidget(self._other_group)
 
-        # 清除日志
+        # Clear logs / 清除日志
         self._log_group = QGroupBox(tr("logs_group"))
         log_layout = QVBoxLayout(self._log_group)
         self._btn_clear_logs = QPushButton(tr("clear_logs"))
@@ -298,8 +309,9 @@ class SettingsDialog(QDialog):
         self._page_layout.addStretch()
         return w
 
+    # Send mode: radio dots (filled when selected) + word-wrapped text labels
+    # 发送模式：radio 圆点选择框（选中实心）+ 可换行文字标签
     def _build_send_page(self):
-        """发送模式：radio 圆点选择框（选中实心）+ 可换行文字标签"""
         w = self._page_widget()
 
         self._send_group = QGroupBox(tr("send_mode"))
@@ -310,7 +322,7 @@ class SettingsDialog(QDialog):
         self._label_file = _ClickableLabel(tr("send_mode_file"))
         self._label_image = _ClickableLabel(tr("send_mode_image"))
         for label in (self._label_file, self._label_image):
-            label.setWordWrap(True)  # 长文字自动换行，不被窗口截断
+            label.setWordWrap(True)  # Wraps long text so it is not clipped / 长文字自动换行，不被窗口截断
             label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
             label.setCursor(Qt.CursorShape.PointingHandCursor)
         self._label_file.clicked.connect(self._rb_file.click)
@@ -323,7 +335,8 @@ class SettingsDialog(QDialog):
 
         def _row(radio, label):
             row = QHBoxLayout()
-            row.setSpacing(2)  # 圆点与文字紧贴，视觉同一行
+            row.setSpacing(2)  # Radio dot and text stay close, same visual row / 圆点与文字紧贴，视觉同一行
+            # Align radio dot center with the first text line (radio is shorter, nudge down)
             # 圆点中心对齐第一行文字中心（radio 比文字行矮，微调下移）
             radio.setStyleSheet("QRadioButton { margin-top: 2px; }")
             row.addWidget(radio, 0, Qt.AlignmentFlag.AlignTop)
@@ -336,8 +349,9 @@ class SettingsDialog(QDialog):
         self._page_layout.addStretch()
         return w
 
+    # Hotkey page
+    # 快捷键
     def _build_hotkey_page(self, hotkey_desc):
-        """快捷键"""
         w = self._page_widget()
         self._hotkey_group = QGroupBox(tr("hotkey_group"))
         hotkey_layout = QVBoxLayout(self._hotkey_group)
@@ -352,11 +366,13 @@ class SettingsDialog(QDialog):
         self._page_layout.addStretch()
         return w
 
+    # Text preview limits (single-line and multi-line configured independently)
+    # 文字预览限制（单行 / 多行独立）
     def _build_text_page(self):
-        """文字预览限制（单行 / 多行独立）"""
         w = self._page_widget()
         self._text_group = QGroupBox(tr("text_preview_group"))
         text_layout = QVBoxLayout(self._text_group)
+        # Labels wrap so longer English text is not hidden; inputs align to the top
         # 标签可换行（英文文案更长时不被输入框盖住），输入框顶部对齐
         row1 = QHBoxLayout()
         row1.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -384,14 +400,16 @@ class SettingsDialog(QDialog):
         self._page_layout.addStretch()
         return w
 
+    # About page: logo / name / version / developer / MIT license
+    # 信息页：Logo / 名称 / 版本 / 开发者 / MIT 许可。
+    # Hardcoded English only, not routed through the language file
+    # 纯英文硬编码，不经过语言文件。
     def _build_about_page(self):
-        """信息页：Logo / 名称 / 版本 / 开发者 / MIT 许可。
-        纯英文硬编码，不经过语言文件。"""
         w = self._page_widget()
         layout = self._page_layout
         layout.setSpacing(8)
 
-        # Logo（程序图标 icon.ico）
+        # Logo (from the app icon icon.ico) / Logo（程序图标 icon.ico）
         logo = QLabel()
         icon_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
@@ -407,30 +425,26 @@ class SettingsDialog(QDialog):
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(logo)
 
-        # 程序名称
         name = QLabel("GIFManager")
         name.setAlignment(Qt.AlignmentFlag.AlignCenter)
         name.setStyleSheet("font-size: 20px; font-weight: bold; color: #1677FF;")
         layout.addWidget(name)
 
-        # 版本
         ver = QLabel("Version 1.0.0")
         ver.setAlignment(Qt.AlignmentFlag.AlignCenter)
         ver.setStyleSheet("color: #888888; font-size: 12px;")
         layout.addWidget(ver)
 
-        # 开发者
         dev = QLabel("Developer: LwoSnow")
         dev.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(dev)
 
-        # 分隔线
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
         line.setStyleSheet("color: #555555;")
         layout.addWidget(line)
 
-        # MIT 许可声明（完整文本，可滚动查看）
+        # MIT license text (full, scrollable) / MIT 许可声明（完整文本，可滚动查看）
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -469,8 +483,9 @@ class SettingsDialog(QDialog):
         layout.addWidget(scroll, 1)
         return w
 
+    # Performance page: worker thread count
+    # 性能：多线程核心数
     def _build_perf_page(self):
-        """性能：多线程核心数"""
         w = self._page_widget()
         self._perf_group = QGroupBox(tr("perf_group"))
         perf_layout = QVBoxLayout(self._perf_group)
@@ -517,15 +532,16 @@ class SettingsDialog(QDialog):
             self._hotkey_changed = False
         self.accept()
 
+    # Refresh all UI texts after a language switch (keeps current control values)
+    # 语言切换后刷新全部界面文本（保留当前控件值）
     def refresh_translations(self):
-        """语言切换后刷新全部界面文本（保留当前控件值）"""
         self.setWindowTitle(tr("settings"))
         keys = ("cat_general", "cat_send", "cat_hotkey", "cat_text", "cat_perf", "cat_about")
         for i, key in enumerate(keys):
             item = self._cat_list.item(i)
             if item is not None:
                 item.setText(tr(key))
-        # 通用页
+        # General page / 通用页
         self._theme_group.setTitle(tr("theme_group"))
         self._lang_group.setTitle(tr("language_group"))
         self._other_group.setTitle(tr("other_group"))
@@ -534,26 +550,26 @@ class SettingsDialog(QDialog):
         self._cb_top.setText(tr("always_on_top"))
         self._log_group.setTitle(tr("logs_group"))
         self._btn_clear_logs.setText(tr("clear_logs"))
-        # 发送页
+        # Send page / 发送页
         self._send_group.setTitle(tr("send_mode"))
         self._label_file.setText(tr("send_mode_file"))
         self._label_image.setText(tr("send_mode_image"))
-        # 快捷键页
+        # Hotkey page / 快捷键页
         self._hotkey_group.setTitle(tr("hotkey_group"))
         self._hotkey_hint.setText(tr("hotkey_hint"))
         self._hotkey_capture.setPlaceholderText(tr("hotkey_capture_hint"))
         if self._hotkey_capture.text() in (tr("hotkey_unset"), tr("hotkey_capturing"),
                                            tr("hotkey_capture_hint")):
             self._hotkey_capture.setText(tr("hotkey_unset"))
-        # 文字页
+        # Text page / 文字页
         self._text_group.setTitle(tr("text_preview_group"))
         self._label_single.setText(tr("text_preview_single"))
         self._label_multi.setText(tr("text_preview_multi"))
-        # 性能页
+        # Performance page / 性能页
         self._perf_group.setTitle(tr("perf_group"))
         self._perf_hint.setText(tr("perf_hint"))
         self._label_threads.setText(tr("thread_count"))
-        # 按钮
+        # Buttons / 按钮
         self._btn_ok.setText(tr("ok"))
         self._btn_cancel.setText(tr("cancel"))
         self._btn_apply.setText(tr("apply"))
@@ -564,8 +580,9 @@ class SettingsDialog(QDialog):
     def remember_group(self):
         return self._cb_remember.isChecked()
 
+    # Read current hotkey live (also effective on Apply)
+    # 实时读取当前快捷键（Apply 时也生效）
     def hotkey_info(self):
-        """实时读取当前快捷键（Apply 时也生效）"""
         txt = self._hotkey_capture.text()
         mods, vk = self._hotkey_capture.hotkey_info()
         if txt == tr("hotkey_unset"):

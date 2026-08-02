@@ -10,7 +10,8 @@ from PySide6.QtGui import QImage, QPixmap
 
 import re
 
-# Valid characters for group names: Chinese and English, numbers, spaces, short lines / 分组名合法字符：中英文、数字、空格、短横线
+# Valid characters for group names: Chinese and English, numbers, spaces, short lines /
+# 分组名合法字符：中英文、数字、空格、短横线
 _GROUP_NAME_RE = re.compile(r'^[\w\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\- ]+$')
 
 def _is_valid_group_name(name):
@@ -30,7 +31,10 @@ def _app_data_dir():
         d = os.path.dirname(d)  # root
         candidates.append(os.path.join(d, "data"))
     candidates.append(
-        os.path.join(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation), "GIFManager")
+        os.path.join(
+            QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation),
+            "GIFManager",
+        )
     )
     for c in candidates:
         try:
@@ -89,18 +93,25 @@ class DataManager:
         if "content_hash" not in cols:
             self._conn.execute("ALTER TABLE emojis ADD COLUMN content_hash TEXT DEFAULT ''")
         if "sort_order" not in cols:
-            self._conn.execute("ALTER TABLE emojis ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
+            self._conn.execute(
+                "ALTER TABLE emojis ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"
+            )
         if "col_index" not in cols:
             self._conn.execute("ALTER TABLE emojis ADD COLUMN col_index INTEGER NOT NULL DEFAULT 0")
         if "user_sorted" not in cols:
-            self._conn.execute("ALTER TABLE emojis ADD COLUMN user_sorted INTEGER NOT NULL DEFAULT 0")
+            self._conn.execute(
+                "ALTER TABLE emojis ADD COLUMN user_sorted INTEGER NOT NULL DEFAULT 0"
+            )
             self._conn.execute("UPDATE emojis SET user_sorted=1")
         self._conn.commit()
         self._ensure_builtin("All", "image", 0)
         self._ensure_builtin("Default Expression", "image", 1)
 
     def _ensure_builtin(self, name, grp_type, sort_order):
-        cur = self._conn.execute("SELECT id, name FROM groups WHERE is_builtin=1 AND sort_order=?", (sort_order,))
+        cur = self._conn.execute(
+            "SELECT id, name FROM groups WHERE is_builtin=1 AND sort_order=?",
+            (sort_order,),
+        )
         row = cur.fetchone()
         if row is None:
             self._conn.execute(
@@ -247,7 +258,9 @@ class DataManager:
             try:
                 h = self._file_md5(fp)
             except OSError:
-                continue  # File is missing, leaving empty hash (does not appear in "All" view) / 文件缺失，保留空哈希（不会出现在\"全部\"视图）
+                # File is missing, leaving empty hash (does not appear in "All" view) /
+                # 文件缺失，保留空哈希（不会出现在\"全部\"视图）
+                continue
             self._conn.execute(
                 "UPDATE emojis SET content_hash=? WHERE id=?", (h, r["id"])
             )
@@ -308,14 +321,18 @@ class DataManager:
     def count_all_emojis(self):
         return self._conn.execute("SELECT COUNT(*) FROM emojis").fetchone()[0]
 
-    def count_image_emojis(self):  # image Total number of grouped expression records / image 分组表情总数记录
+    # image Total number of grouped expression records / image 分组表情总数记录
+    def count_image_emojis(self):
         return self._conn.execute(
             "SELECT COUNT(*) FROM emojis e JOIN groups g ON e.group_id=g.id "
             "WHERE g.type='image'"
         ).fetchone()[0]
 
     def count_emojis_in_group(self, group_id):
-        return self._conn.execute("SELECT COUNT(*) FROM emojis WHERE group_id=?", (group_id,)).fetchone()[0]
+        return self._conn.execute(
+            "SELECT COUNT(*) FROM emojis WHERE group_id=?",
+            (group_id,),
+        ).fetchone()[0]
 
     def import_emoji(self, group_id, filepath):
         group = self.get_group(group_id)
@@ -325,8 +342,10 @@ class DataManager:
         ext = os.path.splitext(filepath)[1].lower()
         if ext not in {".gif", ".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
             return "error"
-        # Calculate the source file hash first to check for duplication: if there is already the same content in the same group, skip it;
-        # Duplication is allowed across groups (the same picture can be classified into multiple groups to create multiple tags)
+        # Calculate the source file hash first to check for duplication: if there is
+        # already the same content in the same group, skip it;
+        # Duplication is allowed across groups (the same picture can be classified
+        # into multiple groups to create multiple tags)
         # 先算源文件哈希查重：同一分组内已有相同内容则跳过；
         # 跨分组允许重复（同一张图可归入多个分组做多标签）
         try:
@@ -543,9 +562,12 @@ class DataManager:
         return True
 
     def assign_unassigned_columns(self, group_id, usable_w, spacing, width_of):
-        # Batch column allocation: Cards with user_sorted=0 in the group (newly imported old data) are allocated one by one according to the column container rules
-        # (open new columns if they can be opened, otherwise the cards are placed in the minimum number of columns), and are written in a single transaction.
-        # width_of: Callback for the natural width of the card (pictures have a fixed width and text has a natural width). Returns the number of allocated cards.
+        # Batch column allocation: Cards with user_sorted=0 in the group (newly
+        # imported old data) are allocated one by one according to the column container rules
+        # (open new columns if they can be opened, otherwise the cards are placed in the
+        # minimum number of columns), and are written in a single transaction.
+        # width_of: Callback for the natural width of the card (pictures have a fixed
+        # width and text has a natural width). Returns the number of allocated cards.
         # 批量摊列：组内 user_sorted=0 的卡片（新导入/旧数据）按列容器规则逐张分配（能开新列则开，否则放卡片最少列），单事务写入。
         # width_of: 卡片自然宽回调（图片固定宽 / 文字自然宽）。返回分配卡片数。
         emojis = self.get_emojis_by_group(group_id)
@@ -586,7 +608,8 @@ class DataManager:
 
     def rearrange_columns(self, group_id, col_count):
         # One-click sorting redistributes columns evenly in global order (col_index, sort_order),
-        # rows are filled first (card i → column i%K, intra-column order iK), and single transaction writes
+        # rows are filled first (card i → column i%K, intra-column order iK), and
+        # single transaction writes
         # 一键整理按全局顺序（col_index, sort_order）重新均匀分配列，行优先填充（卡 i → 列 i%K，列内序 i//K），单事务写入
         emojis = self.get_emojis_by_group(group_id)
         if not emojis:

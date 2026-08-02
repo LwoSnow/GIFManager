@@ -1,4 +1,5 @@
-"""删除重复表情对话框 — 多选分组 + 全选（仅"全部"视图使用）"""
+"""Duplicate emoji removal (All)
+重复表情删除（All）"""
 import sys
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -11,7 +12,6 @@ from app.models.lang_manager import tr
 
 
 class DeleteCopiesDialog(QDialog):
-    """列出同一表情的所有分组副本，多选要删除的项"""
 
     def __init__(self, copies, parent=None):
         super().__init__(parent)
@@ -33,7 +33,6 @@ class DeleteCopiesDialog(QDialog):
         layout.setSpacing(10)
         layout.setContentsMargins(20, 14, 20, 16)
 
-        # 标题栏
         title_bar = QHBoxLayout()
         title = QLabel(tr("delete_copies_title"))
         title.setStyleSheet("font-size: 15px; font-weight: bold; color: #FFF;")
@@ -46,13 +45,11 @@ class DeleteCopiesDialog(QDialog):
         title_bar.addWidget(btn_close)
         layout.addLayout(title_bar)
 
-        # 提示文字
         prompt = QLabel(tr("delete_copies_prompt", count=len(self._copies)))
         prompt.setStyleSheet("color: #999; font-size: 12px;")
         prompt.setWordWrap(True)
         layout.addWidget(prompt)
 
-        # 全选/取消全选
         select_row = QHBoxLayout()
         self._btn_all = QPushButton(tr("select_all_btn"))
         self._btn_all.setFixedHeight(26)
@@ -71,6 +68,7 @@ class DeleteCopiesDialog(QDialog):
         select_row.addStretch()
         layout.addLayout(select_row)
 
+        # Group check list
         # 分组复选列表
         self._list = QListWidget()
         self._list.setStyleSheet(
@@ -89,7 +87,6 @@ class DeleteCopiesDialog(QDialog):
             self._items.append((item, c["id"], cb))
         layout.addWidget(self._list, 1)
 
-        # 按钮
         btn_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -103,7 +100,8 @@ class DeleteCopiesDialog(QDialog):
             cb.setChecked(checked)
 
     def selected_emojis(self):
-        """返回用户勾选要删除的 emoji id 列表"""
+        # Returns the list of emoji ids that the user checked to delete
+        # 返回用户勾选要删除的 emoji id 列表
         return [eid for _item, eid, cb in self._items if cb.isChecked()]
 
     def _apply_rounded(self):

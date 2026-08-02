@@ -1,4 +1,5 @@
-"""文字表情编辑对话框 — 支持多行文字"""
+"""Edit text dialog
+文字编辑对话框"""
 import sys
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -11,7 +12,6 @@ from app.models.lang_manager import tr
 
 
 class EditTextDialog(QDialog):
-    """编辑文字表情内容（支持换行）"""
 
     def __init__(self, current_text="", parent=None):
         super().__init__(parent)

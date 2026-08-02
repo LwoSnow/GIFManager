@@ -1,4 +1,5 @@
-"""底部分组标签栏 — 水平可滚动按钮组，支持拖拽排序"""
+"""Bottom group tab bar — horizontal scrollable button bar with drag reorder
+底部分组标签栏 — 水平可滚动按钮组，支持拖拽排序"""
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QPushButton, QScrollArea, QMenu, QInputDialog, QMessageBox,
     QApplication,
@@ -9,8 +10,8 @@ from PySide6.QtGui import QDrag, QMouseEvent, QPainter, QColor
 from app.models.lang_manager import tr
 
 
+# Button container that paints a white insertion indicator bar / 支持绘制白色插入指示条的按钮容器
 class _DropContainer(QWidget):
-    """支持绘制白色插入指示条的按钮容器"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -32,14 +33,15 @@ class _DropContainer(QWidget):
         children.sort(key=lambda w: w.geometry().x())
         n = len(children)
         if n < 2:
-            return  # 需要至少"全部"+一个可移动分组
+            return  # need at least "All" + one movable group / 需要至少"全部"+一个可移动分组
+        # children[0] is the fixed "All" tab; children[1..n-1] are movable groups
         # children[0] 是固定"全部"，children[1..n-1] 是可移动分组
-        # _drop_index 基于"不含全部"的可移动分组索引
+        # _drop_index indexes movable groups only (excluding "All") / _drop_index 基于"不含全部"的可移动分组索引
         idx = max(0, min(self._drop_index, n - 1))
         if idx <= 0:
-            x = children[1].geometry().left()  # 第一个可移动分组左侧
+            x = children[1].geometry().left()  # left of first movable group / 第一个可移动分组左侧
         elif idx >= n - 1:
-            x = children[-1].geometry().right()  # 末尾
+            x = children[-1].geometry().right()  # right edge of last button / 末尾
         else:
             x = (children[idx].geometry().right() + children[idx + 1].geometry().left()) // 2
         rect = QRect(x, 2, 2, self.height() - 4)
@@ -49,8 +51,8 @@ class _DropContainer(QWidget):
         painter.end()
 
 
+# Draggable group tab button ("All" pinned, not draggable) / 可拖拽的分组标签按钮（"全部"固定不可拖）
 class GroupTabButton(QPushButton):
-    """可拖拽的分组标签按钮（"全部"固定不可拖）"""
 
     def __init__(self, group_id, pinned=False, parent=None):
         super().__init__(parent)
@@ -68,7 +70,8 @@ class GroupTabButton(QPushButton):
     def mouseMoveEvent(self, event: QMouseEvent):
         if (event.buttons() & Qt.MouseButton.LeftButton and
                 self._press_pos is not None and not self._pinned):
-            if (event.position().toPoint() - self._press_pos).manhattanLength() > QApplication.startDragDistance():
+            if ((event.position().toPoint() - self._press_pos).manhattanLength()
+                    > QApplication.startDragDistance()):
                 self._dragging = True
                 drag = QDrag(self)
                 mime = QMimeData()
@@ -83,18 +86,19 @@ class GroupTabButton(QPushButton):
         super().mouseReleaseEvent(event)
 
 
+# Horizontal group tab bar: "All" tab, groups, and the "+" button / 水平分组标签栏，包含"全部"、各分组和 + 按钮
 class GroupListWidget(QWidget):
-    """水平分组标签栏，包含"全部"、各分组和 + 按钮"""
 
-    group_changed = Signal(object)  # group_id (None = 全部)
+    group_changed = Signal(object)  # group_id (None = All) / group_id (None = 全部)
     groups_updated = Signal()
 
     def __init__(self, data_manager, parent=None):
         super().__init__(parent)
         self._dm = data_manager
-        self._buttons = {}  # group_id -> GroupTabButton
+        self._buttons = {}  # maps group_id to its button / group_id -> GroupTabButton
         self._current_group_id = None
-        self._dragging_id = None  # 正在拖拽的分组 id（用于插入点计算）
+        # id of the group being dragged (for insertion-point calc) / 正在拖拽的分组 id（用于插入点计算）
+        self._dragging_id = None
 
         self.setFixedHeight(44)
         self._setup_ui()
@@ -117,7 +121,7 @@ class GroupListWidget(QWidget):
         self._btn_layout.setSpacing(4)
         self._btn_layout.addStretch()
 
-        # 容器接受拖放，用于分组排序
+        # Container accepts drag & drop for group reordering / 容器接受拖放，用于分组排序
         self._btn_container.setAcceptDrops(True)
         self._btn_container.installEventFilter(self)
 
@@ -131,7 +135,7 @@ class GroupListWidget(QWidget):
         layout.addWidget(self._btn_add)
 
     # ------------------------------------------------------------------
-    # 构建按钮
+    # Build buttons / 构建按钮
     # ------------------------------------------------------------------
 
     def _rebuild(self):
@@ -150,7 +154,9 @@ class GroupListWidget(QWidget):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.clicked.connect(lambda checked, _id=gid: self._select(_id))
             btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            btn.customContextMenuRequested.connect(lambda pos, _id=gid: self._on_right_click(_id, pos))
+            btn.customContextMenuRequested.connect(
+                lambda pos, _id=gid: self._on_right_click(_id, pos)
+            )
 
             self._btn_layout.insertWidget(self._btn_layout.count() - 1, btn)
             self._buttons[gid] = btn
@@ -158,7 +164,7 @@ class GroupListWidget(QWidget):
         self._update_active_style()
 
     # ------------------------------------------------------------------
-    # 拖拽排序（容器事件过滤）
+    # Drag reordering (container event filter) / 拖拽排序（容器事件过滤）
     # ------------------------------------------------------------------
 
     def eventFilter(self, obj, event):
@@ -167,7 +173,9 @@ class GroupListWidget(QWidget):
             if t == QEvent.Type.DragEnter:
                 if event.mimeData().hasFormat("application/x-group-id"):
                     try:
-                        self._dragging_id = int(bytes(event.mimeData().data("application/x-group-id")).decode())
+                        self._dragging_id = int(
+                            bytes(event.mimeData().data("application/x-group-id")).decode()
+                        )
                     except (ValueError, TypeError):
                         self._dragging_id = None
                     event.acceptProposedAction()
@@ -200,6 +208,7 @@ class GroupListWidget(QWidget):
         except (ValueError, TypeError):
             event.ignore()
             return
+        # Exclude the dragged group from insertion-point calc to avoid index shift after remove
         # 计算插入点时排除被拖分组本身（避免 remove 后索引偏移）
         idx = self._index_at_pos(event.position().toPoint(), exclude=dragged_id)
         if self._dm.reorder_group(dragged_id, idx):
@@ -207,8 +216,8 @@ class GroupListWidget(QWidget):
             self._rebuild()
             self.groups_updated.emit()
 
+    # Insertion index over movable groups, excluding the dragged one / 计算插入点索引：基于"排除被拖分组后"的可移动分组序列
     def _index_at_pos(self, pos, exclude=None):
-        """计算插入点索引：基于"排除被拖分组后"的可移动分组序列"""
         all_id = self._dm._all_group_id()
         anchors = [gid for gid in self._buttons if gid != all_id and gid != exclude]
         if not anchors:
@@ -222,14 +231,14 @@ class GroupListWidget(QWidget):
             if dist < best_dist:
                 best_dist = dist
                 best = i
-        # 在最后一个锚点右侧 → 末尾
+        # Right of the last anchor -> end / 在最后一个锚点右侧 → 末尾
         last_btn = self._buttons[anchors[-1]]
         if pos.x() > last_btn.geometry().right():
             best = len(anchors)
         return best
 
     # ------------------------------------------------------------------
-    # 选择
+    # Selection / 选择
     # ------------------------------------------------------------------
 
     def select_all_group(self):
@@ -254,7 +263,7 @@ class GroupListWidget(QWidget):
             btn.style().polish(btn)
 
     # ------------------------------------------------------------------
-    # 右键菜单
+    # Context menu / 右键菜单
     # ------------------------------------------------------------------
 
     def _on_right_click(self, group_id, pos):
@@ -278,7 +287,9 @@ class GroupListWidget(QWidget):
         g = self._dm.get_group(group_id)
         if not g:
             return
-        new_name, ok = QInputDialog.getText(self, tr("rename_group_dialog"), tr("new_name"), text=g["name"])
+        new_name, ok = QInputDialog.getText(
+            self, tr("rename_group_dialog"), tr("new_name"), text=g["name"]
+        )
         if ok and new_name.strip():
             if not self._dm.rename_group(group_id, new_name.strip()):
                 QMessageBox.warning(self, tr("rename_failed"), tr("rename_failed_msg"))
@@ -302,7 +313,7 @@ class GroupListWidget(QWidget):
             self.groups_updated.emit()
 
     # ------------------------------------------------------------------
-    # + 按钮 - 新建分组
+    # "+" button - create group / + 按钮 - 新建分组
     # ------------------------------------------------------------------
 
     def _on_add_clicked(self):

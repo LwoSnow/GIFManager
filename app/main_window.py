@@ -370,8 +370,10 @@ class MainWindow(QMainWindow):
     # Group / 分组
 
     def _on_group_changed(self, group_id):
-        # "All" is a virtual aggregation group: its database id is equivalent to "No group selected",
-        # Otherwise, get_emojis_by_group(all_id) will only find the emoticons under the name "All" (always empty).
+        # "All" is a virtual aggregation group: its database id is
+        # equivalent to "No group selected",
+        # Otherwise, get_emojis_by_group(all_id) will only find the
+        # emoticons under the name "All" (always empty).
         # "All"是虚拟聚合分组：其数据库 id 等价于"未选中任何分组"，
         # 否则会走 get_emojis_by_group(全部_id) 只查到"All"名下（恒为空）的表情。
         all_g = self.data_manager.get_group_by_name("All")
@@ -380,7 +382,8 @@ class MainWindow(QMainWindow):
         self.current_group_id = group_id
         self.emoji_grid.current_group_id = group_id
         self._log.info("Switch group -> id=%s", group_id)
-        # Text grouping enables horizontal scrolling (stable columns may exceed the visible width), image grouping is turned off
+        # Text grouping enables horizontal scrolling (stable columns may
+        # exceed the visible width), image grouping is turned off
         # 文字分组启用横向滚动（稳定列可能超出可视宽度），图片分组关闭
         is_text = False
         if group_id is not None:
@@ -432,9 +435,11 @@ class MainWindow(QMainWindow):
                 image_total = self.data_manager.count_image_emojis()
                 folded = image_total - shown
                 if folded > 0:
-                    self.status_bar.showMessage(
-                        f"  {tr('emoji_count_folded', group=group_name, count=shown, total=total, folded=folded)}"
+                    folded_msg = tr(
+                        "emoji_count_folded", group=group_name,
+                        count=shown, total=total, folded=folded,
                     )
+                    self.status_bar.showMessage(f"  {folded_msg}")
                     return
             count = shown
         else:

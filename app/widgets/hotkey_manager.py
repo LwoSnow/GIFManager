@@ -1,10 +1,11 @@
-"""Windows 全局快捷键管理器 — RegisterHotKey + nativeEvent"""
+"""Windows global hotkey manager — RegisterHotKey + nativeEvent
+Windows 全局快捷键管理器 — RegisterHotKey + nativeEvent"""
 import ctypes
 from ctypes import wintypes
 from PySide6.QtCore import QAbstractNativeEventFilter, Qt
 from PySide6.QtGui import QKeySequence
 
-# Win32 API
+# Win32 API constants / Win32 API 常量
 user32 = ctypes.windll.user32
 WM_HOTKEY = 0x0312
 MOD_ALT = 0x0001
@@ -12,7 +13,7 @@ MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 MOD_WIN = 0x0008
 
-# 虚拟键码
+# Virtual key codes / 虚拟键码
 VK_MAP = {
     Qt.Key.Key_F1: 0x70, Qt.Key.Key_F2: 0x71, Qt.Key.Key_F3: 0x72,
     Qt.Key.Key_F4: 0x73, Qt.Key.Key_F5: 0x74, Qt.Key.Key_F6: 0x75,
@@ -34,9 +35,9 @@ VK_MAP = {
     Qt.Key.Key_Space: 0x20,
     Qt.Key.Key_Tab: 0x09,
     Qt.Key.Key_Escape: 0x1B,
-    # 鼠标侧键 → 虚拟键码
-    0x100001: 0x05,  # XButton1 → VK_XBUTTON1
-    0x100002: 0x06,  # XButton2 → VK_XBUTTON2
+    # Mouse side buttons → virtual key codes / 鼠标侧键 → 虚拟键码
+    0x100001: 0x05,  # XButton1 → VK_XBUTTON1 / 鼠标侧键1 → VK_XBUTTON1
+    0x100002: 0x06,  # XButton2 → VK_XBUTTON2 / 鼠标侧键2 → VK_XBUTTON2
 }
 
 
@@ -54,8 +55,9 @@ def _qt_mods_to_win(mods):
     return wm
 
 
+# Build a human-readable hotkey description from a QKeyEvent
+# 从 QKeyEvent 生成人类可读的快捷键描述
 def key_event_to_hotkey_desc(event):
-    """从 QKeyEvent 生成人类可读的快捷键描述"""
     parts = []
     mods = int(event.modifiers().value)
     if mods & int(Qt.KeyboardModifier.ControlModifier.value):
@@ -68,7 +70,7 @@ def key_event_to_hotkey_desc(event):
         parts.append("Win")
 
     key = event.key()
-    # 鼠标侧键 (raw Qt values)
+    # Mouse side buttons (raw Qt values) / 鼠标侧键（原始 Qt 键值）
     if key == 0x100001:
         parts.append("鼠标侧键1")
     elif key == 0x100002:
@@ -84,9 +86,9 @@ def key_event_to_hotkey_desc(event):
     return "+".join(parts) if parts else ""
 
 
+# Global hotkey manager
+# 全局热键管理器
 class HotkeyManager(QAbstractNativeEventFilter):
-    """全局热键管理器"""
-
     HOTKEY_ID = 1
 
     def __init__(self, parent=None):
@@ -96,8 +98,9 @@ class HotkeyManager(QAbstractNativeEventFilter):
         self._vk = 0
         self._callback = None
 
+    # Register a global hotkey. mods: Qt modifiers, vk: Qt Key, callback: zero-arg callback
+    # 注册全局热键。mods: Qt 修饰键，vk: Qt 键，callback: 无参回调
     def register(self, mods, vk, callback):
-        """注册全局热键。mods: Qt modifiers, vk: Qt Key, callback: 无参回调"""
         self.unregister()
         wm = _qt_mods_to_win(mods)
         win_vk = VK_MAP.get(vk, vk)
@@ -120,6 +123,7 @@ class HotkeyManager(QAbstractNativeEventFilter):
         return self._registered
 
     def nativeEventFilter(self, eventType, message):
+        # In PySide6, eventType is a QByteArray → Python bytes
         # PySide6 中 eventType 是 QByteArray → Python bytes
         et = eventType.data() if hasattr(eventType, 'data') else bytes(eventType)
         if b"windows" in et:
@@ -133,7 +137,7 @@ class HotkeyManager(QAbstractNativeEventFilter):
         return False, 0
 
     # ------------------------------------------------------------------
-    # 序列化
+    # Serialization / 序列化
     # ------------------------------------------------------------------
 
     def to_dict(self):

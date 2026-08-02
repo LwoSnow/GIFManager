@@ -53,7 +53,8 @@ def init_logger():
     # FileHandler (StreamHandler) flushes after each emit by default
     # FileHandler（StreamHandler）默认每条 emit 后 flush
     _logger.addHandler(_handler)
-    # Console synchronous output (developers can view it in real time, StreamHandler flushes after emit by default)
+    # Console synchronous output (developers can view it in real time,
+    # StreamHandler flushes after emit by default)
     # 控制台同步输出（开发者实时查看，StreamHandler 默认 emit 后 flush）
     _console = logging.StreamHandler(sys.stdout)
     _console.setFormatter(fmt)
