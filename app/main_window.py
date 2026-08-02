@@ -172,9 +172,11 @@ class MainWindow(QMainWindow):
         self._settings.setValue("window_geometry", self.saveGeometry())
 
     def _apply_always_on_top(self):
+        # setWindowFlag implicitly hides the window; record visibility and restore
+        # setWindowFlag 会隐式隐藏窗口：先记录可见性再恢复显示
+        was_visible = self.isVisible()
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, self._always_on_top)
-        if self.isVisible():
-            self.hide()
+        if was_visible:
             self.show()
 
     def _apply_autostart(self):
@@ -380,8 +382,9 @@ class MainWindow(QMainWindow):
         # emoticons under the name "All" (always empty).
         # "All"是虚拟聚合分组：其数据库 id 等价于"未选中任何分组"，
         # 否则会走 get_emojis_by_group(全部_id) 只查到"All"名下（恒为空）的表情。
-        all_g = self.data_manager.get_group_by_name("All")
-        if all_g is not None and group_id == all_g["id"]:
+        # "All"是虚拟聚合分组：按内置标记识别（重命名后仍有效）
+        all_id = self.data_manager._all_group_id()
+        if all_id is not None and group_id == all_id:
             group_id = None
         self.current_group_id = group_id
         self.emoji_grid.current_group_id = group_id
@@ -484,11 +487,13 @@ class MainWindow(QMainWindow):
     def _do_import(self, files):
         target_group = self.current_group_id
         if target_group is None:
-            default = self.data_manager.get_group_by_name("Default Expression")
+            # Builtin default group lookup by flag (works after rename)
+            # 内置默认分组按标记查找（重命名后仍有效）
+            default = self.data_manager.default_group_id()
             if default is None:
                 QMessageBox.warning(self, "GIFManager", tr("default_group_missing"))
                 return
-            target_group = default["id"]
+            target_group = default
 
         group_info = self.data_manager.get_group(target_group)
         if group_info and group_info["type"] == "text":

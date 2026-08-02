@@ -493,6 +493,7 @@ class EmojiGridWidget(QWidget):
                     card = old_cards.pop(em.get("id"), None)
                     if card is not None and card._is_text == bool(em.get("text_content")):
                         card._emoji = em
+                        card.refresh_display()
                     else:
                         card = EmojiItem(em, dm, self._flow_container,
                                          preview_limits=preview_limits)
@@ -511,6 +512,7 @@ class EmojiGridWidget(QWidget):
                     cid = card._emoji.get("id")
                     if cid in keep_ids:
                         card._emoji = emap[cid]
+                        card.refresh_display()
                         survivors.append(card)
                     else:
                         card._stop_gif()

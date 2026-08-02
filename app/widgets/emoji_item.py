@@ -190,6 +190,17 @@ class EmojiItem(QFrame):
         if self._thumb_label is not None and not self._is_text:
             self._thumb_label.setPixmap(pix)
 
+    def refresh_display(self):
+        # Refresh name/text label after rename or text edit
+        # (reused cards keep their widgets, so labels must be updated manually)
+        # 重命名/编辑后刷新名称/文字（复用卡保留控件，需手动更新标签）
+        if self._is_text:
+            display, _t = self._display_text()
+            self._text_label.setText(display)
+        else:
+            name = self._emoji.get("original_name", "")[:10]
+            self._name_label.setText(name)
+
     # ------------------------------------------------------------------
     # Text-mode UI (adaptive height + preview limits + dynamic column reflow)
     # 文字模式 UI（自适应高度 + 预览限制 + 动态列宽重排）

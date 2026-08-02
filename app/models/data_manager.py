@@ -108,27 +108,19 @@ class DataManager:
         self._ensure_builtin("Default Expression", "image", 1)
 
     def _ensure_builtin(self, name, grp_type, sort_order):
+        # Create builtin groups only when missing; never force-rename them
+        # (users may rename builtin groups freely, keep their choice)
+        # 仅在缺失时创建内置分组；不强制改名（允许用户自由重命名内置分组）
         cur = self._conn.execute(
-            "SELECT id, name FROM groups WHERE is_builtin=1 AND sort_order=?",
+            "SELECT id FROM groups WHERE is_builtin=1 AND sort_order=?",
             (sort_order,),
         )
-        row = cur.fetchone()
-        if row is None:
+        if cur.fetchone() is None:
             self._conn.execute(
                 "INSERT INTO groups (name, type, sort_order, is_builtin) VALUES (?,?,?,1)",
                 (name, grp_type, sort_order)
             )
             self._conn.commit()
-        elif row["name"] != name:
-            self._conn.execute("UPDATE groups SET name=? WHERE id=?", (name, row["id"]))
-            self._conn.commit()
-            old_dir = os.path.join(self._emojis_dir, row["name"])
-            new_dir = os.path.join(self._emojis_dir, name)
-            if os.path.isdir(old_dir) and not os.path.isdir(new_dir):
-                try:
-                    os.rename(old_dir, new_dir)
-                except OSError:
-                    pass
 
     @property
     def data_dir(self):
@@ -139,6 +131,14 @@ class DataManager:
     def _all_group_id(self):
         r = self._conn.execute(
             "SELECT id FROM groups WHERE is_builtin=1 AND sort_order=0 LIMIT 1"
+        ).fetchone()
+        return r[0] if r else None
+
+    def default_group_id(self):
+        # Builtin default group (sort_order=1); name-independent so renaming works
+        # 内置默认分组（sort_order=1），按标记识别不依赖名字（重命名后仍有效）
+        r = self._conn.execute(
+            "SELECT id FROM groups WHERE is_builtin=1 AND sort_order=1 LIMIT 1"
         ).fetchone()
         return r[0] if r else None
 
