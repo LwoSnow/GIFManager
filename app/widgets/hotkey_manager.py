@@ -5,6 +5,8 @@ from ctypes import wintypes
 from PySide6.QtCore import QAbstractNativeEventFilter, Qt
 from PySide6.QtGui import QKeySequence
 
+from app.models.lang_manager import tr
+
 # Win32 API constants / Win32 API 常量
 user32 = ctypes.windll.user32
 WM_HOTKEY = 0x0312
@@ -72,9 +74,9 @@ def key_event_to_hotkey_desc(event):
     key = event.key()
     # Mouse side buttons (raw Qt values) / 鼠标侧键（原始 Qt 键值）
     if key == 0x100001:
-        parts.append("鼠标侧键1")
+        parts.append(tr("mouse_x1"))
     elif key == 0x100002:
-        parts.append("鼠标侧键2")
+        parts.append(tr("mouse_x2"))
     else:
         seq = QKeySequence(key)
         name = seq.toString()

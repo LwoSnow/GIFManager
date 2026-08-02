@@ -19,6 +19,10 @@ from app.theme.dark_theme import QSS as DARK_QSS
 from app.theme.light_theme import QSS as LIGHT_QSS
 from app.models.data_manager import DataManager
 from app.models.lang_manager import tr, set_language, current_language, available_languages
+from app.models.constants import (
+    DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT,
+    MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT,
+)
 from app.models.logger import init_logger, get_logger, install_excepthook, clear_logs
 from app.widgets.group_list import GroupListWidget
 from app.widgets.emoji_grid import EmojiGridWidget
@@ -63,8 +67,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(self.APP_TITLE)
-        self.resize(620, 520)
-        self.setMinimumSize(400, 360)
+        self.resize(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
+        self.setMinimumSize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
         self.setAcceptDrops(True)
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window
@@ -157,7 +161,7 @@ class MainWindow(QMainWindow):
         if geo:
             self.restoreGeometry(geo)
         else:
-            self.resize(620, 520)
+            self.resize(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
             screen = QApplication.primaryScreen().availableGeometry()
             self.move(
                 (screen.width() - self.width()) // 2,
@@ -504,7 +508,7 @@ class MainWindow(QMainWindow):
         self._refresh_status()
         msg = tr("import_success", count=imported, group=group_info["name"])
         if duplicated:
-            msg += f"（跳过 {duplicated} 个重复）"
+            msg += tr("import_skip_dup", count=duplicated)
         self.status_bar.showMessage(f"  {msg}", 3000)
 
     def _add_text_emoji(self):
@@ -580,7 +584,7 @@ class MainWindow(QMainWindow):
                         self._refresh_status()
                         msg = tr("pasted_to", group=g["name"])
                         if skipped:
-                            msg += f"（跳过 {skipped} 个重复）"
+                            msg += tr("import_skip_dup", count=skipped)
                         self.status_bar.showMessage(f"  {msg}", 2500)
                     return
         super().keyPressEvent(event)

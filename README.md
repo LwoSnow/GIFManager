@@ -189,7 +189,7 @@ group membership is tracked in `emoji.db`.
 
 ---
 
-## Settings (Settings dialog ⚙)
+## Settings
 
 | Category | Setting | Notes |
 | --- | --- | --- |

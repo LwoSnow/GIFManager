@@ -12,6 +12,8 @@ from PySide6.QtGui import (
     QColor, QImage,
 )
 
+from app.models.lang_manager import tr
+
 
 # Thumbnail cache capped at 64MB (~2500+ 76x76 thumbs); LRU evicts automatically
 # 缩略图缓存上限 64MB（约 2500+ 张 76x76 缩略图），LRU 自动淘汰
@@ -168,7 +170,7 @@ class EmojiItem(QFrame):
     def _setup_image(self):
         filepath = self._dm.emoji_filepath(self._emoji)
         if not filepath or not os.path.isfile(filepath):
-            self._thumb_label.setText("无图片")
+            self._thumb_label.setText(tr("no_image"))
             return
         self._thumb_path = filepath
         # 1) Cache hit: show directly (zero decode on group switch / hover restore)
