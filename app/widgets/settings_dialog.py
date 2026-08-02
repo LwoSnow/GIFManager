@@ -433,7 +433,7 @@ class SettingsDialog(QDialog):
         name.setStyleSheet("font-size: 20px; font-weight: bold; color: #1677FF;")
         layout.addWidget(name)
 
-        ver = QLabel("Version 1.0.0")
+        ver = QLabel("Version 1.0.1")
         ver.setAlignment(Qt.AlignmentFlag.AlignCenter)
         ver.setStyleSheet("color: #888888; font-size: 12px;")
         layout.addWidget(ver)

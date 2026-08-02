@@ -82,7 +82,7 @@ class MainWindow(QMainWindow):
         init_logger()
         install_excepthook()
         self._log = get_logger()
-        self._log.info("App version: 1.0.0 | theme: pending | thread_count: pending")
+        self._log.info("App version: 1.0.1 | theme: pending | thread_count: pending")
 
         self._settings = QSettings("GIFManager", "GIFManager")
         self.data_manager = DataManager()
