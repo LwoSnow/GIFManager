@@ -4,8 +4,9 @@ from PySide6.QtWidgets import (
     QWidget, QLayout, QLayoutItem, QSizePolicy, QLabel, QVBoxLayout,
 )
 from PySide6.QtCore import Qt, QSize, QRect, Signal, QPoint, QTimer
-from PySide6.QtGui import QContextMenuEvent, QPainter, QColor, QPixmap, QPixmapCache
+from PySide6.QtGui import QContextMenuEvent, QPainter, QColor, QPixmap, QPixmapCache, QPen
 import math
+import time
 
 from app.widgets.emoji_item import EmojiItem, _loader, _thumb_key
 from app.models.lang_manager import tr
@@ -20,6 +21,35 @@ def _grid_log():
     if _GRID_LOG is None:
         _GRID_LOG = get_logger()
     return _GRID_LOG
+
+
+# Transparent overlay that draws the drag-drop indicator on top of the card container,
+# because painting on the grid itself is covered by child widgets
+# 置顶透明覆盖层：绘制拖放引导条（画在网格自身会被卡片容器子控件遮挡）
+class _DropOverlay(QWidget):
+    def __init__(self, grid):
+        super().__init__(grid)
+        self._grid = grid
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setStyleSheet("background: transparent;")
+        self.hide()
+
+    def paintEvent(self, event):
+        rect = self._grid._drop_indicator_rect()
+        if rect is None:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        if self._grid._drop_mode == "swap":
+            # White border around the swap target card / 交换目标卡片白色边框
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(255, 255, 255), 2))
+            painter.drawRect(rect.adjusted(0, 0, -1, -1))
+        else:
+            # White insert bar (horizontal gap / vertical new column) / 白色插入条（水平间隙 / 垂直新列）
+            painter.fillRect(rect, QColor(255, 255, 255))
+        painter.end()
 
 
 # Fluid layout with adaptive column number / 自适应列数的流式布局
@@ -256,6 +286,11 @@ class EmojiGridWidget(QWidget):
         self._drop_index = -1
         self._drop_col = -1    # Text grouping: target column / 文字分组：目标列
         self._drop_order = 0   # Text grouping: insertion position within column / 文字分组：列内插入位置
+        self._drop_mode = "insert"  # Gap insert / swap with card under cursor / 间隙插入 / 卡片交换
+        self._drop_target_id = None  # Swap target card id / 交换目标卡片 id
+        self._last_sort_by = None    # Last blank-menu sort kind / 上次空白菜单整理方式
+        self._last_sort_time = 0.0   # Last blank-menu sort timestamp / 上次整理时间戳
+        self._last_sort_desc = False  # Last blank-menu sort direction / 上次整理方向（True=逆序）
         self._is_text_group = False
         self.setAcceptDrops(True)
 
@@ -282,6 +317,11 @@ class EmojiGridWidget(QWidget):
         self._flow_container = QWidget(self)
         self._flow = FlowLayout(self._flow_container, margin=10, spacing=8)
         outer.addWidget(self._flow_container, 1)
+
+        # Top-most drop indicator overlay (mouse-transparent) / 置顶拖放引导条覆盖层（鼠标穿透）
+        self._drop_overlay = _DropOverlay(self)
+        self._drop_overlay.setGeometry(self.rect())
+        self._drop_overlay.raise_()
 
     def _on_thumb_ready(self, key, img):
         if img.isNull():
@@ -585,16 +625,45 @@ class EmojiGridWidget(QWidget):
             self.emoji_right_clicked.emit(child._emoji, pos)
             event.accept()
             return
-        # Right-click on blank space: one-click rearrange (evenly re-distribute columns to the
-        # current window width, removing the gaps left after stretching the window)
-        # 空白处右键：一键整理（按当前窗口宽度重新均匀分列，消除拉伸窗口后的空缺）
+        # Right-click on blank space: sort/rearrange menu
+        # 空白处右键：整理/排序菜单
         if self.current_group_id is not None and self._data:
             from PySide6.QtWidgets import QMenu
             menu = QMenu(self)
-            act = menu.addAction(tr("rearrange"))
-            if menu.exec(pos) == act:
+            act_rearrange = menu.addAction(tr("rearrange"))
+            menu.addSeparator()
+            act_name = menu.addAction(tr("sort_by_name"))
+            act_time = menu.addAction(tr("sort_by_time"))
+            chosen = menu.exec(pos)
+            if chosen == act_rearrange:
                 self._rearrange()
+            elif chosen == act_name or chosen == act_time:
+                by = "name" if chosen == act_name else "time"
+                self._sort_group(by)
         event.accept()
+
+    # Sort the group once by name / created time. Clicking the same kind flips direction
+    # (ascending ↔ descending) within 10s; clicking again after 10s resets to ascending.
+    # 按名称 / 加入时间单次整理组内卡片。10 秒内重复点击同一方式在正序/逆序间切换；超过 10 秒再次点击恢复正序。
+    def _sort_group(self, by):
+        if self.current_group_id is None or not self._data:
+            return
+        dm = self._find_data_manager()
+        if dm is None:
+            return
+        now = time.time()
+        within = getattr(self, "_last_sort_by", None) == by and \
+            now - getattr(self, "_last_sort_time", 0) <= 10
+        # Flip direction when clicked again within 10s, otherwise reset to ascending
+        # 10 秒内再次点击翻转方向，否则重置为正序
+        desc = (not getattr(self, "_last_sort_desc", False)) if within else False
+        self._last_sort_by = by
+        self._last_sort_time = now
+        self._last_sort_desc = desc
+        dm.sort_group_emojis(self.current_group_id, by=by, desc=desc)
+        _grid_log().info("Sort group -> group=%s by=%s desc=%s cards=%d",
+                         self.current_group_id, by, desc, len(self._data))
+        self._refresh_cards_after_merge()
 
     # One-click rearrange: compute the column count from the current window width (icon column
     # count is decided by window/screen size), then evenly re-distribute all cards in global
@@ -634,7 +703,9 @@ class EmojiGridWidget(QWidget):
             if self.current_group_id is not None and self._data:
                 self._drop_col = 0
                 self._drop_order = 0
-                self.update()
+                self._drop_mode = "insert"
+                self._drop_target_id = None
+                self._drop_overlay.show()
                 event.acceptProposedAction()
             else:
                 event.ignore()
@@ -645,36 +716,37 @@ class EmojiGridWidget(QWidget):
         if event.mimeData().hasFormat("application/x-emoji-id") and self._data:
             event.acceptProposedAction()
             pos = event.position().toPoint()
-            col, order = self._drop_target(pos)
-            if col != self._drop_col or order != self._drop_order:
-                # Partial repaint: only refresh the old/new insert-bar regions to avoid full
-                # repaint jank / 局部重绘：只刷新旧/新插入条区域，避免全量重绘卡顿
-                old = self._drop_line_rect_h()
-                self._drop_col, self._drop_order = col, order
-                new = self._drop_line_rect_h()
+            mode, col, order, target_id = self._drop_target(pos)
+            if (mode, col, order, target_id) != (self._drop_mode, self._drop_col,
+                                                 self._drop_order, self._drop_target_id):
+                # Partial repaint: only refresh the old/new indicator regions / 局部重绘：只刷新旧/新指示区域
+                old = self._drop_indicator_rect()
+                self._drop_mode, self._drop_col, self._drop_order, self._drop_target_id = \
+                    mode, col, order, target_id
+                new = self._drop_indicator_rect()
                 if old is not None:
-                    self.update(old.adjusted(-4, -4, 4, 4))
+                    self._drop_overlay.update(old.adjusted(-4, -4, 4, 4))
                 if new is not None:
-                    self.update(new.adjusted(-4, -4, 4, 4))
+                    self._drop_overlay.update(new.adjusted(-4, -4, 4, 4))
         else:
             event.ignore()
 
     def dragLeaveEvent(self, event):
-        old = self._drop_line_rect_h()
         self._drop_index = -1
         self._drop_col = -1
         self._drop_order = 0
-        if old is not None:
-            self.update(old.adjusted(-4, -4, 4, 4))
+        self._drop_mode = "insert"
+        self._drop_target_id = None
+        self._drop_overlay.hide()
         super().dragLeaveEvent(event)
 
     def dropEvent(self, event):
-        old = self._drop_line_rect_h()
         self._drop_index = -1
         self._drop_col = -1
         self._drop_order = 0
-        if old is not None:
-            self.update(old.adjusted(-4, -4, 4, 4))
+        self._drop_mode = "insert"
+        self._drop_target_id = None
+        self._drop_overlay.hide()
         if event.mimeData().hasFormat("application/x-emoji-id"):
             try:
                 dragged_id = int(bytes(event.mimeData().data("application/x-emoji-id")).decode())
@@ -685,34 +757,39 @@ class EmojiGridWidget(QWidget):
                 event.ignore()
                 return
             dm = self._find_data_manager()
-            # Unified column mode: drop to the target position in the target column
-            # (move within/across columns) / 统一列模式：拖拽到目标列的指定位置（列内/列间移动）
-            col, order = self._drop_target(event.position().toPoint(), exclude=dragged_id)
-            dm.set_emoji_column(dragged_id, col, order)
-            dm.compact_text_columns(self.current_group_id)
+            mode, col, order, target_id = self._drop_target(
+                event.position().toPoint(), exclude=dragged_id)
+            if mode == "swap" and target_id is not None and target_id != dragged_id:
+                # Swap positions with the card under the cursor / 与光标下的卡片交换位置
+                dm.swap_emoji_columns(dragged_id, target_id)
+                _grid_log().info("Drag swap -> emoji=%s with=%s", dragged_id, target_id)
+            else:
+                # Gap insert (move within/across columns) / 间隙插入（列内/列间移动）
+                dm.set_emoji_column(dragged_id, col, order)
+                dm.compact_text_columns(self.current_group_id)
+                _grid_log().info("Drag reorder -> emoji=%s group=%s target_col=%s order=%s",
+                                 dragged_id, self.current_group_id, col, order)
             event.acceptProposedAction()
-            _grid_log().info("Drag reorder -> emoji=%s group=%s target_col=%s order=%s",
-                             dragged_id, self.current_group_id, col, order)
             # Lightweight refresh (update card data + relayout, avoiding full rebuild jank)
             # 轻量刷新（更新卡片数据 + 重排，避免全量重建卡顿）
             self._refresh_cards_after_merge()
         else:
             event.ignore()
 
-    # Draw the white drop-position indicator bar: horizontal inside a column,
-    # vertical for a new column / 绘制白色插入位置指示条：列内画水平条，新列画垂直条
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        painter = None
-        if self._drop_col < 0 or not self._data:
-            return
-        rect = self._drop_line_rect_h()
-        if rect is None:
-            return
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        painter.fillRect(rect, QColor(255, 255, 255))
-        painter.end()
+    # The drop indicator is drawn on the top-most _DropOverlay (painting on the grid itself
+    # is covered by child widgets), so no paintEvent override is needed here
+    # 拖放引导条由置顶 _DropOverlay 绘制（画在网格自身会被子控件遮挡），此处无需 paintEvent
+
+    # Unified indicator rect by mode: insert bar (horizontal), blank new-column bar (vertical),
+    # swap target highlight border / 按模式统一返回指示矩形：插入条（水平）、新列条（垂直）、交换高亮边框
+    def _drop_indicator_rect(self):
+        if self._drop_mode == "swap" and self._drop_target_id is not None:
+            rects, _tw, _th, _info = self._masonry_layout_data(self._usable_width())
+            r = rects.get(self._drop_target_id)
+            if r is None:
+                return None
+            return QRect(r[0], r[1], r[2], r[3])
+        return self._drop_line_rect_h()
 
     # Horizontal separator bar inside a column (data-driven estimated position); for a new
     # column, draw a vertical bar on the right of the last column
@@ -749,9 +826,12 @@ class EmojiGridWidget(QWidget):
         y = (prev[1] + prev[3] + nxt[1]) // 2 - 1
         return QRect(prev[0], y, prev[2], 3)
 
-    # Compute (target column, insertion order inside the column) from the full data set, since
-    # cards may not be created yet under lazy loading
-    # 计算 (目标列, 列内插入位置)——基于全量数据预估位置（懒加载下卡片可能未创建）
+    # Compute (mode, column, order, target_id) from the full data set, since cards may not be
+    # created yet under lazy loading. Mode: "insert" = drop into the gap (column/order valid);
+    # "swap" = drop onto the middle of a card (target_id valid); "blank" = open a new column.
+    # 计算 (模式, 目标列, 列内位置, 目标卡id)——基于全量数据预估（懒加载下卡片可能未创建）。
+    # 模式："insert" = 间隙插入（列/位置有效）；"swap" = 卡片中间交换（目标卡id有效）；
+    # "blank" = 开新列。
     def _drop_target(self, pos, exclude=None):
         rects, _tw, _th, _info = self._masonry_layout_data(self._usable_width())
         cols = {}
@@ -763,7 +843,7 @@ class EmojiGridWidget(QWidget):
                 continue
             cols.setdefault(int(em.get("col_index", 0)), []).append((em, r))
         if not cols:
-            return (0, 0)
+            return ("blank", 0, 0, None)
         # x range of each column / 列的 x 范围
         col_xs = {}
         for ci, entries in cols.items():
@@ -777,9 +857,9 @@ class EmojiGridWidget(QWidget):
                 target_col = ci
                 break
         if target_col is None:
-            # Not inside any column: blank space on the right (in the viewport, right of the
-            # last column) → try opening a new column; otherwise use the nearest column
-            # 不在任何列内：右侧空白（视口内、最后一列右侧）→ 尝试开新列；否则最近列
+            # Blank space on the right (in the viewport, right of the last column) → try
+            # opening a new column; otherwise use the nearest column
+            # 右侧空白（视口内、最后一列右侧）→ 尝试开新列；否则最近列
             max_col = max(col_xs)
             last_right = col_xs[max_col][1]
             sc = self._find_scroll()
@@ -789,25 +869,28 @@ class EmojiGridWidget(QWidget):
             if pos.x() > last_right and in_view:
                 new_col = self._blank_zone_col(exclude)
                 if new_col is not None:
-                    return (new_col, 0)  # Open a new column / 开新列
-                # Cannot open a new column → append to the end of the last column
-                # 不能开新列 → 最后一列末尾
-                return (max_col, len(cols[max_col]))
+                    return ("blank", new_col, 0, None)  # Open a new column / 开新列
+                return ("insert", max_col, len(cols[max_col]), None)  # Last column end / 末列末尾
             best, bd = None, float("inf")
             for ci, (x0, x1) in col_xs.items():
                 d = abs(pos.x() - (x0 + x1) // 2)
                 if d < bd:
                     bd, best = d, ci
             target_col = best
-        # Insertion order inside the column: compare pos.y with the card centers
-        # 列内插入位置：比较 pos.y 与卡片中心
         col_items = sorted(cols[target_col], key=lambda e: e[1][1])
+        # 1) Cursor is inside a card's rect → swap with that card
+        #    光标在卡片矩形内 → 与该卡片交换
+        for em, r in col_items:
+            if r[1] <= pos.y() <= r[1] + r[3]:
+                return ("swap", target_col, 0, em["id"])
+        # 2) Otherwise insert into the gap: compare pos.y with card centers
+        #    否则在间隙处插入：比较 pos.y 与卡片中心
         order = len(col_items)
         for i, (_e, r) in enumerate(col_items):
             if pos.y() < r[1] + r[3] / 2:
                 order = i
                 break
-        return (target_col, order)
+        return ("insert", target_col, order, None)
 
     # Right blank zone: if the dragged card can open a new column by itself, return the new
     # column number, otherwise None / 右侧空白区：若被拖卡片能单独开一列则返回新列号，否则返回 None
@@ -907,6 +990,8 @@ class EmojiGridWidget(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        # Keep the drop overlay covering the whole grid / 让拖放覆盖层始终覆盖整个网格
+        self._drop_overlay.setGeometry(self.rect())
         # Merge overflowing columns when the window shrinks (150ms debounce: a resize storm
         # from dragging the window edge triggers only one pass)
         # 缩小窗口时融合溢出列（150ms 防抖：拖拽窗口边缘的 resize 风暴只触发一次）

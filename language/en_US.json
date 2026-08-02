@@ -92,6 +92,8 @@
     "thread_count": "Threads:",
     "thread_count_unit": "cores",
     "rearrange": "Rearrange (evenly distribute by window width)",
+    "sort_by_name": "Sort by Name",
+    "sort_by_time": "Sort by Created Time",
     "cat_general": "General",
     "cat_send": "Send",
     "cat_hotkey": "Hotkey",

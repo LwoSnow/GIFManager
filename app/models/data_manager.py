@@ -106,6 +106,58 @@ class DataManager:
         self._conn.commit()
         self._ensure_builtin("All", "image", 0)
         self._ensure_builtin("Default Expression", "image", 1)
+        self._cleanup_duplicate_builtins()
+
+    def _cleanup_duplicate_builtins(self):
+        # An older buggy version matched builtin groups by name, so renaming the default group
+        # created a duplicate builtin default group. Merge every duplicate into the canonical
+        # one (sort_order=1) and re-normalize its columns.
+        # 旧版按名字匹配内置分组，重命名默认分组会产生重复的内置默认分组。
+        # 将重复分组合并到正统分组（sort_order=1）并重排其列。
+        all_id = self._all_group_id()
+        rows = self._conn.execute(
+            "SELECT * FROM groups WHERE is_builtin=1"
+        ).fetchall()
+        defaults = [dict(r) for r in rows if r["id"] != all_id]
+        if len(defaults) <= 1:
+            return
+        keep = min(defaults, key=lambda g: (g["sort_order"], g["id"]))
+        keep_dir = os.path.join(self._emojis_dir, keep["name"])
+        for dup in defaults:
+            if dup["id"] == keep["id"]:
+                continue
+            dup_dir = os.path.join(self._emojis_dir, dup["name"])
+            for e in self._conn.execute(
+                "SELECT * FROM emojis WHERE group_id=?", (dup["id"],)
+            ).fetchall():
+                em = dict(e)
+                # Move the file only when the directories differ / 目录不同才移动文件
+                if em["filename"] and dup_dir != keep_dir:
+                    src = os.path.join(dup_dir, em["filename"])
+                    dst = os.path.join(keep_dir, em["filename"])
+                    if os.path.isfile(src):
+                        os.makedirs(keep_dir, exist_ok=True)
+                        try:
+                            shutil.move(src, dst)
+                        except OSError:
+                            pass
+                self._conn.execute(
+                    "UPDATE emojis SET group_id=? WHERE id=?",
+                    (keep["id"], em["id"]),
+                )
+            self._conn.execute("DELETE FROM groups WHERE id=?", (dup["id"],))
+        self._conn.commit()
+        self._renormalize_columns(keep["id"])
+
+    def _renormalize_columns(self, group_id):
+        # Re-distribute all cards of a group row-first keeping their relative global order
+        # 保持全局相对顺序，将该组所有卡片行优先重新分列
+        emojis = self.get_emojis_by_group(group_id)
+        if not emojis:
+            return
+        emojis.sort(key=lambda e: (int(e.get("col_index", 0)), int(e.get("sort_order", 0))))
+        col_count = len({int(e.get("col_index", 0)) for e in emojis}) or 1
+        self._redistribute([e["id"] for e in emojis], group_id, col_count)
 
     def _ensure_builtin(self, name, grp_type, sort_order):
         # Create builtin groups only when missing; never force-rename them
@@ -561,6 +613,30 @@ class DataManager:
         self._conn.commit()
         return True
 
+    def swap_emoji_columns(self, emoji_a, emoji_b):
+        # Swap the column/order of two cards (drag onto the middle of a card).
+        # Returns True on success / 交换两张卡片的列与列内位置（拖到卡片中间时）。成功返回 True
+        rows = self._conn.execute(
+            "SELECT id, group_id, col_index, sort_order FROM emojis WHERE id IN (?,?)",
+            (emoji_a, emoji_b),
+        ).fetchall()
+        if len(rows) != 2:
+            return False
+        info = {r[0]: {"group": r[1], "col": r[2], "order": r[3]} for r in rows}
+        if info[emoji_a]["group"] != info[emoji_b]["group"]:
+            return False
+        a, b = info[emoji_a], info[emoji_b]
+        self._conn.execute(
+            "UPDATE emojis SET col_index=?, sort_order=?, user_sorted=1 WHERE id=?",
+            (b["col"], b["order"], emoji_a),
+        )
+        self._conn.execute(
+            "UPDATE emojis SET col_index=?, sort_order=?, user_sorted=1 WHERE id=?",
+            (a["col"], a["order"], emoji_b),
+        )
+        self._conn.commit()
+        return True
+
     def assign_unassigned_columns(self, group_id, usable_w, spacing, width_of):
         # Batch column allocation: Cards with user_sorted=0 in the group (newly
         # imported old data) are allocated one by one according to the column container rules
@@ -614,23 +690,83 @@ class DataManager:
         emojis = self.get_emojis_by_group(group_id)
         if not emojis:
             return 0
+        ordered = [e["id"] for e in emojis]
+        return self._redistribute(ordered, group_id, col_count)
+
+    def sort_group_emojis(self, group_id, by="name", desc=False):
+        # Sort all cards in the group by name / created time and re-distribute columns
+        # (row-first fill). Returns the number of sorted cards.
+        # 按名称 / 加入时间排序组内所有卡片并重新分配列（行优先填充）。返回排序卡片数。
+        emojis = self.get_emojis_by_group(group_id)
+        if not emojis:
+            return 0
+        if by == "time":
+            # created_at has second precision; tie-break by id (insert order)
+            # created_at 秒级精度，同秒用 id（插入顺序）区分
+            emojis.sort(
+                key=lambda e: (e.get("created_at", ""), e["id"]),
+                reverse=desc,
+            )
+        else:
+            # Name sort: case-insensitive, empty names go last / 名称排序：忽略大小写，空名排后
+            emojis.sort(
+                key=lambda e: (e.get("original_name", "") or "").lower(),
+                reverse=desc,
+            )
+        # Keep the current column count so the sort is a one-time action / 保留当前列数（单次整理）
+        col_count = len({int(e.get("col_index", 0)) for e in emojis}) or 1
+        return self._redistribute([e["id"] for e in emojis], group_id, col_count)
+
+    def prepend_emojis(self, group_id, new_ids):
+        # Place the newly added cards at the top-left corner: prepend them (in insert order) to
+        # the global order and re-distribute columns row-first, so existing cards shift back.
+        # Returns the number of cards re-distributed.
+        # 将本次新增的卡片放到左上角：新卡（按加入顺序）插到全局顺序最前并重新行优先分列，
+        # 旧卡整体后移。返回重分配卡片数。
+        emojis = self.get_emojis_by_group(group_id)
+        if not emojis:
+            return 0
+        # Existing order / 现有全局顺序（列主序即视觉顺序）
+        emojis.sort(key=lambda e: (int(e.get("col_index", 0)), int(e.get("sort_order", 0))))
+        old_ids = [e["id"] for e in emojis if e["id"] not in new_ids]
+        ordered = list(new_ids) + old_ids
+        col_count = len({int(e.get("col_index", 0)) for e in emojis}) or 1
+        return self._redistribute(ordered, group_id, col_count)
+
+    def prepend_latest_imports(self, group_id, count):
+        # Prepend the `count` most recently imported cards to the top-left corner (newest batch
+        # from a single import). Insert order = ascending id (earliest first).
+        # 将最近导入的 count 张卡片放到左上角（单次批量导入的最新一批）。顺序按 id 升序（先导入的在前）。
+        if count <= 0:
+            return 0
+        emojis = self.get_emojis_by_group(group_id)
+        if not emojis:
+            return 0
+        emojis.sort(key=lambda e: e["id"], reverse=True)  # Newest first / 最新在前
+        new_ids = [e["id"] for e in emojis[:count]]
+        new_ids.reverse()  # Insert order: earliest first / 按加入顺序：先导入的在前
+        return self.prepend_emojis(group_id, new_ids)
+
+    def _redistribute(self, ordered_ids, group_id, col_count):
+        # Row-first redistribution: card i → column i%K, intra-column order i//K
+        # 行优先重分配：卡 i → 列 i%K，列内序 i//K
         k = max(1, int(col_count))
         cols = [[] for _ in range(k)]
-        for i, e in enumerate(emojis):
-            cols[i % k].append(e)
+        for i, eid in enumerate(ordered_ids):
+            cols[i % k].append(eid)
         self._conn.execute("BEGIN")
         try:
             for ci, lst in enumerate(cols):
-                for idx, e in enumerate(lst):
+                for idx, eid in enumerate(lst):
                     self._conn.execute(
                         "UPDATE emojis SET col_index=?, sort_order=?, user_sorted=1 WHERE id=?",
-                        (ci, idx, e["id"]),
+                        (ci, idx, eid),
                     )
             self._conn.commit()
         except Exception:
             self._conn.rollback()
             raise
-        return len(emojis)
+        return len(ordered_ids)
 
     def merge_columns_into(self, group_id, source_cols, target_cols):
         emojis = self.get_emojis_by_group(group_id)
@@ -720,10 +856,32 @@ class DataManager:
             mime.setUrls([QUrl.fromLocalFile(filepath)])
             clipboard.setMimeData(mime)
         else:
-            img = QImage(filepath)
-            if img.isNull():
-                return False
-            clipboard.setImage(img)
+            # GIF must keep animation: QImage decodes only the first frame,
+            # so put the raw bytes into image/gif mime for WeChat/QQ to
+            # recognize it as an animated image. Also attach the file URL
+            # for extra compatibility.
+            # GIF 需保留动画：QImage 只解码首帧，故将原始字节放入 image/gif
+            # mime，供微信/QQ 识别为动图；同时附带文件路径增强兼容。
+            is_gif = False
+            try:
+                with open(filepath, "rb") as f:
+                    is_gif = f.read(4) == b"GIF8"
+            except OSError:
+                pass
+            if is_gif:
+                mime = QMimeData()
+                try:
+                    with open(filepath, "rb") as f:
+                        mime.setData("image/gif", f.read())
+                except OSError:
+                    return False
+                mime.setUrls([QUrl.fromLocalFile(filepath)])
+                clipboard.setMimeData(mime)
+            else:
+                img = QImage(filepath)
+                if img.isNull():
+                    return False
+                clipboard.setImage(img)
 
         return True
 

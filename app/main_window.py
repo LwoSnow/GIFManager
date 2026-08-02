@@ -180,7 +180,7 @@ class MainWindow(QMainWindow):
             self.show()
 
     def _apply_autostart(self):
-        # 开机启动项
+        # Windows startup entry (registry Run key) / 开机启动项（注册表 Run 键）
         if sys.platform != "win32":
             return
         try:
@@ -509,6 +509,9 @@ class MainWindow(QMainWindow):
             group_info["name"] if group_info else target_group,
             len(files), imported, duplicated,
         )
+        # New cards go to the top-left corner / 新导入的卡片放到左上角
+        if imported > 0:
+            self.data_manager.prepend_latest_imports(target_group, imported)
         self._refresh_emoji_grid()
         self._refresh_status()
         msg = tr("import_success", count=imported, group=group_info["name"])
@@ -531,7 +534,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, tr("text_duplicate_title"), tr("text_duplicate_msg"))
                 return
             if r > 0:
-                self._assign_new_text(r, text.strip())
+                # New text emoji goes to the top-left corner / 新文字表情放到左上角
+                self.data_manager.prepend_emojis(self.current_group_id, [r])
             self._refresh_emoji_grid()
             self._refresh_status()
             self.status_bar.showMessage(f"  {tr('added_to', group=g['name'])}", 2000)
@@ -575,16 +579,20 @@ class MainWindow(QMainWindow):
                     if text.strip():
                         added = 0
                         skipped = 0
+                        new_ids = []
                         for line in text.strip().split("\n"):
                             line = line.strip()
                             if not line:
                                 continue
                             r = self.data_manager.add_text_emoji(self.current_group_id, line)
                             if r > 0:
-                                self._assign_new_text(r, line)
+                                new_ids.append(r)
                                 added += 1
                             elif r == 0:
                                 skipped += 1
+                        if new_ids:
+                            # Pasted text goes to the top-left corner / 粘贴的文字放到左上角
+                            self.data_manager.prepend_emojis(self.current_group_id, new_ids)
                         self._refresh_emoji_grid()
                         self._refresh_status()
                         msg = tr("pasted_to", group=g["name"])

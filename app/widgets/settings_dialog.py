@@ -264,6 +264,9 @@ class SettingsDialog(QDialog):
         self._theme_group = QGroupBox(tr("theme_group"))
         theme_layout = QHBoxLayout(self._theme_group)
         self._theme_combo = QComboBox()
+        self._theme_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
         self._theme_combo.addItem(tr("theme_dark"), "dark")
         self._theme_combo.addItem(tr("theme_light"), "light")
         idx = self._theme_combo.findData(self._theme)
@@ -502,7 +505,8 @@ class SettingsDialog(QDialog):
         self._spin_threads.setValue(self._thread_count)
         self._spin_threads.setFixedWidth(72)
         row.addWidget(self._spin_threads)
-        row.addWidget(QLabel(tr("thread_count_unit")))
+        self._label_threads_unit = QLabel(tr("thread_count_unit"))
+        row.addWidget(self._label_threads_unit)
         row.addStretch()
         perf_layout.addLayout(row)
         self._page_layout.addWidget(self._perf_group)
@@ -543,6 +547,10 @@ class SettingsDialog(QDialog):
                 item.setText(tr(key))
         # General page / 通用页
         self._theme_group.setTitle(tr("theme_group"))
+        # Theme combo option texts / 主题下拉选项文本
+        for i in range(self._theme_combo.count()):
+            key = "theme_dark" if self._theme_combo.itemData(i) == "dark" else "theme_light"
+            self._theme_combo.setItemText(i, tr(key))
         self._lang_group.setTitle(tr("language_group"))
         self._other_group.setTitle(tr("other_group"))
         self._cb_remember.setText(tr("remember_group"))
@@ -569,10 +577,17 @@ class SettingsDialog(QDialog):
         self._perf_group.setTitle(tr("perf_group"))
         self._perf_hint.setText(tr("perf_hint"))
         self._label_threads.setText(tr("thread_count"))
+        self._label_threads_unit.setText(tr("thread_count_unit"))
         # Buttons / 按钮
         self._btn_ok.setText(tr("ok"))
         self._btn_cancel.setText(tr("cancel"))
         self._btn_apply.setText(tr("apply"))
+        # Relayout so longer English texts get full width (avoids truncation
+        # like "Dark mo" when switching language without reopening)
+        # 强制重新布局：更长的英文文本获得完整宽度（避免如 "Dark mo" 截断）
+        self._theme_combo.updateGeometry()
+        self.layout().invalidate()
+        self.layout().activate()
 
     def send_mode(self):
         return 0 if self._rb_file.isChecked() else 1

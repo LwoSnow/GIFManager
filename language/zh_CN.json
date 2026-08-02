@@ -92,6 +92,8 @@
     "thread_count": "多线程核心数：",
     "thread_count_unit": "核",
     "rearrange": "一键整理（按窗口宽度均匀分列）",
+    "sort_by_name": "按名称整理",
+    "sort_by_time": "按加入时间整理",
     "cat_general": "通用",
     "cat_send": "发送",
     "cat_hotkey": "快捷键",

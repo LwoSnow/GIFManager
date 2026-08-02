@@ -256,8 +256,11 @@ class GroupListWidget(QWidget):
         self.group_changed.emit(group_id)
 
     def _update_active_style(self):
+        all_id = self._dm._all_group_id()
+        current = self._current_group_id
         for gid, btn in self._buttons.items():
-            is_active = (gid == self._current_group_id)
+            # None means "全部": highlight its button too / None 表示"全部"：同样高亮"全部"按钮
+            is_active = (gid == current) or (current is None and gid == all_id)
             btn.setProperty("active", is_active)
             btn.style().unpolish(btn)
             btn.style().polish(btn)
@@ -306,10 +309,21 @@ class GroupListWidget(QWidget):
             tr("confirm_delete_group_msg", name=g["name"]),
         )
         if reply == QMessageBox.StandardButton.Yes:
+            # Remember the group before the deleted one (current visual order, "全部" first)
+            # 记住被删分组在当前顺序中的前一个（"全部"在最前）
+            ids = list(self._buttons.keys())
+            prev_id = None
+            if group_id in ids:
+                idx = ids.index(group_id)
+                prev_id = ids[idx - 1] if idx > 0 else None
             self._dm.delete_group(group_id)
-            if self._current_group_id == group_id:
-                self.select_all_group()
             self._rebuild()
+            if self._current_group_id == group_id:
+                # Jump to the previous group to avoid an unselected state / 跳转到前一个分组，避免无选中状态
+                if prev_id is not None and prev_id in self._buttons:
+                    self.select_group(prev_id)
+                else:
+                    self.select_all_group()
             self.groups_updated.emit()
 
     # ------------------------------------------------------------------
