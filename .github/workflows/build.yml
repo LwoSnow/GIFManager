@@ -63,9 +63,14 @@ jobs:
       - name: Build installer (Inno Setup)
         shell: pwsh
         run: |
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
-            "/DMyAppVersion=${{ inputs.version }}" `
-            "installer\GIFManager.iss"
+          $iscc = Get-ChildItem "C:\Program Files*\Inno Setup*\ISCC.exe" -ErrorAction SilentlyContinue |
+                  Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $iscc) {
+            Write-Error "ISCC.exe not found under C:\Program Files*\Inno Setup*"
+            exit 1
+          }
+          & $iscc "/DMyAppVersion=${{ inputs.version }}" "installer\GIFManager.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
