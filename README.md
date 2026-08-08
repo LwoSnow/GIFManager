@@ -17,7 +17,7 @@ manage them in groups, and send them to any chat window in one click.
   always available for quick imports.
 - **Two group types**
   - *Image groups* — store GIF/PNG/JPG/WebP/BMP stickers.
-  - *Text groups* — store pure text (kaomoji / 颜文字). Paste text with **Ctrl+V**
+  - *Text groups* — store pure text (kaomoji / Emoticon). Paste text with **Ctrl+V**
     to batch-save each line as a sticker.
 - **Import method**
   - `Import GIF` button → *Import from folder* (recursive scan) or *Import from files*
