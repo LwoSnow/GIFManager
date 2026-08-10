@@ -55,6 +55,15 @@ manage them in groups, and send them to any chat window in one click.
 
 ---
 
+## AI Disclosure
+
+This project used AI-assisted development tools:
+
+- **Tool**: DeepSeek v4 flash 0731
+- **Role**: Code generation, implementation assistance
+- **Human oversight**: All code was reviewed, tested, and integrated by the project maintainer
+
+---
 ## UI Layout
 
 ```
