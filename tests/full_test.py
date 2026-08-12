@@ -1,11 +1,16 @@
-"""GIFManager 发布前全线测试（离屏、数据隔离）
+"""GIFManager pre-release full-line test (offscreen, data isolated)
+GIFManager 发布前全线测试（离屏、数据隔离）
 
-覆盖：
-  A. 数据层（DataManager 全 API + 边界）
-  B. UI 集成（主窗口全部交互路径，含对话框 monkeypatch）
-  C. 边界/鲁棒性
-  D. 性能基准（批量导入对比、启动、切换、搜索、复制、删除、内存）
+Coverage / 覆盖:
+  A. Data layer: full DataManager API + edge cases / A. 数据层（DataManager 全 API + 边界）
+  B. UI integration: all main-window paths, dialog monkeypatches
+     B. UI 集成（主窗口全部交互路径，含对话框 monkeypatch）
+  C. Edge cases & robustness / C. 边界/鲁棒性
+  D. Performance baselines: batch import, startup, switching, search, copy, delete, memory
+     D. 性能基准（批量导入对比、启动、切换、搜索、复制、删除、内存）
 
+Result: PASS/FAIL printed to console; passed items + performance are written to
+TEST_REPORT.md (bugs stay out of the md).
 结果：PASS/FAIL 收集到控制台；通过项 + 性能写入 TEST_REPORT.md（bug 不写入 md）。
 """
 import os
@@ -22,6 +27,7 @@ TMP = tempfile.mkdtemp(prefix="gifmgr_full_")
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 sys.path.insert(0, ROOT)
 
+# ---- Isolation (must run before MainWindow / DataManager instantiation) ----
 # ---- 隔离（必须在 MainWindow / DataManager 实例化前）----
 import app.main_window as mw_mod
 
@@ -43,7 +49,7 @@ dm_mod._app_data_dir = lambda: os.path.join(TMP, "data")
 
 import app.models.logger as log_mod
 log_mod.logs_dir = lambda: (os.makedirs(os.path.join(TMP, "logs"), exist_ok=True)
-                             or os.path.join(TMP, "logs"))  # 日志隔离到临时目录
+                             or os.path.join(TMP, "logs"))  # logs isolated to temp dir / 日志隔离到临时目录
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtCore import Qt, QEvent, QPointF, QMimeData, QUrl, QThreadPool
@@ -57,7 +63,7 @@ app = QApplication(sys.argv)
 
 RESULTS = {}
 CHECKS = []  # {name, ok, detail}
-FAILS = []   # 仅在界面汇报，不写入 md
+FAILS = []   # Reported to the console only, not into the md / 仅在界面汇报，不写入 md
 
 
 def now():
@@ -118,8 +124,10 @@ def mem_mb():
             _fields_ = [
                 ("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
                 ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
-                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
                 ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
             ]
         psapi = ctypes.WinDLL("psapi")
@@ -149,6 +157,7 @@ check("A0 内置分组存在", dm.get_group_by_name("All") and dm.get_group_by_n
 g_def = dm.get_group_by_name("Default Expression")
 g_all = dm.get_group_by_name("All")
 
+# ---- Group CRUD ----
 # ---- 分组 CRUD ----
 g_img = dm.create_group("测试图片组", "image")
 g_txt = dm.create_group("测试文字组", "text")
@@ -173,6 +182,7 @@ dm.reorder_group(g_img2, 0)
 order = [g["name"] for g in dm.get_all_groups()]
 check("A10 分组重排且「全部」固定首位", order[0] == "All" and order[1] == "图片组2", order)
 
+# ---- Single import ----
 # ---- 单张导入 ----
 imgdir = os.path.join(TMP, "imgs")
 imgs = gen_images(6, imgdir)
@@ -184,13 +194,15 @@ check("A14 不支持扩展名 error", dm.import_emoji(g_img, os.path.join(imgdir
 check("A15 缺失文件 error", dm.import_emoji(g_img, os.path.join(imgdir, "nope.png")) == "error")
 check("A16 导入到文字分组 error", dm.import_emoji(g_txt, p1) == "error")
 
+# ---- Batch import ----
 # ---- 批量导入 ----
 batch_files = gen_images(30, os.path.join(TMP, "batch"), prefix="b", offset=100)
 imp, dup = dm.import_emojis_batch(g_img2, batch_files, workers=4)
 check("A17 批量导入(4线程)", imp == 30 and dup == 0, f"imported={imp} dup={dup}")
 imp2, dup2 = dm.import_emojis_batch(g_img2, batch_files, workers=4)
 check("A18 批量重复检测", imp2 == 0 and dup2 == 30, f"imported={imp2} dup={dup2}")
-mixed = gen_images(5, os.path.join(TMP, "mix"), prefix="m", offset=200) + [os.path.join(imgdir, "x.txt")]
+mixed = gen_images(5, os.path.join(TMP, "mix"), prefix="m", offset=200) \
+    + [os.path.join(imgdir, "x.txt")]
 imp3, dup3 = dm.import_emojis_batch(g_img2, mixed, workers=2)
 check("A19 批量混合无效文件只处理有效", imp3 == 5 and dup3 == 0, f"{imp3}/{dup3}")
 imp4, dup4 = dm.import_emojis_batch(g_img2, batch_files[:3], workers=1)
@@ -198,6 +210,7 @@ check("A20 批量 workers=1", imp4 == 0 and dup4 == 3)
 imp5, _d = dm.import_emojis_batch(g_img2, [], workers=8)
 check("A21 批量空列表", imp5 == 0)
 
+# ---- Text emojis ----
 # ---- 文字 ----
 r1 = dm.add_text_emoji(g_txt, "颜文字(•̀ᴗ•́)✧")
 check("A22 添加文字 ok", r1 > 0)
@@ -205,6 +218,7 @@ check("A23 文字重复返回 0", dm.add_text_emoji(g_txt, "颜文字(•̀ᴗ�
 check("A24 空文字返回 -1", dm.add_text_emoji(g_txt, "   ") == -1)
 check("A25 文字加到图片组 -1", dm.add_text_emoji(g_img2, "x") == -1)
 
+# ---- Delete ----
 # ---- 删除 ----
 emoji_g = dm.get_emojis_by_group(g_img)[0]
 fp = dm.emoji_filepath(emoji_g)
@@ -214,14 +228,17 @@ check("A27 删除后文件消失", not os.path.isfile(fp))
 dm.delete_emoji(999999)
 check("A28 删除不存在 id 无异常", True)
 
+# ---- Rename / update ----
 # ---- 重命名 / 更新 ----
 e2 = dm.get_emojis_by_group(g_img2)[0]
 dm.rename_emoji(e2["id"], "新名字")
 check("A29 rename_emoji", dm.get_emojis_by_group(g_img2)[0]["original_name"] == "新名字")
 e_txt = dm.get_emojis_by_group(g_txt)[0]
 dm.update_text_content(e_txt["id"], "新文字内容(๑•̀ㅂ•́)و✧")
-check("A30 update_text_content", dm.get_emojis_by_group(g_txt)[0]["text_content"] == "新文字内容(๑•̀ㅂ•́)و✧")
+check("A30 update_text_content",
+      dm.get_emojis_by_group(g_txt)[0]["text_content"] == "新文字内容(๑•̀ㅂ•́)و✧")
 
+# ---- Move ----
 # ---- 移动 ----
 mv = dm.get_emojis_by_group(g_img2)[0]
 mvfp = dm.emoji_filepath(mv)
@@ -234,6 +251,7 @@ mv2 = dm.get_emojis_by_group(g_txt)[0]
 check("A33 文字移动到图片组拒绝", not dm.move_emoji(mv2["id"], g_img2))
 check("A34 移动到不存在组 False", not dm.move_emoji(mv["id"], 99999))
 
+# ---- Copies (same image across groups) ----
 # ---- 副本（同图跨组）----
 dm.import_emoji(g_img, imgs[4])
 dm.import_emoji(g_img2, imgs[4])
@@ -242,6 +260,7 @@ rec4 = next(e for e in dm.get_emojis_by_group(g_img2)
 copies = dm.get_emoji_copies(rec4)
 check("A35 跨组副本查询", len(copies) >= 2, f"copies={len(copies)}")
 
+# ---- Column ops (stable text-group columns; fresh group avoids stale interference) ----
 # ---- 列操作（文字分组稳定列，用全新分组避免存量干扰）----
 g_col = dm.create_group("列测试组", "text")
 ids = [dm.add_text_emoji(g_col, f"列测试文本{i}") for i in range(6)]
@@ -260,12 +279,15 @@ check("A36 set_emoji_column 列重排",
 n = dm.assign_unassigned_columns(g_col, 600, 8, lambda e: 120)
 check("A37 无未分配卡片（二次摊列为 0）", n == 0, f"assigned={n}")
 n2 = dm.rearrange_columns(g_col, 2)
-check("A38 rearrange_columns 一键整理", n2 == 6 and dm.text_max_col(g_col) == 1, f"rearranged={n2} maxcol={dm.text_max_col(g_col)}")
+check("A38 rearrange_columns 一键整理", n2 == 6 and dm.text_max_col(g_col) == 1,
+      f"rearranged={n2} maxcol={dm.text_max_col(g_col)}")
 moved_n = dm.merge_columns_into(g_col, [0], [1])
 check("A39 merge_columns_into 列融合", moved_n > 0 and dm.text_max_col(g_col) == 1, f"moved={moved_n}")
 dm.compact_text_columns(g_col)
-check("A40 compact_text_columns 列压缩", dm.text_max_col(g_col) == 0, f"max_col={dm.text_max_col(g_col)}")
+check("A40 compact_text_columns 列压缩", dm.text_max_col(g_col) == 0,
+      f"max_col={dm.text_max_col(g_col)}")
 
+# ---- Query ----
 # ---- 查询 ----
 all_list = dm.get_all_emojis()
 kw_list = dm.get_all_emojis("新名字")
@@ -274,19 +296,29 @@ check("A41 get_all_emojis 去重+关键词",
       f"all={len(all_list)} kw={len(kw_list)}")
 grp_kw = dm.get_emojis_by_group(g_col, "列测试")
 check("A42 组内关键词搜索", len(grp_kw) >= 3, f"hit={len(grp_kw)}")
-text_total = sum(dm.count_emojis_in_group(g["id"]) for g in dm.get_all_groups() if g["type"] == "text")
+text_total = sum(
+    dm.count_emojis_in_group(g["id"]) for g in dm.get_all_groups()
+    if g["type"] == "text"
+)
 check("A43 计数接口一致", dm.count_all_emojis() == dm.count_image_emojis() + text_total)
 
+# ---- Clipboard ----
 # ---- 剪贴板 ----
 ok_txt = dm.copy_to_clipboard(dm.get_emojis_by_group(g_txt)[0])
-check("A44 文字复制到剪贴板", ok_txt and app.clipboard().text() == dm.get_emojis_by_group(g_txt)[0]["text_content"])
+check("A44 文字复制到剪贴板",
+      ok_txt and app.clipboard().text()
+      == dm.get_emojis_by_group(g_txt)[0]["text_content"])
 img_e = dm.get_emojis_by_group(g_img2)[0]
 ok_p = dm.copy_to_clipboard(img_e, mode=0)
 check("A45 复制文件路径 mime", ok_p and app.clipboard().mimeData().hasUrls())
 ok_i = dm.copy_to_clipboard(img_e, mode=1)
 check("A46 复制图片数据", ok_i and not app.clipboard().image().isNull())
-check("A47 缺失文件复制 False", not dm.copy_to_clipboard({"filename": "nope.png", "group_id": g_img2, "text_content": ""}, mode=0))
+check("A47 缺失文件复制 False",
+      not dm.copy_to_clipboard(
+          {"filename": "nope.png", "group_id": g_img2, "text_content": ""}, mode=0
+      ))
 
+# ---- Cascade delete of a group ----
 # ---- 删除分组级联 ----
 dm.import_emoji(g_img2, p1)
 g_del = dm.create_group("待删组", "image")
@@ -323,7 +355,7 @@ w.group_list.select_all_group()
 flush(80)
 check("B5 全部视图按钮恢复", w.btn_import.isVisible() and not w.btn_add_text.isVisible())
 
-# 搜索
+# Search / 搜索
 w.search_bar.setText("新名字")
 flush(80)
 check("B6 搜索过滤生效", len(w.emoji_grid._items) >= 1, f"cards={len(w.emoji_grid._items)}")
@@ -333,13 +365,13 @@ check("B7 搜索无结果显示占位", w.emoji_grid._placeholder.isVisible())
 w.search_bar.setText("")
 flush(80)
 
-# _do_import（全部 → 默认表情）+ 批量路径
+# _do_import (All -> Default) + batch path / _do_import（全部 → 默认表情）+ 批量路径
 before_def = dm.count_emojis_in_group(g_def["id"])
 w._do_import(gen_images(5, os.path.join(TMP, "ui_import"), prefix="u"))
 flush(80)
 check("B8 「全部」下导入落到默认表情", dm.count_emojis_in_group(g_def["id"]) == before_def + 5)
 
-# 拖放导入（QDropEvent 模拟）
+# Drag-and-drop import (simulated QDropEvent) / 拖放导入（QDropEvent 模拟）
 more = gen_images(3, os.path.join(TMP, "ui_drop"), prefix="d", offset=300)
 mime = QMimeData()
 mime.setUrls([QUrl.fromLocalFile(f) for f in more])
@@ -350,7 +382,7 @@ w.dropEvent(ev)
 flush(80)
 check("B9 拖放文件批量导入", dm.count_emojis_in_group(g_def["id"]) == before_def2 + 3)
 
-# 文字粘贴（Ctrl+V 多行）
+# Text paste (Ctrl+V, multiple lines) / 文字粘贴（Ctrl+V 多行）
 w.group_list.select_group(g_txt)
 flush(80)
 from PySide6.QtGui import QClipboard
@@ -360,7 +392,7 @@ w.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_V, Qt.KeyboardModifie
 flush(80)
 check("B10 文字粘贴 3 行新增 3 条", dm.count_emojis_in_group(g_txt) == before_txt + 3)
 
-# 添加文字（monkeypatch QInputDialog）
+# Add text (monkeypatched QInputDialog) / 添加文字（monkeypatch QInputDialog）
 with mock.patch.object(mw_mod.QInputDialog, "getMultiLineText",
                        staticmethod(lambda *a, **k: ("手动添加的文字(｡･ω･｡)", True))):
     before_txt2 = dm.count_emojis_in_group(g_txt)
@@ -368,15 +400,16 @@ with mock.patch.object(mw_mod.QInputDialog, "getMultiLineText",
     flush(50)
     check("B11 添加文字按钮路径", dm.count_emojis_in_group(g_txt) == before_txt2 + 1)
 
-# 卡片点击复制
+# Card click copies to clipboard / 卡片点击复制
 w.group_list.select_group(g_img2)
 flush(80)
 cards = w.emoji_grid._items
 if cards:
     w._on_emoji_clicked(cards[0]._emoji)
-    check("B12 卡片点击复制", app.clipboard().mimeData().hasUrls() or not app.clipboard().image().isNull())
+    check("B12 卡片点击复制",
+          app.clipboard().mimeData().hasUrls() or not app.clipboard().image().isNull())
 
-# 删除卡片（monkeypatch 确认框）
+# Delete a card (monkeypatched confirmation box) / 删除卡片（monkeypatch 确认框）
 with mock.patch.object(mw_mod.QMessageBox, "question",
                        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)):
     target = w.emoji_grid._items[0]._emoji
@@ -385,13 +418,14 @@ with mock.patch.object(mw_mod.QMessageBox, "question",
     flush(50)
     check("B13 删除卡片路径", dm.count_all_emojis() == n_before - 1)
 
-# 移动到分组
+# Move to a group / 移动到分组
 src = dm.get_emojis_by_group(g_img2)[0]
 w._do_move(src, g_img)
 fresh_src = next(e for e in dm.get_emojis_by_group(g_img) if e["id"] == src["id"])
 check("B14 移动分组路径", fresh_src["group_id"] == g_img)
 
-# 设置对话框（走真实打开路径，确保 Apply 信号已连接）
+# Settings dialog (real open path, ensures the Apply signal is wired) / 设置对话框（走真实
+# 打开路径，确保 Apply 信号已连接）
 w._open_settings()
 dlg = w._settings_dialog
 flush(80)
@@ -400,7 +434,7 @@ dlg._cat_list.setCurrentRow(1)
 flush(30)
 check("B16 分类切换", dlg._stack.currentIndex() == 1)
 
-# Apply（主题/语言/线程数）
+# Apply (theme / language / thread count) / Apply（主题/语言/线程数）
 dlg._theme_combo.setCurrentIndex(dlg._theme_combo.findData("light"))
 dlg._lang_combo.setCurrentIndex(dlg._lang_combo.findData("en_US"))
 dlg._spin_threads.setValue(3)
@@ -413,53 +447,55 @@ check("B17d Apply 后按钮文本英文", w.btn_import.text() == "Import GIF", w
 dlg.refresh_translations()
 check("B18 设置对话框实时翻译", dlg._btn_ok.text() == "OK" and dlg._cat_list.item(0).text() == "General")
 
-# OK 关闭（切回 zh_CN）
+# OK closes and applies (switch back to zh_CN) / OK 关闭（切回 zh_CN）
 dlg._lang_combo.setCurrentIndex(dlg._lang_combo.findData("zh_CN"))
 dlg._theme_combo.setCurrentIndex(dlg._theme_combo.findData("dark"))
 w._on_settings_finished(SettingsDialog.DialogCode.Accepted)
 flush(80)
 check("B19 OK 应用并关闭", current_language() == "zh_CN" and w._theme == "dark"
       and w.btn_import.text() == tr("import_gif"))
-check("B20 设置持久化", w._settings.value("theme") == "dark" and w._settings.value("language") == "zh_CN")
+check("B20 设置持久化",
+      w._settings.value("theme") == "dark" and w._settings.value("language") == "zh_CN")
 
-# 热键
+# Hotkey / 热键
 w._apply_hotkey(0, 0)
 check("B21 热键清除", w._hotkey_mods == 0 and w._hotkey_vk == 0)
 
-# 托盘
+# Tray / 托盘
 w._toggle_visible()
 check("B22 托盘隐藏", not w.isVisible())
 w._toggle_visible()
 check("B23 托盘显示", w.isVisible())
 
-# 日志
+# Logs / 日志
 log_file = os.listdir(os.path.join(TMP, "logs"))
 check("B24 启动生成日志文件", len(log_file) >= 1, log_file)
 n_logs = log_mod.clear_logs()
-check("B25 clear_logs 清理", n_logs >= 1 and os.path.exists(os.path.join(TMP, "logs")), f"removed={n_logs}")
+check("B25 clear_logs 清理", n_logs >= 1 and os.path.exists(os.path.join(TMP, "logs")),
+      f"removed={n_logs}")
 
 # ======================================================================
 section("C. 边界/鲁棒性")
-# 空库启动
+# Empty-database startup / 空库启动
 dm2dir = tempfile.mkdtemp(prefix="gifmgr_empty_")
 dm_mod._app_data_dir = lambda: os.path.join(dm2dir, "data")
 dm2 = DataManager()
 check("C1 空库初始化内置分组", dm2.get_all_groups() and dm2.count_all_emojis() == 0)
-dm_mod._app_data_dir = lambda: os.path.join(TMP, "data")  # 还原
+dm_mod._app_data_dir = lambda: os.path.join(TMP, "data")  # Restore / 还原
 
-# LIKE 通配符搜索
+# LIKE wildcard search / LIKE 通配符搜索
 dm.import_emoji(g_img2, imgs[3])
 res = dm.get_emojis_by_group(g_img2, "%")
 check("C2 LIKE 通配符 % 不崩溃", isinstance(res, list), f"hits={len(res)}")
 
-# 超长文本预览
+# Overlong text preview / 超长文本预览
 long_text = "长" * 5000
 rid = dm.add_text_emoji(g_txt, long_text)
 check("C3 超长文本保存", rid > 0)
 e_long = dm.get_emojis_by_group(g_txt)
 check("C4 超长文本显示名截断", any(e["original_name"].endswith("...") for e in e_long if e["id"] == rid))
 
-# 主题样式表
+# Theme stylesheet / 主题样式表
 w._theme = "light"
 w._apply_theme()
 check("C5 亮色主题应用", "light" in w._theme and len(w.styleSheet()) > 1000)
@@ -467,12 +503,13 @@ w._theme = "dark"
 w._apply_theme()
 check("C6 暗色主题应用", len(w.styleSheet()) > 1000)
 
-# 线程数推荐
+# Recommended thread count / 线程数推荐
 from app.widgets.settings_dialog import recommended_thread_count
 check("C7 recommended_thread_count 范围", 2 <= recommended_thread_count() <= 8)
 
-# 卡片 Gif 能力
+# Card GIF capability / 卡片 Gif 能力
 from app.widgets.emoji_item import EmojiItem
+# Real GIF content disguised with a .jpg extension (common in QQ stickers), detected by content
 # 伪装成 .jpg 扩展名的真实 GIF 内容（QQ 表情包常见），按内容识别
 fake_gif = os.path.join(TMP, "hidden.gif.jpg")
 with open(fake_gif, "wb") as f:
@@ -480,7 +517,7 @@ with open(fake_gif, "wb") as f:
 check("C8 is_gif_content 按内容识别伪装 GIF",
       EmojiItem.is_gif_content(fake_gif) and not EmojiItem.is_gif_content(imgs[0]))
 
-# 删除分组时当前选中组被删（UI 路径）
+# Deleting the currently selected group (UI path) / 删除分组时当前选中组被删（UI 路径）
 g_tmp = dm.create_group("临时组", "image")
 w.group_list._rebuild()
 w.group_list.select_group(g_tmp)
@@ -496,7 +533,7 @@ section("D. 性能基准")
 perf_dir = os.path.join(TMP, "perf")
 perf_imgs = gen_images(500, perf_dir, prefix="perf")
 print(f"  生成 500 张 512x512: {RESULTS.get('gen_500', 0)}s（见下方计时）")
-timed("D0 gen_500_images", lambda: None)  # 已生成，仅占位
+timed("D0 gen_500_images", lambda: None)  # Already generated; placeholder only / 已生成，仅占位
 RESULTS.pop("D0 gen_500_images", None)
 
 g_perf_single = dm.create_group("性能-单张", "image")
@@ -509,14 +546,17 @@ def _single_import():
 
 
 def _batch_import():
-    dm.import_emojis_batch(g_perf_batch, perf_imgs, workers=QThreadPool.globalInstance().maxThreadCount())
+    dm.import_emojis_batch(
+        g_perf_batch, perf_imgs,
+        workers=QThreadPool.globalInstance().maxThreadCount(),
+    )
 
 
 timed("D1 单张导入 500", _single_import)
 timed("D2 批量导入 500", _batch_import)
 check("D4 批量导入结果正确", dm.count_emojis_in_group(g_perf_batch) == 500)
 
-# 启动「全部」视图（约 500+ 卡）
+# Startup with the "All" view (~500+ cards) / 启动「全部」视图（约 500+ 卡）
 w.group_list.select_all_group()
 flush(300)
 RESULTS["D3 全部视图卡片数"] = len(w.emoji_grid._items)
@@ -551,7 +591,7 @@ RESULTS["D9 删除 100 张"] = round(now() - t0, 3)
 mem_sample()
 RESULTS["D10 峰值内存MB"] = round(MEM_PEAK[0], 1)
 
-# 批量导入 vs 单张导入 加速比
+# Batch import vs single import speedup ratio / 批量导入 vs 单张导入 加速比
 if RESULTS.get("D1 单张导入 500") and RESULTS.get("D2 批量导入 500"):
     RESULTS["D11 批量加速比"] = round(RESULTS["D1 单张导入 500"] / max(RESULTS["D2 批量导入 500"], 1e-6), 1)
 
@@ -565,6 +605,7 @@ print(json.dumps(RESULTS, ensure_ascii=False, indent=2))
 with open(os.path.join(ROOT, "tests", "output", "full_results.json"), "w", encoding="utf-8") as f:
     json.dump({"results": RESULTS, "checks": CHECKS}, f, ensure_ascii=False, indent=2)
 
+# ---- Generate TEST_REPORT.md (passed items + performance only, no bugs) ----
 # ---- 生成 TEST_REPORT.md（仅通过项 + 性能，不含 bug）----
 passed = [c["name"] for c in CHECKS if c["ok"]]
 md = []
@@ -576,12 +617,26 @@ md.append("- 运行方式: 离屏（`QT_QPA_PLATFORM=offscreen`），数据与�
 md.append(f"- 功能检查: **{n_pass}/{len(CHECKS)} 通过**\n")
 md.append("## 2. 功能测试覆盖（全部通过）\n")
 md.append("| 模块 | 通过用例 |\n|---|---|")
-md.append("| 数据层-分组 | " + "、".join(p for p in passed if p.startswith("A0") or p.startswith("A1") or p.startswith("A2") or p.startswith("A3") or p.startswith("A4") or p.startswith("A5") or p.startswith("A6") or p.startswith("A7") or p.startswith("A8") or p.startswith("A9") or p.startswith("A10")) + " |")
-md.append("| 数据层-导入 | " + "、".join(p for p in passed if p.startswith("A1") or p.startswith("A2") or p.startswith("A3")) + " |")
-md.append("| 数据层-文字/删除/移动/列 | " + "、".join(p for p in passed if p.startswith("A2") or p.startswith("A3") or p.startswith("A4") or p.startswith("A5")) + " |")
-md.append("| 数据层-查询/剪贴板/级联 | " + "、".join(p for p in passed if p.startswith("A4") or p.startswith("A5")) + " |")
-md.append("| UI-启动/分组/搜索/导入 | " + "、".join(p for p in passed if p.startswith("B1") or p.startswith("B2") or p.startswith("B3") or p.startswith("B4") or p.startswith("B5") or p.startswith("B6") or p.startswith("B7") or p.startswith("B8") or p.startswith("B9")) + " |")
-md.append("| UI-粘贴/设置/托盘/热键/日志 | " + "、".join(p for p in passed if p.startswith("B1") or p.startswith("B2") or p.startswith("B3") or p.startswith("B4") or p.startswith("B5")) + " |")
+md.append("| 数据层-分组 | " + "、".join(
+    p for p in passed if p.startswith(("A0", "A1", "A2", "A3", "A4", "A5",
+                                       "A6", "A7", "A8", "A9", "A10"))
+) + " |")
+md.append("| 数据层-导入 | " + "、".join(
+    p for p in passed if p.startswith(("A1", "A2", "A3"))
+) + " |")
+md.append("| 数据层-文字/删除/移动/列 | " + "、".join(
+    p for p in passed if p.startswith(("A2", "A3", "A4", "A5"))
+) + " |")
+md.append("| 数据层-查询/剪贴板/级联 | " + "、".join(
+    p for p in passed if p.startswith(("A4", "A5"))
+) + " |")
+md.append("| UI-启动/分组/搜索/导入 | " + "、".join(
+    p for p in passed if p.startswith(("B1", "B2", "B3", "B4", "B5",
+                                       "B6", "B7", "B8", "B9"))
+) + " |")
+md.append("| UI-粘贴/设置/托盘/热键/日志 | " + "、".join(
+    p for p in passed if p.startswith(("B1", "B2", "B3", "B4", "B5"))
+) + " |")
 md.append("| 边界/鲁棒性 | " + "、".join(p for p in passed if p.startswith("C")) + " |")
 md.append("\n## 3. 性能基准（512x512 PNG）\n")
 md.append("| 操作 | 耗时 |")
@@ -594,6 +649,7 @@ with open(os.path.join(ROOT, "TEST_REPORT.md"), "w", encoding="utf-8") as f:
     f.write("\n".join(md) + "\n")
 print(f"\n已写入 {os.path.join(ROOT, 'TEST_REPORT.md')}")
 
+# ---- Cleanup ----
 # ---- 清理 ----
 print("\n清理临时数据...")
 try:

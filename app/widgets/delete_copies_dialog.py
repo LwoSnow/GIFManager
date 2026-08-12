@@ -1,32 +1,25 @@
 """Duplicate emoji removal (All)
 重复表情删除（All）"""
-import sys
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QCheckBox, QDialogButtonBox,
 )
-from PySide6.QtCore import Qt, QPoint
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtCore import Qt
 
 from app.models.lang_manager import tr
+from app.widgets.frameless_dialog import FramelessDialog
 
 
-class DeleteCopiesDialog(QDialog):
+class DeleteCopiesDialog(FramelessDialog):
 
     def __init__(self, copies, parent=None):
         super().__init__(parent)
         self.setWindowTitle(tr("delete_copies_title"))
         self.setFixedSize(380, 420)
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog
-        )
         self._copies = copies
         self._items = []  # (QListWidgetItem, emoji_id)
-        self._dragging = False
-        self._drag_start = QPoint()
 
         self._setup_ui()
-        self._apply_rounded()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -79,7 +72,9 @@ class DeleteCopiesDialog(QDialog):
         )
         for c in self._copies:
             item = QListWidgetItem()
-            cb = QCheckBox(f"{c.get('group_name','?')}（{c.get('original_name','')}）")
+            gname = c.get("group_name", "?")
+            oname = c.get("original_name", "")
+            cb = QCheckBox(f"{gname}（{oname}）")
             cb.setStyleSheet("color:#E0E0E0; background:transparent;")
             item.setSizeHint(cb.sizeHint())
             self._list.addItem(item)
@@ -91,6 +86,7 @@ class DeleteCopiesDialog(QDialog):
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         btn_box.button(QDialogButtonBox.StandardButton.Ok).setText(tr("delete"))
+        btn_box.button(QDialogButtonBox.StandardButton.Cancel).setText(tr("cancel"))
         btn_box.accepted.connect(self.accept)
         btn_box.rejected.connect(self.reject)
         layout.addWidget(btn_box)
@@ -103,33 +99,3 @@ class DeleteCopiesDialog(QDialog):
         # Returns the list of emoji ids that the user checked to delete
         # 返回用户勾选要删除的 emoji id 列表
         return [eid for _item, eid, cb in self._items if cb.isChecked()]
-
-    def _apply_rounded(self):
-        if sys.platform != "win32":
-            return
-        try:
-            import ctypes
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                int(self.winId()), 33,
-                ctypes.byref(ctypes.c_int(2)),
-                ctypes.sizeof(ctypes.c_int),
-            )
-        except Exception:
-            pass
-
-    def mousePressEvent(self, event: QMouseEvent):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._dragging = True
-            self._drag_start = event.globalPosition().toPoint()
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QMouseEvent):
-        if self._dragging:
-            delta = event.globalPosition().toPoint() - self._drag_start
-            self.move(self.pos() + delta)
-            self._drag_start = event.globalPosition().toPoint()
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: QMouseEvent):
-        self._dragging = False
-        super().mouseReleaseEvent(event)

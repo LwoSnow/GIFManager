@@ -2,7 +2,7 @@
 #
 # 触发方式：
 #   GitHub 仓库页面 → Actions → "Build Windows Package" → Run workflow
-#   （可在输入框中指定版本号，默认 1.0.0）
+#   （可在输入框中指定版本号，默认 1.0.2）
 #
 # 产物（在 workflow 运行结果页的 Artifacts 中下载）：
 #   - release/GIFManager-<version>-win64.zip        便携压缩包（解压即用）
@@ -18,9 +18,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version used to name the artifacts, e.g. 1.0.0"
+        description: "Release version used to name the artifacts, e.g. 1.0.2"
         required: false
-        default: "1.0.0"
+        default: "1.0.2"
 
 permissions:
   contents: read

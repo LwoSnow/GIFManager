@@ -1,6 +1,9 @@
-"""布局与"全部"聚合/去重 回归测试
+"""Layout and "All" aggregation/deduplication regression tests
+布局与"全部"聚合/去重 回归测试
 
+Run: python -m unittest tests.test_layout -v
 运行: python -m unittest tests.test_layout -v
+Isolation: temporary data dir + in-memory QSettings (never touches real data/ or registry)
 隔离: 使用临时数据目录 + 内存版 QSettings（不触碰真实 data/ 与注册表配置）
 """
 import os
@@ -19,7 +22,8 @@ import app.models.data_manager as dm_mod
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QTimer, QEventLoop
 
-# 用内存版 QSettings 替换，避免读写用户注册表配置
+# Replace QSettings with an in-memory version to avoid touching the user
+# registry / 用内存版 QSettings 替换，避免读写用户注册表配置
 import app.main_window as mw_mod
 
 
@@ -42,7 +46,8 @@ mw_mod.QSettings = _FakeSettings
 
 
 def _make_gif(path, color=0xFF):
-    """生成 1x1 GIF，color 决定内容（同 color = 同内容，用于去重测试）"""
+    # Generates a 1x1 GIF; color decides the content (same color = same content,
+    # used for the dedupe test) / 生成 1x1 GIF，color 决定内容（同 color = 同内容，用于去重测试）
     with open(path, "wb") as f:
         f.write(bytes([
             0x47, 0x49, 0x46, 0x38, 0x39, 0x61,
@@ -57,7 +62,9 @@ class TestLayoutAndSync(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        # 数据目录重定向到本类临时目录（运行时 patch，tearDown 恢复，避免多测试类互相覆盖）
+        # Redirect the data dir to this class's temp dir (runtime patch, restored in
+        # tearDown so test classes never overwrite each other) / 数据目录重定向到本类临时目录
+        # （运行时 patch，tearDown 恢复，避免多测试类互相覆盖）
         cls._orig_data_dir = dm_mod._app_data_dir
         dm_mod._app_data_dir = lambda: TMP
         cls.app = QApplication.instance() or QApplication([])
@@ -78,7 +85,8 @@ class TestLayoutAndSync(unittest.TestCase):
         )
 
     def _run_chain(self, steps):
-        """steps: [(delay_ms, callable)] 依序执行；事件循环运行直至全部完成"""
+        # Runs steps: [(delay_ms, callable)] in order until all complete
+        # 依序执行 steps: [(delay_ms, callable)]，事件循环运行直至全部完成
         loop = QEventLoop()
         total = 0
         for delay, fn in steps:
@@ -88,7 +96,8 @@ class TestLayoutAndSync(unittest.TestCase):
         loop.exec()
 
     def test_full_flow_no_overlap_aggregate_dedupe(self):
-        """全流程：卡片无重叠；"全部"聚合所有 image 分组并按内容去重"""
+        # Full flow: cards never overlap; "All" aggregates every image group
+        # and dedupes by content / 全流程：卡片无重叠；"全部"聚合所有 image 分组并按内容去重
         dm = self.w.data_manager
         results = {}
 
@@ -98,12 +107,13 @@ class TestLayoutAndSync(unittest.TestCase):
                 files = []
                 for i in range(4):
                     p = os.path.join(tmp, f"g{i}.gif")
-                    _make_gif(p, 0x10 + i)  # 4 张内容不同
+                    _make_gif(p, 0x10 + i)  # 4 distinct contents / 4 张内容不同
                     files.append(p)
                 self.w._do_import(files)
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
-            # 当前分组 = 全部(None 路径)，导入目标 = 默认表情 → "全部"应立即显示 4 张
+            # Current group is "All" (None path); imports go to Default, so "All"
+            # should show 4 right away / 当前分组 = 全部(None 路径)，导入目标 = 默认表情 → "全部"应立即显示 4 张
             results["import_in_all"] = (len(self.w.emoji_grid._items), self._overlap())
 
         def switch_default():
@@ -125,11 +135,12 @@ class TestLayoutAndSync(unittest.TestCase):
 
         def all_again():
             self.w.group_list.select_all_group()
-            # 文字不混入"全部"，仍为 4 张图
+            # Text emojis stay out of "All"; still 4 images / 文字不混入"全部"，仍为 4 张图
             results["all_again"] = (len(self.w.emoji_grid._items), self._overlap())
 
         def setup_groups_and_dupe():
-            # 组A/组B：same 内容各导一份（应去重为 1）；uniq 只进组A
+            # Group A/B: same content imported once each (should dedupe to 1); uniq only
+            # in A / 组A/组B：same 内容各导一份（应去重为 1）；uniq 只进组A
             ga = dm.create_group("组A", "image")
             gb = dm.create_group("组B", "image")
             tmp = tempfile.mkdtemp()
@@ -138,19 +149,21 @@ class TestLayoutAndSync(unittest.TestCase):
                 same2 = os.path.join(tmp, "same2.gif")
                 uniq = os.path.join(tmp, "uniq.gif")
                 _make_gif(same1, 0x33)
-                _make_gif(same2, 0x33)  # 与 same1 内容相同
-                _make_gif(uniq, 0x77)   # 内容不同
+                _make_gif(same2, 0x33)  # Same content as same1 / 与 same1 内容相同
+                _make_gif(uniq, 0x77)   # Distinct content / 内容不同
                 dm.import_emoji(ga, same1)
                 dm.import_emoji(gb, same2)
                 dm.import_emoji(ga, uniq)
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
             self.w.group_list._rebuild()
-            # 数据库层去重校验：4(默认) + 2(组A/组B 去重后) = 6
+            # DB dedupe check: 4 (Default) + 2 (A/B after dedupe) = 6 / 数据库层去重校验：
+            # 4(默认) + 2(组A/组B 去重后) = 6
             results["db_all_count"] = (len(dm.get_all_emojis()), 0)
 
         def click_all_button():
-            # 主 bug 覆盖：点击"全部"按钮（真实 id 路径）→ 应聚合所有 image 分组
+            # Main bug coverage: clicking the "All" button (real id path) aggregates all
+            # image groups / 主 bug 覆盖：点击"全部"按钮（真实 id 路径）→ 应聚合所有 image 分组
             all_gid = dm.get_group_by_name("All")["id"]
             self.w.group_list.select_group(all_gid)
             results["all_button"] = (len(self.w.emoji_grid._items), self._overlap())

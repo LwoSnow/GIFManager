@@ -20,13 +20,19 @@ class LangManager:
         return os.path.join(d, "language")
 
     def _load(self, lang):
+        # Load en_US as a fallback dictionary first, then let the active
+        # language override it, so missing keys never show raw key names.
+        # 先加载 en_US 兜底字典，当前语言再覆盖；缺失键不会显示键名
         fp = os.path.join(self._lang_dir(), f"{lang}.json")
+        self._texts = {}
+        en_fp = os.path.join(self._lang_dir(), "en_US.json")
+        if os.path.isfile(en_fp) and lang != "en_US":
+            with open(en_fp, "r", encoding="utf-8") as f:
+                self._texts.update(json.load(f))
         if os.path.isfile(fp):
             with open(fp, "r", encoding="utf-8") as f:
-                self._texts = json.load(f)
+                self._texts.update(json.load(f))
             self._lang = lang
-        else:
-            self._texts = {}
 
     def t(self, key, **kwargs):
         text = self._texts.get(key, key)

@@ -455,6 +455,13 @@ class EmojiItem(QFrame):
     def _stop_gif(self):
         if self._movie:
             self._movie.stop()
+            # Release the file handle synchronously: QMovie keeps the file
+            # open until its QIODevice is detached, which blocks Windows from
+            # renaming/deleting the group folder
+            # 同步释放文件句柄：QMovie 会一直持有文件直到分离 QIODevice，
+            # 否则 Windows 无法重命名/删除分组目录
+            self._movie.setDevice(None)
+            self._movie.deleteLater()
             self._movie = None
         # Restore the static thumbnail / 恢复静态缩略图
         if not self._is_text:

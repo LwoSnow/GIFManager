@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
     QPushButton, QMenu, QScrollArea, QFrame, QLabel,
     QFileDialog, QMessageBox, QStatusBar, QApplication, QInputDialog,
-    QSystemTrayIcon,
+    QSystemTrayIcon, QProgressDialog,
 )
 from PySide6.QtCore import Qt, QSize, QMimeData, QPoint, QTimer, QSettings, QThreadPool
 from PySide6.QtGui import (
@@ -19,6 +19,8 @@ from app.theme.dark_theme import QSS as DARK_QSS
 from app.theme.light_theme import QSS as LIGHT_QSS
 from app.models.data_manager import DataManager
 from app.models.lang_manager import tr, set_language, current_language, available_languages
+from app import __version__
+from app.utils.version import cmp_version, parse_version
 from app.models.constants import (
     DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT,
     MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT,
@@ -29,6 +31,7 @@ from app.widgets.emoji_grid import EmojiGridWidget
 from app.widgets.search_bar import SearchBar
 from app.widgets.settings_dialog import SettingsDialog, recommended_thread_count
 from app.widgets.hotkey_manager import HotkeyManager
+from app.utils import gif_converter
 
 
 def _root_dir():
@@ -70,8 +73,10 @@ class MainWindow(QMainWindow):
         self.resize(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
         self.setMinimumSize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
         self.setAcceptDrops(True)
+        # Tool flag keeps the window out of the taskbar (tray-only UI) /
+        # Tool 标志使窗口不显示在任务栏（仅托盘图标）
         self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window
+            Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
         )
 
         icon_path = os.path.join(_root_dir(), "icon.ico")
@@ -82,7 +87,10 @@ class MainWindow(QMainWindow):
         init_logger()
         install_excepthook()
         self._log = get_logger()
-        self._log.info("App version: 1.0.1 | theme: pending | thread_count: pending")
+        self._log.info(
+            "App version: %s | theme: pending | thread_count: pending",
+            __version__,
+        )
 
         self._settings = QSettings("GIFManager", "GIFManager")
         self.data_manager = DataManager()
@@ -108,7 +116,7 @@ class MainWindow(QMainWindow):
         else:
             self.group_list.select_all_group()
 
-    # QSettings
+    # QSettings / QSettings 设置持久化
 
     def _load_settings(self):
         self._send_mode = int(self._settings.value("send_mode", 0))
@@ -126,6 +134,15 @@ class MainWindow(QMainWindow):
         # 文字预览限制（单行 / 多行独立）
         self._text_limit_single = int(self._settings.value("text_preview_limit_single", 100))
         self._text_limit_multi = int(self._settings.value("text_preview_limit_multi", 200))
+        # Global sorting mode (time/name/freq, asc/desc) / 全局排序模式（时间/名称/频率，正/逆序）
+        self._gs_enabled = self._settings.value("global_sort_enabled", False, type=bool)
+        by = self._settings.value("global_sort_by", "time")
+        self._gs_by = by if by in ("time", "name", "freq") else "time"
+        self._gs_desc = self._settings.value("global_sort_desc", False, type=bool)
+        # Auto-convert imported non-gif images to gif / 导入时自动把非 gif 图片转为 gif
+        self._auto_convert_gif = self._settings.value("auto_convert_gif", True, type=bool)
+        # Auto-update check on startup / 启动时自动检查更新
+        self._auto_update = self._settings.value("auto_update", False, type=bool)
         lang = self._settings.value("language", "zh_CN")
         try:
             set_language(lang)
@@ -154,6 +171,11 @@ class MainWindow(QMainWindow):
         self._settings.setValue("theme", self._theme)
         self._settings.setValue("text_preview_limit_single", self._text_limit_single)
         self._settings.setValue("text_preview_limit_multi", self._text_limit_multi)
+        self._settings.setValue("global_sort_enabled", self._gs_enabled)
+        self._settings.setValue("global_sort_by", self._gs_by)
+        self._settings.setValue("global_sort_desc", self._gs_desc)
+        self._settings.setValue("auto_convert_gif", self._auto_convert_gif)
+        self._settings.setValue("auto_update", self._auto_update)
         self._settings.setValue("language", current_language())
 
     def _restore_geometry(self):
@@ -194,7 +216,7 @@ class MainWindow(QMainWindow):
                 exe_path = sys.executable
                 script = os.path.abspath(sys.argv[0]) if sys.argv else ""
                 winreg.SetValueEx(key, "GIFManager", 0, winreg.REG_SZ,
-                                  f'"{exe_path}" "{script}"')
+                                  f"\"{exe_path}\" \"{script}\"")
             else:
                 try:
                     winreg.DeleteValue(key, "GIFManager")
@@ -240,7 +262,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    # UI
+    # UI / 界面构建
 
     def _setup_ui(self):
         central = QWidget()
@@ -372,17 +394,29 @@ class MainWindow(QMainWindow):
         self.emoji_grid.emoji_right_clicked.connect(self._on_emoji_right_clicked)
         self.emoji_grid.emojis_reordered.connect(self._refresh_emoji_grid)
         self.btn_add_text.clicked.connect(self._add_text_emoji)
+        # Debounce timer for global freq sort (merge rapid usage) / 频率全局排序防抖定时器
+        self._gs_timer = QTimer(self)
+        self._gs_timer.setSingleShot(True)
+        self._gs_timer.setInterval(400)
+        self._gs_timer.timeout.connect(self._on_gs_freq_timeout)
+        self._gs_pending_group = None
+        # Silent update check on startup (tray bubble when a new version
+        # exists; failures are logged only). / 启动静默检查更新（发现新版本
+        # 用托盘气泡提示；失败仅记录日志）
+        from app.models.update_manager import UpdateManager
+        self._update_mgr = UpdateManager(self)
+        self._update_mgr.check_finished.connect(self._on_auto_update_result)
+        if self._auto_update:
+            QTimer.singleShot(5000, self._update_mgr.check_updates)
 
     # Group / 分组
 
     def _on_group_changed(self, group_id):
         # "All" is a virtual aggregation group: its database id is
-        # equivalent to "No group selected",
-        # Otherwise, get_emojis_by_group(all_id) will only find the
-        # emoticons under the name "All" (always empty).
-        # "All"是虚拟聚合分组：其数据库 id 等价于"未选中任何分组"，
-        # 否则会走 get_emojis_by_group(全部_id) 只查到"All"名下（恒为空）的表情。
-        # "All"是虚拟聚合分组：按内置标记识别（重命名后仍有效）
+        # equivalent to "No group selected" (identified by the builtin flag,
+        # so it keeps working after renaming).
+        # "All"是虚拟聚合分组：其数据库 id 等价于"未选中任何分组"
+        # （按内置标记识别，重命名后仍有效）。
         all_id = self.data_manager._all_group_id()
         if all_id is not None and group_id == all_id:
             group_id = None
@@ -500,24 +534,138 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "GIFManager", tr("text_group_warning"))
             return
 
-        imported, duplicated = self.data_manager.import_emojis_batch(
-            target_group, files,
-            workers=QThreadPool.globalInstance().maxThreadCount(),
-        )
+        valid = [f for f in files
+                 if os.path.splitext(f)[1].lower() in gif_converter.IMPORT_EXTS]
+        if not valid:
+            self.status_bar.showMessage(f"  {tr('import_no_valid')}", 3000)
+            return
+        # Auto-convert works with Pillow by default (ffmpeg optional) /
+        # 自动转换默认用 Pillow（ffmpeg 为可选增强）
+        auto = self._auto_convert_gif
+        if auto and len(valid) > 100:
+            # Large batch: show a conversion progress dialog / 大批量：显示转换进度条
+            imported, duplicated, converted_n, fail_n = \
+                self._import_with_progress(target_group, valid)
+        else:
+            imported, duplicated = self.data_manager.import_emojis_batch(
+                target_group, valid,
+                workers=QThreadPool.globalInstance().maxThreadCount(),
+                auto_convert=auto,
+            )
+            converted_n = 0
+            fail_n = 0
         self._log.info(
             "Import -> group=%s files=%d imported=%d duplicated=%d",
             group_info["name"] if group_info else target_group,
-            len(files), imported, duplicated,
+            len(valid), imported, duplicated,
         )
         # New cards go to the top-left corner / 新导入的卡片放到左上角
         if imported > 0:
             self.data_manager.prepend_latest_imports(target_group, imported)
+            # Global time/name sort runs once after adding / 全局时间/名称排序在新增后执行一次
+            self._apply_global_sort(target_group)
         self._refresh_emoji_grid()
         self._refresh_status()
         msg = tr("import_success", count=imported, group=group_info["name"])
         if duplicated:
             msg += tr("import_skip_dup", count=duplicated)
-        self.status_bar.showMessage(f"  {msg}", 3000)
+        if converted_n:
+            msg += tr("import_converted", count=converted_n)
+        if fail_n:
+            msg += tr("import_conv_fail", count=fail_n)
+        self.status_bar.showMessage(f"  {msg}", 4000)
+
+    def _import_with_progress(self, group_id, files):
+        # Convert non-gif files one by one on the main thread while showing
+        # a progress dialog, then batch-insert everything.
+        # 主线程逐张转换非 gif 文件并显示进度条，随后批量入库。
+        dlg = QProgressDialog(
+            tr("converting_gif"), tr("cancel"), 0, len(files), self)
+        dlg.setWindowTitle(tr("importing"))
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        ready = []
+        imported = duplicated = converted_n = fail_n = 0
+        import tempfile as _tf
+        try:
+            for i, f in enumerate(files):
+                if dlg.wasCanceled():
+                    break
+                dlg.setValue(i)
+                dlg.setLabelText(tr("converting_file", name=os.path.basename(f)))
+                QApplication.processEvents()
+                if gif_converter.needs_conversion(f):
+                    tmp = os.path.join(
+                        _tf.gettempdir(), f"gm_conv_{os.urandom(4).hex()}.gif")
+                    if gif_converter.convert_to_gif(f, tmp):
+                        ready.append(tmp)
+                        converted_n += 1
+                    else:
+                        ready.append(f)  # failed -> keep original format / 失败保持原格式
+                        fail_n += 1
+                else:
+                    ready.append(f)
+            dlg.setValue(len(files))
+            if ready:
+                imported, duplicated = self.data_manager.import_emojis_batch(
+                    group_id, ready,
+                    workers=QThreadPool.globalInstance().maxThreadCount(),
+                    auto_convert=False,
+                )
+        finally:
+            dlg.close()
+            # Clean up temp gif files (already copied into the library) /
+            # 清理临时 gif 文件（已复制入库）
+            for p in ready:
+                if p.endswith(".gif") and os.path.dirname(p) == _tf.gettempdir():
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+        return imported, duplicated, converted_n, fail_n
+
+    def _on_convert_library(self):
+        # One-click convert: all non-gif images in every group -> gif /
+        # 一键转换：把所有分组非 gif 图片转为 gif
+        ret = QMessageBox.question(
+            self, tr("gif_convert_all"),
+            tr("gif_convert_confirm"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        dlg = QProgressDialog(tr("converting_gif"), "", 0, 1, self)
+        dlg.setWindowTitle(tr("gif_convert_all"))
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setCancelButton(None)
+
+        def cb(i, total, name):
+            if total:
+                dlg.setMaximum(total)
+                dlg.setValue(i)
+                if name:
+                    dlg.setLabelText(tr("converting_file", name=name))
+                QApplication.processEvents()
+
+        try:
+            converted, failed, deduped = \
+                self.data_manager.convert_library_to_gif(progress_cb=cb)
+        finally:
+            dlg.close()
+        self._refresh_emoji_grid()
+        self._refresh_status()
+        if converted or failed or deduped:
+            QMessageBox.information(
+                self, tr("gif_convert_all"),
+                tr("gif_convert_done",
+                   converted=converted, failed=failed, deduped=deduped),
+            )
+        else:
+            QMessageBox.information(
+                self, tr("gif_convert_all"), tr("gif_convert_none"))
 
     def _add_text_emoji(self):
         if self.current_group_id is None:
@@ -536,6 +684,8 @@ class MainWindow(QMainWindow):
             if r > 0:
                 # New text emoji goes to the top-left corner / 新文字表情放到左上角
                 self.data_manager.prepend_emojis(self.current_group_id, [r])
+                # Global time/name sort runs once after adding / 全局时间/名称排序在新增后执行一次
+                self._apply_global_sort(self.current_group_id)
             self._refresh_emoji_grid()
             self._refresh_status()
             self.status_bar.showMessage(f"  {tr('added_to', group=g['name'])}", 2000)
@@ -593,6 +743,8 @@ class MainWindow(QMainWindow):
                         if new_ids:
                             # Pasted text goes to the top-left corner / 粘贴的文字放到左上角
                             self.data_manager.prepend_emojis(self.current_group_id, new_ids)
+                            # Global time/name sort runs once after adding / 全局时间/名称排序在新增后执行一次
+                            self._apply_global_sort(self.current_group_id)
                         self._refresh_emoji_grid()
                         self._refresh_status()
                         msg = tr("pasted_to", group=g["name"])
@@ -608,9 +760,91 @@ class MainWindow(QMainWindow):
         self._log.info("Send/copy emoji -> id=%s mode=%s", emoji.get("id"), self._send_mode)
         success = self.data_manager.copy_to_clipboard(emoji, mode=self._send_mode)
         if success:
+            # Bump usage frequency for the freq sort / 记录使用次数供频率排序
+            if emoji.get("id") is not None:
+                self.data_manager.increment_use_count(emoji["id"])
             name = emoji.get("original_name") or emoji.get("text_content", "emoji")
             mode_label = tr("copied_path") if self._send_mode == 0 else tr("copied_image")
             self.status_bar.showMessage(f"  ✓ {tr('copied_msg', mode=mode_label, name=name)}", 2000)
+        # Global freq sort: debounced re-sort on usage / 全局频率排序：使用时防抖重排
+        if self._gs_enabled and self._gs_by == "freq":
+            gid = emoji.get("group_id")
+            if gid is not None and success:
+                self._gs_pending_group = gid
+                self._gs_timer.start()
+
+    # Global sorting mode / 全局排序模式
+    def _apply_global_sort(self, group_id):
+        # Time/name sorts run once when emojis are added; freq runs on use.
+        # 时间/名称排序在新增表情时执行一次；频率排序在使用时执行。
+        if not self._gs_enabled or group_id is None:
+            return
+        if self._gs_by == "freq":
+            return
+        try:
+            self.data_manager.sort_group_emojis(
+                group_id, by=self._gs_by, desc=self._gs_desc)
+        except Exception:
+            self._log.exception("Global sort failed")
+            return
+        if self.current_group_id == group_id:
+            self._refresh_emoji_grid()
+
+    def _apply_global_sort_all(self):
+        if not self._gs_enabled:
+            return
+        all_id = self.data_manager._all_group_id()
+        for g in self.data_manager.get_all_groups():
+            gid = g["id"]
+            if gid is None or gid == all_id:
+                # Skip the virtual "All" aggregation group / 跳过"全部"虚拟聚合分组
+                continue
+            try:
+                self.data_manager.sort_group_emojis(
+                    gid, by=self._gs_by, desc=self._gs_desc)
+            except Exception:
+                self._log.exception("Global sort failed for group %s", gid)
+        self._refresh_emoji_grid()
+        self._refresh_status()
+
+    def _on_gs_freq_timeout(self):
+        gid = self._gs_pending_group
+        self._gs_pending_group = None
+        if not self._gs_enabled or self._gs_by != "freq" or gid is None:
+            return
+        try:
+            self.data_manager.sort_group_emojis(
+                gid, by="freq", desc=self._gs_desc)
+        except Exception:
+            self._log.exception("Global freq sort failed")
+            return
+        if self.current_group_id == gid:
+            self._refresh_emoji_grid()
+
+    # Silent auto-update result: tray bubble for a newer version; failures
+    # are logged only (details stay visible in the settings update page).
+    # 静默更新结果：发现新版本用托盘气泡提示；失败仅记录日志
+    # （详细信息可在设置更新页查看）
+    def _on_auto_update_result(self, ok, version, url, size, err_key, detail):
+        if not ok:
+            self._log.info("Auto-update check failed: %s %s", err_key, detail)
+            return
+        if version is None or cmp_version(version, parse_version(__version__)) <= 0:
+            self._log.info("Auto-update: already up to date")
+            return
+        ver_str = ".".join(str(x) for x in version)
+        self._log.info("Auto-update: new version %s available", ver_str)
+        if self._tray.isVisible():
+            self._tray.showMessage(
+                tr("update_bubble_title"),
+                tr("update_bubble_msg", version=ver_str),
+                QSystemTrayIcon.MessageIcon.Information,
+                8000,
+            )
+            try:
+                self._tray.messageClicked.connect(self._open_settings)
+            except RuntimeError:
+                pass
 
     def _on_emoji_right_clicked(self, emoji, pos):
         menu = QMenu(self)
@@ -726,8 +960,11 @@ class MainWindow(QMainWindow):
             self._autostart, self._always_on_top,
             self._text_limit_single, self._text_limit_multi,
             self._thread_count, self._theme,
+            self._gs_enabled, self._gs_by, self._gs_desc,
+            self._auto_convert_gif, self._auto_update,
             self.data_manager, self._hotkey_desc(), self
         )
+        dlg.convert_library_requested.connect(self._on_convert_library)
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dlg.apply_clicked.connect(self._on_settings_apply)
         dlg.finished.connect(self._on_settings_finished)
@@ -767,6 +1004,20 @@ class MainWindow(QMainWindow):
         self._text_limit_single = dlg.text_limit_single()
         self._text_limit_multi = dlg.text_limit_multi()
         self._thread_count = dlg.thread_count()
+        # Global sorting mode changed -> re-sort all groups once / 全局排序变化 → 全分组重排一次
+        gs_changed = (
+            dlg.global_sort_enabled() != self._gs_enabled
+            or dlg.global_sort_by() != self._gs_by
+            or dlg.global_sort_desc() != self._gs_desc
+        )
+        self._gs_enabled = dlg.global_sort_enabled()
+        self._gs_by = dlg.global_sort_by()
+        self._gs_desc = dlg.global_sort_desc()
+        if gs_changed and self._gs_enabled:
+            self._apply_global_sort_all()
+        # Auto-convert setting may change without closing the dialog / 自动转换开关可能在对话框内直接变化
+        self._auto_convert_gif = dlg.auto_convert_gif()
+        self._auto_update = dlg.auto_update()
         theme_changed = (dlg.theme() != self._theme)
         self._theme = dlg.theme()
         self._log.info(

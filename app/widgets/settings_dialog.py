@@ -5,14 +5,25 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QRadioButton,
     QPushButton, QGroupBox, QButtonGroup, QDialogButtonBox,
     QCheckBox, QComboBox, QLineEdit, QSpinBox, QListWidget,
-    QStackedWidget, QWidget, QFrame, QScrollArea,
+    QStackedWidget, QWidget, QFrame, QScrollArea, QProgressBar,
 )
-from PySide6.QtCore import Qt, QPoint, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import Qt, QPoint, Signal, QStandardPaths
+from PySide6.QtGui import QPixmap, QPainter, QColor, QFont
 from PySide6.QtGui import QKeyEvent, QKeySequence, QMouseEvent
 
 from app.models.lang_manager import tr, current_language, available_languages
+from app.models.update_manager import UpdateManager
 from app.widgets.hotkey_manager import key_event_to_hotkey_desc
+from app.utils.version import cmp_version, parse_version
+from app import __version__
+
+
+def _download_dir():
+    # System Downloads folder, falling back to the home dir /
+    # 系统下载目录，失败回退用户主目录
+    d = QStandardPaths.writableLocation(
+        QStandardPaths.StandardLocation.DownloadLocation)
+    return d if d else os.path.expanduser("~")
 
 
 # Recommended worker thread count: keep 1 core for the UI, capped at 8
@@ -100,10 +111,14 @@ class SettingsDialog(QDialog):
 
     apply_clicked = Signal()  # Apply clicked (does not close) / 点击"应用"（不关闭）
     clear_logs_requested = Signal()  # Clear-all-logs requested / 点击"清除所有日志"
+    convert_library_requested = Signal()  # One-click convert all / 一键转换所有图片
 
     def __init__(self, current_mode=0, remember_group=True, autostart=False,
                  always_on_top=False, text_limit_single=100, text_limit_multi=200,
-                 thread_count=0, theme="dark", data_manager=None, hotkey_desc="", parent=None):
+                 thread_count=0, theme="dark",
+                 global_sort_enabled=False, global_sort_by="time", global_sort_desc=False,
+                 auto_convert_gif=True, auto_update=False,
+                 data_manager=None, hotkey_desc="", parent=None):
         super().__init__(parent)
         self.setWindowTitle(tr("settings"))
         self.setFixedSize(440, 480)
@@ -120,6 +135,14 @@ class SettingsDialog(QDialog):
         # 0 = auto (use recommended value) / 0 = 自动（使用推荐值）
         self._thread_count = thread_count if thread_count > 0 else recommended_thread_count()
         self._theme = theme if theme in ("dark", "light") else "dark"
+        # Global sorting mode (time/name/freq, asc/desc) / 全局排序模式（时间/名称/频率，正/逆序）
+        self._gs_enabled = global_sort_enabled
+        self._gs_by = global_sort_by if global_sort_by in ("time", "name", "freq") else "time"
+        self._gs_desc = global_sort_desc
+        # Auto-convert imported images to gif / 导入时自动转 gif
+        self._auto_convert_gif = auto_convert_gif
+        # Auto-update check on startup / 启动时自动检查更新
+        self._auto_update = auto_update
         self._dm = data_manager
         self._hotkey_mods = 0
         self._hotkey_vk = 0
@@ -205,6 +228,7 @@ class SettingsDialog(QDialog):
         self._cat_list.setFixedWidth(118)
         for key in ("cat_general", "cat_send", "cat_hotkey", "cat_text", "cat_perf"):
             self._cat_list.addItem(tr(key))
+        self._cat_list.addItem(tr("cat_update"))
         # Category name comes from the language file, not hardcoded "About"
         # 分类名走语言文件（可替换为"关于"），页面内容保持纯英文
         self._cat_list.addItem(tr("cat_about"))
@@ -217,6 +241,7 @@ class SettingsDialog(QDialog):
         self._stack.addWidget(self._build_hotkey_page(hotkey_desc))
         self._stack.addWidget(self._build_text_page())
         self._stack.addWidget(self._build_perf_page())
+        self._stack.addWidget(self._build_update_page())
         self._stack.addWidget(self._build_about_page())
         self._cat_list.currentRowChanged.connect(self._stack.setCurrentIndex)
         body.addWidget(self._stack, 1)
@@ -258,6 +283,40 @@ class SettingsDialog(QDialog):
 
     # General page: theme + language + other options
     # 通用：主题 + 语言 + 其他
+    # Wrap a settings page in a scroll area so long pages scroll instead
+    # of squeezing together. / 用滚动区包裹设置页，页面过长时滚动显示而不是挤在一起。
+    def _wrap_scroll(self, page):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(
+            "QScrollArea, QScrollArea > QWidget > QWidget { background:transparent; }"
+        )
+        scroll.setWidget(page)
+        return scroll
+
+    # Draw a blue circle with a white "?" via QPainter. Using a bitmap
+    # instead of QSS avoids stylesheet merge conflicts on the real window.
+    # 用 QPainter 绘制蓝底白问号位图，绕开 QSS 合并冲突。
+    @staticmethod
+    def _make_question_pixmap(size=18):
+        pix = QPixmap(size, size)
+        pix.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#1677FF"))
+        p.drawEllipse(0, 0, size, size)
+        p.setPen(QColor("#FFFFFF"))
+        f = QFont()
+        f.setBold(True)
+        f.setPixelSize(int(size * 0.62))
+        p.setFont(f)
+        p.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "?")
+        p.end()
+        return pix
+
     def _build_general_page(self):
         w = self._page_widget()
         # Theme switching / 主题切换
@@ -302,6 +361,72 @@ class SettingsDialog(QDialog):
         other_layout.addWidget(self._cb_top)
         self._page_layout.addWidget(self._other_group)
 
+        # Global sorting mode / 全局排序模式
+        # The group title is drawn as a custom title row so the hint icon
+        # can sit right after the title text. / 分组标题用自定义标题行绘制，
+        # 让问号图标紧跟在标题文字后面。
+        self._gs_group = QGroupBox()
+        gs_layout = QVBoxLayout(self._gs_group)
+        gs_layout.setContentsMargins(4, 2, 4, 4)
+        row_title = QHBoxLayout()
+        self._gs_title = QLabel(tr("global_sort_group"))
+        self._gs_title.setStyleSheet(
+            "QLabel { color:#999999; font-size:11px; padding:0 2px;"
+            " background:transparent; }"
+        )
+        row_title.addWidget(self._gs_title)
+        self._gs_hint = QLabel()
+        self._gs_hint.setPixmap(self._make_question_pixmap(18))
+        self._gs_hint.setFixedSize(18, 18)
+        self._gs_hint.setToolTip(tr("global_sort_hint"))
+        self._gs_hint.setCursor(Qt.CursorShape.WhatsThisCursor)
+        row_title.addWidget(self._gs_hint)
+        row_title.addStretch()
+        gs_layout.addLayout(row_title)
+        # Enable row: checkbox only / 启用行：仅复选框
+        row_enable = QHBoxLayout()
+        self._cb_gs = QCheckBox(tr("global_sort_enable"))
+        self._cb_gs.setChecked(self._gs_enabled)
+        row_enable.addWidget(self._cb_gs)
+        row_enable.addStretch()
+        gs_layout.addLayout(row_enable)
+        combo_style = (
+            "QComboBox { background:#2B2B2B; border:1px solid #3A3A3A;"
+            " border-radius:4px; padding:2px 6px; color:#CCC; }"
+            "QComboBox::drop-down { border:none; width:16px; }"
+            "QComboBox::down-arrow { image:none; width:0; height:0; }"
+            "QComboBox QAbstractItemView { background:#2B2B2B; color:#CCC;"
+            " selection-background-color:#1677FF; }"
+        )
+        row_by = QHBoxLayout()
+        row_by.addWidget(QLabel(tr("global_sort_by")))
+        self._combo_gs_by = QComboBox()
+        self._combo_gs_by.addItem(tr("sort_by_time"), "time")
+        self._combo_gs_by.addItem(tr("sort_by_name"), "name")
+        self._combo_gs_by.addItem(tr("sort_by_freq"), "freq")
+        self._combo_gs_by.setCurrentIndex(
+            max(0, ["time", "name", "freq"].index(self._gs_by)))
+        self._combo_gs_by.setStyleSheet(combo_style)
+        row_by.addWidget(self._combo_gs_by)
+        row_by.addStretch()
+        gs_layout.addLayout(row_by)
+        row_dir = QHBoxLayout()
+        row_dir.addWidget(QLabel(tr("global_sort_dir")))
+        self._combo_gs_dir = QComboBox()
+        self._combo_gs_dir.addItem(tr("sort_dir_asc"), False)
+        self._combo_gs_dir.addItem(tr("sort_dir_desc"), True)
+        self._combo_gs_dir.setCurrentIndex(1 if self._gs_desc else 0)
+        self._combo_gs_dir.setStyleSheet(combo_style)
+        row_dir.addWidget(self._combo_gs_dir)
+        row_dir.addStretch()
+        gs_layout.addLayout(row_dir)
+        # Enable/disable sub-controls with the master checkbox / 随总开关启用/禁用子控件
+        self._cb_gs.toggled.connect(self._combo_gs_by.setEnabled)
+        self._cb_gs.toggled.connect(self._combo_gs_dir.setEnabled)
+        self._combo_gs_by.setEnabled(self._gs_enabled)
+        self._combo_gs_dir.setEnabled(self._gs_enabled)
+        self._page_layout.addWidget(self._gs_group)
+
         # Clear logs / 清除日志
         self._log_group = QGroupBox(tr("logs_group"))
         log_layout = QVBoxLayout(self._log_group)
@@ -310,7 +435,7 @@ class SettingsDialog(QDialog):
         log_layout.addWidget(self._btn_clear_logs)
         self._page_layout.addWidget(self._log_group)
         self._page_layout.addStretch()
-        return w
+        return self._wrap_scroll(w)
 
     # Send mode: radio dots (filled when selected) + word-wrapped text labels
     # 发送模式：radio 圆点选择框（选中实心）+ 可换行文字标签
@@ -349,8 +474,24 @@ class SettingsDialog(QDialog):
         send_layout.addLayout(_row(self._rb_file, self._label_file))
         send_layout.addLayout(_row(self._rb_image, self._label_image))
         self._page_layout.addWidget(self._send_group)
+
+        # GIF conversion group / GIF 转换分组
+        self._conv_group = QGroupBox(tr("gif_conv_group"))
+        conv_layout = QVBoxLayout(self._conv_group)
+        self._cb_auto_convert = QCheckBox(tr("gif_auto_convert"))
+        self._cb_auto_convert.setChecked(self._auto_convert_gif)
+        conv_layout.addWidget(self._cb_auto_convert)
+        self._conv_hint = QLabel(tr("gif_auto_convert_hint"))
+        self._conv_hint.setStyleSheet("color: #888; font-size: 11px;")
+        self._conv_hint.setWordWrap(True)
+        conv_layout.addWidget(self._conv_hint)
+        self._btn_convert_library = QPushButton(tr("gif_convert_all"))
+        self._btn_convert_library.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_convert_library.clicked.connect(self._on_convert_all)
+        conv_layout.addWidget(self._btn_convert_library)
+        self._page_layout.addWidget(self._conv_group)
         self._page_layout.addStretch()
-        return w
+        return self._wrap_scroll(w)
 
     # Hotkey page
     # 快捷键
@@ -367,7 +508,7 @@ class SettingsDialog(QDialog):
         hotkey_layout.addWidget(self._hotkey_capture)
         self._page_layout.addWidget(self._hotkey_group)
         self._page_layout.addStretch()
-        return w
+        return self._wrap_scroll(w)
 
     # Text preview limits (single-line and multi-line configured independently)
     # 文字预览限制（单行 / 多行独立）
@@ -401,12 +542,138 @@ class SettingsDialog(QDialog):
         text_layout.addLayout(row2)
         self._page_layout.addWidget(self._text_group)
         self._page_layout.addStretch()
-        return w
+        return self._wrap_scroll(w)
 
     # About page: logo / name / version / developer / MIT license
     # 信息页：Logo / 名称 / 版本 / 开发者 / MIT 许可。
     # Hardcoded English only, not routed through the language file
     # 纯英文硬编码，不经过语言文件。
+    def _build_update_page(self):
+        w = self._page_widget()
+        layout = self._page_layout
+
+        # Current version / 当前版本
+        self._lbl_current = QLabel(tr("update_current", version=__version__))
+        self._lbl_current.setStyleSheet("color: #DDDDDD; font-size: 13px;")
+        layout.addWidget(self._lbl_current)
+
+        # Auto-update switch / 自动更新开关
+        self._cb_auto_update = QCheckBox(tr("update_auto"))
+        self._cb_auto_update.setChecked(self._auto_update)
+        layout.addWidget(self._cb_auto_update)
+
+        # Check button / 检查更新按钮
+        self._btn_check = QPushButton(tr("update_check"))
+        self._btn_check.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_check.clicked.connect(self._on_check_update)
+        layout.addWidget(self._btn_check)
+
+        # Info area (inline, errors shown in red, no popups) /
+        # 信息区（页内联显示，错误红色，不弹窗）
+        self._lbl_update_info = QLabel("")
+        self._lbl_update_info.setWordWrap(True)
+        self._lbl_update_info.setStyleSheet(
+            "color: #BBBBBB; font-size: 12px;")
+        layout.addWidget(self._lbl_update_info)
+
+        # Download row: button + progress bar / 下载行：按钮 + 进度条
+        self._btn_download = QPushButton(tr("update_download"))
+        self._btn_download.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_download.setEnabled(False)
+        # Only show the button when an update is actually available /
+        # 仅在确实有更新时显示下载按钮
+        self._btn_download.setVisible(False)
+        self._btn_download.clicked.connect(self._on_download_update)
+        layout.addWidget(self._btn_download)
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setVisible(False)
+        layout.addWidget(self._progress)
+
+        self._update_mgr = UpdateManager(self)
+        self._update_mgr.check_finished.connect(self._on_check_finished)
+        self._update_mgr.download_progress.connect(self._on_dl_progress)
+        self._update_mgr.download_done.connect(self._on_dl_done)
+
+        layout.addStretch()
+        return self._wrap_scroll(w)
+
+    # Update page handlers / 更新页处理
+    def _on_check_update(self):
+        self._btn_check.setEnabled(False)
+        self._btn_download.setVisible(False)
+        self._info_normal(tr("update_checking"))
+        self._update_mgr.check_updates()
+
+    def _info_normal(self, text):
+        self._lbl_update_info.setStyleSheet(
+            "color: #BBBBBB; font-size: 12px;")
+        self._lbl_update_info.setText(text)
+
+    def _info_error(self, text):
+        self._lbl_update_info.setStyleSheet(
+            "color: #E5533D; font-size: 12px;")
+        self._lbl_update_info.setText(text)
+
+    def _on_check_finished(self, ok, version, url, size, err_key, detail):
+        self._btn_check.setEnabled(True)
+        if not ok:
+            # No download button when the check failed or there is no update /
+            # 检查失败或没有更新时不显示下载按钮
+            self._btn_download.setVisible(False)
+            msg = tr(err_key)
+            if detail:
+                msg += f"\n({detail})"
+            self._info_error(msg)
+            return
+        self._latest_version = version
+        self._latest_size = size
+        if version is not None and cmp_version(version, parse_version(__version__)) > 0:
+            size_mb = size / 1024 / 1024 if size else 0
+            self._btn_download.setVisible(True)
+            self._btn_download.setEnabled(True)
+            self._info_normal(tr(
+                "update_found", version=".".join(str(x) for x in version),
+                size=f"{size_mb:.1f} MB"))
+        else:
+            # Already the newest version: hide the download button /
+            # 已是最新版本：隐藏下载按钮
+            self._btn_download.setVisible(False)
+            self._info_normal(tr("update_latest"))
+
+    def _on_download_update(self):
+        if self._update_mgr.latest_info() is None:
+            return
+        name = f"GIFManager-Setup-{self._latest_version[0]}." \
+               f"{self._latest_version[1]}.{self._latest_version[2]}.exe"
+        dest = os.path.join(_download_dir(), name)
+        self._btn_download.setEnabled(False)
+        self._progress.setVisible(True)
+        self._progress.setValue(0)
+        self._info_normal(tr("update_downloading", name=name))
+        self._update_mgr.download_update(dest)
+
+    def _on_dl_progress(self, received, total):
+        if total > 0:
+            self._progress.setValue(int(received * 100 / total))
+
+    def _on_dl_done(self, ok, path_or_err):
+        self._btn_download.setEnabled(True)
+        self._progress.setVisible(False)
+        if not ok:
+            key, _, detail = path_or_err.partition("|")
+            msg = tr(key)
+            if detail:
+                msg += f"\n({detail})"
+            self._info_error(msg)
+            return
+        self._info_normal(tr("update_downloaded", path=path_or_err))
+        # Auto-launch the installer / 自动运行安装程序
+        from PySide6.QtCore import QProcess
+        if not QProcess.startDetached(path_or_err, []):
+            self._info_error(tr("update_launch_fail", path=path_or_err))
+
     def _build_about_page(self):
         w = self._page_widget()
         layout = self._page_layout
@@ -433,7 +700,7 @@ class SettingsDialog(QDialog):
         name.setStyleSheet("font-size: 20px; font-weight: bold; color: #1677FF;")
         layout.addWidget(name)
 
-        ver = QLabel("Version 1.0.1")
+        ver = QLabel(f"Version {__version__}")
         ver.setAlignment(Qt.AlignmentFlag.AlignCenter)
         ver.setStyleSheet("color: #888888; font-size: 12px;")
         layout.addWidget(ver)
@@ -511,7 +778,7 @@ class SettingsDialog(QDialog):
         perf_layout.addLayout(row)
         self._page_layout.addWidget(self._perf_group)
         self._page_layout.addStretch()
-        return w
+        return self._wrap_scroll(w)
 
     def _on_ok(self):
         self._mode = 0 if self._rb_file.isChecked() else 1
@@ -521,6 +788,11 @@ class SettingsDialog(QDialog):
         self._text_limit_single = self._spin_single.value()
         self._text_limit_multi = self._spin_multi.value()
         self._thread_count = self._spin_threads.value()
+        self._gs_enabled = self._cb_gs.isChecked()
+        self._gs_by = self._combo_gs_by.currentData()
+        self._gs_desc = bool(self._combo_gs_dir.currentData())
+        self._auto_convert_gif = self._cb_auto_convert.isChecked()
+        self._auto_update = self._cb_auto_update.isChecked()
         self._lang = self._lang_combo.currentData()
         txt = self._hotkey_capture.text()
         mods, vk = self._hotkey_capture.hotkey_info()
@@ -556,12 +828,31 @@ class SettingsDialog(QDialog):
         self._cb_remember.setText(tr("remember_group"))
         self._cb_autostart.setText(tr("autostart"))
         self._cb_top.setText(tr("always_on_top"))
+        self._gs_title.setText(tr("global_sort_group"))
+        self._cb_gs.setText(tr("global_sort_enable"))
+        self._gs_hint.setToolTip(tr("global_sort_hint"))
+        for i in range(self._combo_gs_by.count()):
+            key = {"time": "sort_by_time", "name": "sort_by_name",
+                   "freq": "sort_by_freq"}[self._combo_gs_by.itemData(i)]
+            self._combo_gs_by.setItemText(i, tr(key))
+        for i in range(self._combo_gs_dir.count()):
+            key = "sort_dir_asc" if self._combo_gs_dir.itemData(i) is False \
+                else "sort_dir_desc"
+            self._combo_gs_dir.setItemText(i, tr(key))
         self._log_group.setTitle(tr("logs_group"))
         self._btn_clear_logs.setText(tr("clear_logs"))
         # Send page / 发送页
         self._send_group.setTitle(tr("send_mode"))
         self._label_file.setText(tr("send_mode_file"))
         self._label_image.setText(tr("send_mode_image"))
+        self._conv_group.setTitle(tr("gif_conv_group"))
+        self._cb_auto_convert.setText(tr("gif_auto_convert"))
+        self._conv_hint.setText(tr("gif_auto_convert_hint"))
+        self._btn_convert_library.setText(tr("gif_convert_all"))
+        self._lbl_current.setText(tr("update_current", version=__version__))
+        self._cb_auto_update.setText(tr("update_auto"))
+        self._btn_check.setText(tr("update_check"))
+        self._btn_download.setText(tr("update_download"))
         # Hotkey page / 快捷键页
         self._hotkey_group.setTitle(tr("hotkey_group"))
         self._hotkey_hint.setText(tr("hotkey_hint"))
@@ -611,6 +902,27 @@ class SettingsDialog(QDialog):
 
     def theme(self):
         return self._theme_combo.currentData()
+
+    # Global sorting mode getters / 全局排序模式取值器
+    def global_sort_enabled(self):
+        return self._gs_enabled
+
+    def global_sort_by(self):
+        return self._gs_by
+
+    def global_sort_desc(self):
+        return self._gs_desc
+
+    def auto_convert_gif(self):
+        return self._auto_convert_gif
+
+    def auto_update(self):
+        return self._auto_update
+
+    def _on_convert_all(self):
+        # Emit a signal so MainWindow runs the conversion (it owns the progress
+        # dialog and the data manager). / 发出信号由主窗口执行转换（进度条与数据管理在主窗口）
+        self.convert_library_requested.emit()
 
     def autostart(self):
         return self._cb_autostart.isChecked()

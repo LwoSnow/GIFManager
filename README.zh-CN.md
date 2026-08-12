@@ -228,6 +228,46 @@ GIFManager/
 
 ---
 
+## 测试
+
+自动化测试位于 `tests/` 目录下。全部测试**离屏运行**，数据与设置隔离在临时目录中，
+不会触碰真实的 `data/` 目录或注册表配置。
+
+### 单元 / 回归测试（unittest）
+
+```bash
+# 布局、"全部"聚合/去重、卡片不重叠 回归测试
+python -m unittest tests.test_layout -v
+
+# masonry 列堆叠、resize 列融合、拖拽排序 回归测试
+python -m unittest tests.test_columns -v
+```
+
+### 独立脚本
+
+以下脚本直接运行（不走 unittest）：
+
+```bash
+# 发布前全线测试：数据层 + UI 集成 + 边界鲁棒性 + 性能基准；
+# 输出 tests/output/full_results.json 与 TEST_REPORT.md
+.venv/Scripts/python.exe tests/full_test.py
+
+# 压力 + Bug 测试：导入 2000 张 512x512 图片，随后测分组切换、搜索、复制、
+# 移动、删除、文字分组，并清空分组；输出 tests/output/results.json
+.venv/Scripts/python.exe tests/stress_test.py
+
+# 补充压力测试：复杂（噪声）图像负载 + SQL/布局单次耗时
+.venv/Scripts/python.exe tests/stress_extra.py
+
+# 近期修复/新功能的快速回归脚本（可重复运行）
+.venv/Scripts/python.exe tests/test_regressions.py
+```
+
+> 注意：`full_test.py`、`stress_test.py`、`stress_extra.py` 会生成数百到数千张图片，
+> 耗时可能达数分钟——它们用于发版前的完整验证，不适合每次本地修改都跑。
+
+---
+
 ## 常见问题
 
 - **快捷键注册失败** — 该组合键已被其他程序占用，请在设置里换一个快捷键。

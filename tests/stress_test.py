@@ -1,8 +1,12 @@
-"""GIFManager 压力测试 + Bug 测试（离屏运行，数据隔离在临时目录，不污染真实 data/）
+"""GIFManager stress + bug test (offscreen, data isolated in a temp dir, never touches real data/)
+GIFManager 压力测试 + Bug 测试（离屏运行，数据隔离在临时目录，不污染真实 data/）
 
+Stress: 2000 512x512 images -> import / startup / switching / search / copy / move / delete / text
 压力测试：2000 张 512x512 图片 → 导入 / 启动 / 切换分组 / 搜索 / 复制 / 移动 / 删除 / 文字 / 清空分组
+Bug: card overlap, placeholder, cross-group dedupe, clipboard, file consistency, reorder, etc.
 Bug 测试：卡片重叠、占位文字、跨组去重、剪贴板、文件一致性、分组重排等
 
+Usage: .venv/Scripts/python.exe tests/stress_test.py
 用法：.venv/Scripts/python.exe tests/stress_test.py
 """
 import os
@@ -21,8 +25,11 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 sys.path.insert(0, ROOT)
 
 from PySide6.QtCore import Qt
-# 隔离 QSettings：Windows 上 setPath/setDefaultFormat 对注册表默认格式无效，
-# 改为 monkeypatch main_window 模块中的 QSettings 引用 → 单文件 ini（不碰注册表）
+# Isolate QSettings: setPath/setDefaultFormat do not affect the registry-backed
+# default format on Windows, so monkeypatch main_window's QSettings reference to a
+# single-file ini instead (no registry access) / 隔离 QSettings：Windows 上
+# setPath/setDefaultFormat 对注册表默认格式无效，改为 monkeypatch main_window 模块中的
+# QSettings 引用 → 单文件 ini（不碰注册表）
 import app.main_window as mw_mod
 
 
@@ -38,7 +45,8 @@ def _isolate_qsettings(tmp):
 
 mw_mod.QSettings = _isolate_qsettings(TMP)
 
-# 隔离数据目录（monkeypatch 必须在 DataManager 实例化之前）
+# Isolate the data dir (monkeypatch must happen before DataManager
+# instantiation) / 隔离数据目录（monkeypatch 必须在 DataManager 实例化之前）
 import app.models.data_manager as dm_mod
 dm_mod._app_data_dir = lambda: os.path.join(TMP, "data")
 
@@ -78,7 +86,8 @@ def flush(ms=50):
 
 
 def sample_mem():
-    """Windows 工作集内存采样（字节）"""
+    # Windows working-set memory sample (bytes)
+    # Windows 工作集内存采样（字节）
     global MEM_PEAK
     try:
         from ctypes import wintypes
@@ -87,8 +96,10 @@ def sample_mem():
             _fields_ = [
                 ("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
                 ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
-                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
                 ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
             ]
         psapi = ctypes.WinDLL("psapi")
@@ -113,7 +124,9 @@ def bug(name, ok, detail=""):
 
 
 def check_overlap(tag, cards, limit=6):
-    """检测卡片几何重叠（两两 QRect.intersects）与越界，返回 (重叠对数, 越界数, 检测对数)"""
+    # Detects overlapping card geometries (pairwise QRect.intersects) and
+    # out-of-bounds; returns (overlap_count, out_of_bounds, checked_pairs)
+    # 检测卡片几何重叠（两两 QRect.intersects）与越界，返回 (重叠对数, 越界数, 检测对数)
     rects = [c.geometry() for c in cards]
     bad = 0
     pairs = 0
@@ -130,7 +143,8 @@ def check_overlap(tag, cards, limit=6):
 
 
 def gen_images(n, outdir, size=512):
-    """生成 n 张内容不同的 512x512 PNG"""
+    # Generates n 512x512 PNGs with distinct content
+    # 生成 n 张内容不同的 512x512 PNG
     os.makedirs(outdir, exist_ok=True)
     paths = []
     for i in range(n):
@@ -166,7 +180,8 @@ def section(title):
 
 
 def safe_select_group(gid):
-    """选择分组：新创建的分组按钮尚未重建，先 _rebuild() 再选择"""
+    # Selects a group: newly created buttons are not rebuilt yet,
+    # so call _rebuild() first / 选择分组：新创建的分组按钮尚未重建，先 _rebuild() 再选择
     w.group_list._rebuild()
     w.group_list.select_group(gid)
 
@@ -231,7 +246,9 @@ bug("B3 「全部」2000 卡无重叠", bad == 0, f"重叠对数={bad} 检测对
 out_cnt = sum(1 for c in cards_all if c.x() < 0 or c.y() < 0)
 bug("B3b 无卡片越出左上角", out_cnt == 0, f"越界卡数={out_cnt}")
 loaded_thumbs = sum(1 for c in cards_all
-                    if c._thumb_label is not None and c._thumb_label.pixmap() is not None and not c._thumb_label.pixmap().isNull())
+                    if (c._thumb_label is not None
+                            and c._thumb_label.pixmap() is not None
+                            and not c._thumb_label.pixmap().isNull()))
 bug("B13 缩略图全部就绪", loaded_thumbs == len(cards_all),
     f"有图 {loaded_thumbs}/{len(cards_all)}")
 grid.grab().save(os.path.join(OUT, "all_view_2000.png"))
@@ -414,10 +431,12 @@ bug("B1c 占位不顶左上角（有边距/居中）",
     g.width() >= cg.width() - 2 and g.height() >= cg.height() - 2,
     f"placeholder {g.width()}x{g.height()} vs 容器 {cg.width()}x{cg.height()}")
 grid.grab().save(os.path.join(OUT, "empty_image_group.png"))
+# Residue check: whether _data / _items are cleared after an empty group (observation:
+# the current implementation does not clear them; potential memory issue)
 # 残留检查：空分组后 _data / _items 是否清空（观察项：当前实现不清空，属潜在内存问题）
 print(f"  [观察] 空分组后 _data 残留 {len(grid._data)} 条, _items 残留 {len(grid._items)} 个")
 
-# 空文字分组占位
+# Empty text group placeholder / 空文字分组占位
 safe_select_group(tg)
 flush(50)
 te = dm.create_group("空文字组", "text")
@@ -439,7 +458,9 @@ print(f"  默认表情剩余: {len(remaining_all)} 张")
 def _clear():
     for e in list(dm.get_emojis_by_group(default_g["id"])):
         dm.delete_emoji(e["id"])
-    # 真实用户路径：删除后 UI 自动刷新（_delete_emoji → _refresh_emoji_grid）
+    # Real user path: the UI auto-refreshes after deletion
+    # (_delete_emoji -> _refresh_emoji_grid) / 真实用户路径：删除后 UI 自动刷新
+    # （_delete_emoji → _refresh_emoji_grid）
     w._refresh_emoji_grid()
     flush(150)
 
@@ -454,8 +475,10 @@ grid.grab().save(os.path.join(OUT, "after_clear_group.png"))
 
 # ======================================================================
 section("15. 「全部」跨组去重验证（B6）")
-dm.import_emoji(default_g["id"], img_paths[0])   # 导入到默认表情
-dm.import_emoji(g2, img_paths[0])                # 同一张图导入压测分组（跨组允许）
+# Import into Default / 导入到默认表情
+dm.import_emoji(default_g["id"], img_paths[0])
+# Same image into the stress group (cross-group allowed) / 同一张图导入压测分组（跨组允许）
+dm.import_emoji(g2, img_paths[0])
 all_view = dm.get_all_emojis()
 cnt_first = sum(1 for e in all_view if e["content_hash"] == dm._file_md5(img_paths[0]))
 bug("B6 「全部」按内容哈希折叠跨组重复",
@@ -465,15 +488,15 @@ flush(150)
 
 # ======================================================================
 section("16. 数据层边界：分组重排 / 非法名 / 重命名目录")
-# 重排
+# Reorder / 重排
 dm.reorder_group(g2, 0)
 order_names = [g["name"] for g in dm.get_all_groups()]
 bug("B14 分组重排后顺序更新", "压测分组" in order_names,
     f"顺序={order_names}")
-# 非法名 / 重名
+# Invalid names / duplicate names / 非法名 / 重名
 bug("B15a 非法分组名被拒绝", dm.create_group("bad/name", "image") is None)
 bug("B15b 重名分组被拒绝", dm.create_group("压测分组", "image") is None)
-# 重命名分组 → 目录同步
+# Rename group -> directory sync / 重命名分组 → 目录同步
 gdir_before = os.path.join(dm._emojis_dir, "压测分组")
 ok_ren = dm.rename_group(g2, "压测分组2")
 gdir_after = os.path.join(dm._emojis_dir, "压测分组2")
@@ -494,7 +517,7 @@ fail_count = sum(1 for b in BUGS if not b["ok"])
 print(f"\nBug 汇总: {len(BUGS) - fail_count}/{len(BUGS)} 通过, {fail_count} 失败/异常")
 
 # ======================================================================
-# 清理
+# Cleanup / 清理
 print("\n清理临时数据...")
 try:
     dm._conn.close()

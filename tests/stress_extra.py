@@ -1,4 +1,7 @@
-"""GIFManager 补充压力测试：复杂图像负载 + SQL/布局单次耗时
+"""GIFManager supplementary stress test: complex image load + single-shot SQL/layout timing
+GIFManager 补充压力测试：复杂图像负载 + SQL/布局单次耗时
+(Solid-color images decode fastest; real stickers (complex GIF/PNG) are heavier,
+so noise images are used to simulate them.)
 （纯色图解码最快；真实表情包（复杂 GIF/PNG）解码更重，这里用噪声图模拟）
 """
 import os
@@ -13,6 +16,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP = tempfile.mkdtemp(prefix="gifmgr_extra_")
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 sys.path.insert(0, ROOT)
+
+from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QImage, QColor, QPainter
 
 import app.main_window as mw_mod
 
@@ -32,8 +38,6 @@ mw_mod.QSettings = _isolate_qsettings(TMP)
 import app.models.data_manager as dm_mod
 dm_mod._app_data_dir = lambda: os.path.join(TMP, "data")
 
-from PySide6.QtWidgets import QApplication
-from PySide6.QtGui import QImage, QColor, QPainter
 from app.main_window import MainWindow
 from app.models.data_manager import DataManager
 from app.models.lang_manager import tr
@@ -81,7 +85,8 @@ def gen_solid(n, outdir, size=512):
 
 
 def gen_noise(n, outdir, size=512):
-    """复杂噪声图：每张 800 个随机色块，模拟真实表情包解码负载"""
+    # Complex noise images: 800 random color blocks each, simulating the
+    # decode load of real stickers / 复杂噪声图：每张 800 个随机色块，模拟真实表情包解码负载
     os.makedirs(outdir, exist_ok=True)
     paths = []
     for i in range(n):

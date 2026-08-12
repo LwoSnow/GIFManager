@@ -1,6 +1,9 @@
-"""图片分组列堆叠（masonry）+ resize 列融合 + 拖拽列移动 回归测试
+"""Image group column stacking (masonry) + resize column merge + drag column move regression tests
+图片分组列堆叠（masonry）+ resize 列融合 + 拖拽列移动 回归测试
 
+Run: python -m unittest tests.test_columns -v
 运行: python -m unittest tests.test_columns -v
+Isolation: temporary data dir + in-memory QSettings (never touches real data/ or registry)
 隔离: 临时数据目录 + 内存版 QSettings（不触碰真实 data/ 与注册表配置）
 """
 import os
@@ -52,7 +55,8 @@ def _make_gif(path, color=0xFF):
 
 
 def _col_distribution(dm, group_id):
-    """返回 {col_index: [emojis按sort_order] 的 id 列表}"""
+    # Returns {col_index: [emoji ids sorted by sort_order]}
+    # 返回 {col_index: [按 sort_order 排序的 emoji id 列表]}
     emos = dm.get_emojis_by_group(group_id)
     cols = {}
     for e in emos:
@@ -71,7 +75,9 @@ class TestImageColumnLayout(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        # 数据目录重定向到本类临时目录（运行时 patch，tearDown 恢复，避免多测试类互相覆盖）
+        # Redirect the data dir to this class's temp dir (runtime patch, restored in
+        # tearDown so test classes never overwrite each other) / 数据目录重定向到本类临时目录
+        # （运行时 patch，tearDown 恢复，避免多测试类互相覆盖）
         cls._orig_data_dir = dm_mod._app_data_dir
         dm_mod._app_data_dir = lambda: TMP
         cls.app = QApplication.instance() or QApplication([])
@@ -109,6 +115,7 @@ class TestImageColumnLayout(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+        # ---- 1. Switch to image group: auto-spread unassigned cards (wide -> many columns) ----
         # ---- 1. 切换到图片分组：未分配卡片自动摊列（宽窗口 → 多列） ----
         self.w.group_list._rebuild()
         self.w.group_list.select_group(gid)
@@ -119,23 +126,27 @@ class TestImageColumnLayout(unittest.TestCase):
         self.assertEqual(len(_all_ids(cols)), 7, "卡片无丢失")
         self.assertEqual(self._overlap(), 0, "masonry 布局卡片不应重叠")
         self.assertEqual(len(self.w.emoji_grid._items), 7)
-        # 已分配 → user_sorted=1，再次刷新不再摊列（分布不变）
+        # Assigned cards -> user_sorted=1; refreshing again does not re-spread
+        # (distribution unchanged) / 已分配 → user_sorted=1，再次刷新不再摊列（分布不变）
         before = {k: tuple(v) for k, v in cols.items()}
         self.w._refresh_emoji_grid()
         self._wait()
         after = {k: tuple(v) for k, v in _col_distribution(dm, gid).items()}
         self.assertEqual(before, after, "重复刷新不应改变列分布")
 
+        # ---- 2. Shrink window -> columns merge (order kept, no card lost) ----
         # ---- 2. 缩小窗口 → 列融合（顺序保持，卡片不丢失） ----
         wide = {k: tuple(v) for k, v in cols.items()}
         self.w.resize(420, 520)
-        self._wait(600)  # resizeEvent → 融合 → emojis_reordered → 重载
+        # resizeEvent -> merge -> emojis_reordered -> reload / resizeEvent → 融合 → 重载
+        self._wait(600)
         merged = _col_distribution(dm, gid)
         print("融合后 col 分布:", {k: len(v) for k, v in merged.items()})
         self.assertLess(max(merged), max(wide), "缩小后列数应减少")
         self.assertEqual(len(_all_ids(merged)), 7, "融合后卡片无丢失")
         self.assertEqual(self._overlap(), 0, "融合后卡片不应重叠")
-        # 融合规则：被挤压的卡片逐个放入当前卡片最少的列（动态均衡）
+        # Merge rule: squeezed cards go one by one into the currently shortest
+        # column (dynamic balancing) / 融合规则：被挤压的卡片逐个放入当前卡片最少的列（动态均衡）
         keep_n = max(merged) + 1
         keep_ids = set()
         for ci in range(keep_n):
@@ -150,17 +161,19 @@ class TestImageColumnLayout(unittest.TestCase):
         self.assertLessEqual(max(counts) - min(counts), 1,
                              f"各列卡片数应尽量均衡: {counts}")
 
+        # ---- 3. Drag simulation: move across columns (into a target column/position) ----
         # ---- 3. 拖拽模拟：跨列移动（移入指定列指定位置） ----
         dragged_id = _all_ids(merged)[0]
-        dm.set_emoji_column(dragged_id, 0, 999999)  # 移到第 1 列末尾
+        dm.set_emoji_column(dragged_id, 0, 999999)  # Move to the end of column 1 / 移到第 1 列末尾
         moved = _col_distribution(dm, gid)
         self.assertIn(dragged_id, moved[0], "拖拽后应位于目标列")
         self.assertEqual(moved[0][-1], dragged_id, "拖拽后应位于目标列末尾")
-        # 移空列压缩
+        # Compress emptied columns / 移空列压缩
         empty_cols = [ci for ci in range(max(moved) + 1)
                       if ci not in moved or not moved[ci]]
         self.assertEqual(empty_cols, [], "拖拽后不应有空列（compact 生效）")
 
+        # ---- 4. Text group original behavior stays intact ----
         # ---- 4. 文字分组原有功能不回归 ----
         tid = dm.create_group("颜文字", "text")
         dm.add_text_emoji(tid, "ヽ(´ー｀)ノ おはよう")
@@ -174,6 +187,7 @@ class TestImageColumnLayout(unittest.TestCase):
         self.assertEqual(len(_all_ids(tcols)), 3, "文字卡片无丢失")
         self.assertEqual(self._overlap(), 0, "文字分组卡片不应重叠")
 
+        # ---- 5. "All" aggregate view still works (flow layout) ----
         # ---- 5. "全部"聚合视图仍正常（流式） ----
         self.w.group_list.select_all_group()
         self._wait()

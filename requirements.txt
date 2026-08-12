@@ -1,4 +1,8 @@
-# 运行时依赖（打包与运行均需要）
-# 锁定版本：Qt 补丁版本可能引入行为变化，避免不同环境拉到不一致版本
+# Runtime dependencies (required for both packaging and running) / 运行时依赖（打包与运行均需要）
+# Versions are pinned: Qt patch releases may change behavior, so avoid pulling
+# inconsistent versions across environments / 锁定版本：Qt 补丁版本可能引入行为变化，避免不同环境拉到不一致版本
 PySide6==6.11.1
 shiboken6==6.11.1
+# Pillow: fallback for image-to-GIF conversion when ffmpeg is absent / 无 ffmpeg 时导入图片转 GIF 的回退方案
+# (see app/utils/gif_converter.py) / （见 app/utils/gif_converter.py）
+Pillow==12.3.0

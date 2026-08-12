@@ -1,31 +1,23 @@
 """Edit text dialog
 文字编辑对话框"""
-import sys
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QPlainTextEdit, QDialogButtonBox,
 )
-from PySide6.QtCore import Qt, QPoint
-from PySide6.QtGui import QMouseEvent
 
 from app.models.lang_manager import tr
+from app.widgets.frameless_dialog import FramelessDialog
 
 
-class EditTextDialog(QDialog):
+class EditTextDialog(FramelessDialog):
 
     def __init__(self, current_text="", parent=None):
         super().__init__(parent)
         self.setWindowTitle(tr("edit_text_dialog"))
         self.setFixedSize(400, 300)
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog
-        )
         self._current_text = current_text
-        self._dragging = False
-        self._drag_start = QPoint()
 
         self._setup_ui()
-        self._apply_rounded()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -66,33 +58,3 @@ class EditTextDialog(QDialog):
 
     def text(self):
         return self._editor.toPlainText().strip()
-
-    def _apply_rounded(self):
-        if sys.platform != "win32":
-            return
-        try:
-            import ctypes
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                int(self.winId()), 33,
-                ctypes.byref(ctypes.c_int(2)),
-                ctypes.sizeof(ctypes.c_int),
-            )
-        except Exception:
-            pass
-
-    def mousePressEvent(self, event: QMouseEvent):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._dragging = True
-            self._drag_start = event.globalPosition().toPoint()
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QMouseEvent):
-        if self._dragging:
-            delta = event.globalPosition().toPoint() - self._drag_start
-            self.move(self.pos() + delta)
-            self._drag_start = event.globalPosition().toPoint()
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: QMouseEvent):
-        self._dragging = False
-        super().mouseReleaseEvent(event)

@@ -240,6 +240,49 @@ creating another JSON file with the same keys as `zh_CN.json`.
 
 ---
 
+## Tests
+
+Automated tests live under `tests/`. All of them run **offscreen** with data and
+settings isolated in temporary directories, so they never touch your real `data/`
+folder or registry configuration.
+
+### Unit / regression tests (unittest)
+
+```bash
+# Layout, "All" aggregation/deduplication, and card-overlap regression
+python -m unittest tests.test_layout -v
+
+# Masonry columns, resize merging, and drag-reorder regression
+python -m unittest tests.test_columns -v
+```
+
+### Standalone scripts
+
+Run these directly (not via unittest):
+
+```bash
+# Pre-release full-line test: data layer + UI integration + robustness + performance;
+# writes tests/output/full_results.json and TEST_REPORT.md
+.venv/Scripts/python.exe tests/full_test.py
+
+# Stress + bug test: imports 2000 512x512 images, then measures group switching,
+# search, copy, move, delete, and text groups, and clears the group;
+# writes tests/output/results.json
+.venv/Scripts/python.exe tests/stress_test.py
+
+# Supplementary stress: complex (noise) image load + single-shot SQL/layout timing
+.venv/Scripts/python.exe tests/stress_extra.py
+
+# Quick regression script for recent fixes / new features (rerunnable)
+.venv/Scripts/python.exe tests/test_regressions.py
+```
+
+> Note: `full_test.py`, `stress_test.py`, and `stress_extra.py` generate hundreds to
+> thousands of images and may take minutes — they are meant for release validation,
+> not for every local edit.
+
+---
+
 ## Troubleshooting
 
 - **Hotkey registration failed** — another program already owns that key combination.

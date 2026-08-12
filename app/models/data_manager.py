@@ -1,14 +1,17 @@
 """Data management SQLite & file management
 数据管理 SQLite & 文件管理"""
-import os
-import sys
-import shutil
-import uuid
 import hashlib
+import os
+import re
+import shutil
+import sqlite3
+import sys
+import tempfile
+import uuid
 from PySide6.QtCore import QStandardPaths, QMimeData, QUrl
 from PySide6.QtGui import QImage, QPixmap
 
-import re
+from app.utils import gif_converter
 
 # Valid characters for group names: Chinese and English, numbers, spaces, short lines /
 # 分组名合法字符：中英文、数字、空格、短横线
@@ -46,9 +49,6 @@ def _app_data_dir():
     return candidates[-1]
 
 
-import sqlite3
-
-
 class DataManager:
     def __init__(self):
         self._data_dir = _app_data_dir()
@@ -59,7 +59,13 @@ class DataManager:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        self._last_group_error = ""  # last rename_group failure reason / 上次重命名失败原因
         self._init_tables()
+        # Speed up GROUP BY content_hash in get_all_emojis for large libraries
+        # 为 get_all_emojis 的 GROUP BY content_hash 建索引（大图库提速）
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_emojis_hash ON emojis(content_hash)"
+        )
 
     # Initialization / 初始化
 
@@ -85,6 +91,7 @@ class DataManager:
                 sort_order INTEGER NOT NULL DEFAULT 0,
                 col_index INTEGER NOT NULL DEFAULT 0,
                 user_sorted INTEGER NOT NULL DEFAULT 0,
+                use_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
                 FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE
             )
@@ -92,6 +99,10 @@ class DataManager:
         cols = [r[1] for r in self._conn.execute("PRAGMA table_info(emojis)")]
         if "content_hash" not in cols:
             self._conn.execute("ALTER TABLE emojis ADD COLUMN content_hash TEXT DEFAULT ''")
+        if "src_hash" not in cols:
+            # Original (pre-conversion) file hash, kept for dedup compatibility /
+            # 转换前原始文件哈希，用于去重兼容
+            self._conn.execute("ALTER TABLE emojis ADD COLUMN src_hash TEXT DEFAULT ''")
         if "sort_order" not in cols:
             self._conn.execute(
                 "ALTER TABLE emojis ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0"
@@ -103,6 +114,10 @@ class DataManager:
                 "ALTER TABLE emojis ADD COLUMN user_sorted INTEGER NOT NULL DEFAULT 0"
             )
             self._conn.execute("UPDATE emojis SET user_sorted=1")
+        if "use_count" not in cols:
+            self._conn.execute(
+                "ALTER TABLE emojis ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0"
+            )
         self._conn.commit()
         self._ensure_builtin("All", "image", 0)
         self._ensure_builtin("Default Expression", "image", 1)
@@ -248,14 +263,17 @@ class DataManager:
     def rename_group(self, group_id, new_name):
         old = self.get_group(group_id)
         if not old:
+            self._last_group_error = "missing"
             return False
         new_name = new_name.strip()
         # Security verification / 安全性校验
         if not _is_valid_group_name(new_name):
+            self._last_group_error = "invalid"
             return False
         # Duplicate name inspection / 重名检查
         existing = self.get_group_by_name(new_name)
         if existing and existing["id"] != group_id:
+            self._last_group_error = "duplicate"
             return False
         self._conn.execute("UPDATE groups SET name=? WHERE id=?", (new_name, group_id))
         self._conn.commit()
@@ -265,9 +283,28 @@ class DataManager:
             try:
                 os.rename(old_dir, new_dir)
             except OSError:
-                self._conn.execute("UPDATE groups SET name=? WHERE id=?", (old["name"], group_id))
-                self._conn.commit()
-                return False
+                # Windows occasionally fails with os.rename; fall back to
+                # shutil.move before rolling back (Windows 下 os.rename 偶发失败，
+                # 回滚前先尝试 shutil.move 兜底迁移)
+                try:
+                    shutil.move(old_dir, new_dir)
+                except OSError:
+                    # Last resort: copy the whole folder, then remove the old
+                    # one. Copying does not need exclusive access, so it still
+                    # works while a file handle is open
+                    # 最后兜底：整目录复制后删除旧目录；复制不要求独占访问
+                    try:
+                        shutil.copytree(old_dir, new_dir, dirs_exist_ok=True)
+                        shutil.rmtree(old_dir, ignore_errors=True)
+                    except OSError:
+                        self._conn.execute(
+                            "UPDATE groups SET name=? WHERE id=?",
+                            (old["name"], group_id),
+                        )
+                        self._conn.commit()
+                        self._last_group_error = "dir"
+                        return False
+        self._last_group_error = ""
         return True
 
     def delete_group(self, group_id):
@@ -311,10 +348,13 @@ class DataManager:
                 h = self._file_md5(fp)
             except OSError:
                 # File is missing, leaving empty hash (does not appear in "All" view) /
-                # 文件缺失，保留空哈希（不会出现在\"全部\"视图）
+                # 文件缺失，保留空哈希（不会出现在"全部"视图）
                 continue
             self._conn.execute(
-                "UPDATE emojis SET content_hash=? WHERE id=?", (h, r["id"])
+                "UPDATE emojis SET content_hash=?,"
+                " src_hash=CASE WHEN src_hash='' THEN ? ELSE src_hash END"
+                " WHERE id=?",
+                (h, h, r["id"])
             )
         self._conn.commit()
 
@@ -386,22 +426,31 @@ class DataManager:
             (group_id,),
         ).fetchone()[0]
 
-    def import_emoji(self, group_id, filepath):
+    def import_emoji(self, group_id, filepath, auto_convert=True):
         group = self.get_group(group_id)
         if not group or group["type"] != "image":
             return "error"
 
         ext = os.path.splitext(filepath)[1].lower()
-        if ext not in {".gif", ".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+        if ext not in gif_converter.IMPORT_EXTS:
             return "error"
-        # Calculate the source file hash first to check for duplication: if there is
-        # already the same content in the same group, skip it;
-        # Duplication is allowed across groups (the same picture can be classified
-        # into multiple groups to create multiple tags)
-        # 先算源文件哈希查重：同一分组内已有相同内容则跳过；
-        # 跨分组允许重复（同一张图可归入多个分组做多标签）
+        # Convert non-gif images to gif first (keeps size/ratio unchanged) /
+        # 先把非 gif 图片转为 gif（尺寸比例不变）
+        src_hash = ""
+        src = filepath
+        if auto_convert and gif_converter.needs_conversion(filepath):
+            src_hash = self._file_md5(filepath)
+            tmp_gif = os.path.join(
+                tempfile.gettempdir(), f"gm_conv_{uuid.uuid4().hex}.gif")
+            if gif_converter.convert_to_gif(filepath, tmp_gif):
+                src = tmp_gif
+        # Calculate the stored-file hash for dedup: after conversion the gif
+        # hash matches other gifs of the same picture, so png and gif of the
+        # same image de-duplicate each other.
+        # 以实际存储文件哈希查重：转换后 gif 哈希与同图其他 gif 一致，
+        # 因此同一张图的 png 与 gif 可以互相去重。
         try:
-            content_hash = self._file_md5(filepath)
+            content_hash = self._file_md5(src)
         except OSError:
             return "error"
         dup = self._conn.execute(
@@ -410,51 +459,72 @@ class DataManager:
             (content_hash, group_id),
         ).fetchone()
         if dup:
+            if src != filepath:
+                try:
+                    os.remove(src)  # clean temp gif / 清理临时 gif
+                except OSError:
+                    pass
             return "duplicate"
 
         gdir = os.path.join(self._emojis_dir, group["name"])
         os.makedirs(gdir, exist_ok=True)
 
         unique_id = uuid.uuid4().hex[:8]
-        new_name = f"{unique_id}{ext}"
+        store_ext = os.path.splitext(src)[1].lower() or ".gif"
+        new_name = f"{unique_id}{store_ext}"
         dest = os.path.join(gdir, new_name)
-        shutil.copy2(filepath, dest)
+        shutil.copy2(src, dest)
 
         original_name = os.path.splitext(os.path.basename(filepath))[0]
         self._conn.execute(
-            "INSERT INTO emojis (group_id, filename, original_name, content_hash) VALUES (?,?,?,?)",
-            (group_id, new_name, original_name, content_hash)
+            "INSERT INTO emojis (group_id, filename, original_name, content_hash, src_hash)"
+            " VALUES (?,?,?,?,?)",
+            (group_id, new_name, original_name, content_hash, src_hash)
         )
         self._conn.commit()
+        if src != filepath:
+            try:
+                os.remove(src)  # remove temp gif / 删除临时 gif
+            except OSError:
+                pass
         return "ok"
 
-    def import_emojis_batch(self, group_id, filepaths, workers=None):
+    def import_emojis_batch(self, group_id, filepaths, workers=None, auto_convert=True):
         # Multi-threaded import / 多线程导入
         group = self.get_group(group_id)
         if not group or group["type"] != "image":
             return (0, 0)
-        exts = {".gif", ".png", ".jpg", ".jpeg", ".webp", ".bmp"}
         valid = [p for p in filepaths
-                 if os.path.splitext(p)[1].lower() in exts]
+                 if os.path.splitext(p)[1].lower() in gif_converter.IMPORT_EXTS]
         if not valid:
             return (0, 0)
         gdir = os.path.join(self._emojis_dir, group["name"])
         os.makedirs(gdir, exist_ok=True)
 
         def work(src):
-            # worker Thread: hash + copy to target (uuid named)
-            # worker 线程：哈希 + 复制到目标（uuid 命名）
+            # worker Thread: convert -> hash -> copy to target (uuid named)
+            # worker 线程：转换 → 哈希 → 复制到目标（uuid 命名）
             try:
-                h = self._file_md5(src)
+                src_hash = ""
+                store = src
+                if auto_convert and gif_converter.needs_conversion(src):
+                    src_hash = self._file_md5(src)
+                    tmp_gif = os.path.join(
+                        tempfile.gettempdir(), f"gm_conv_{uuid.uuid4().hex}.gif")
+                    if gif_converter.convert_to_gif(src, tmp_gif):
+                        store = tmp_gif
+                h = self._file_md5(store)
+                store_ext = os.path.splitext(store)[1].lower() or ".gif"
+                dest = os.path.join(gdir, f"{uuid.uuid4().hex[:8]}{store_ext}")
+                shutil.copy2(store, dest)
+                if store != src:
+                    try:
+                        os.remove(store)  # remove temp gif / 删除临时 gif
+                    except OSError:
+                        pass
             except OSError:
                 return None
-            ext = os.path.splitext(src)[1].lower()
-            dest = os.path.join(gdir, f"{uuid.uuid4().hex[:8]}{ext}")
-            try:
-                shutil.copy2(src, dest)
-            except OSError:
-                return None
-            return {"dest": dest, "hash": h,
+            return {"dest": dest, "hash": h, "src_hash": src_hash,
                     "original_name": os.path.splitext(os.path.basename(src))[0]}
 
         if workers is None or workers <= 1 or len(valid) <= 1:
@@ -488,9 +558,11 @@ class DataManager:
                     continue
                 existing.add(r["hash"])
                 self._conn.execute(
-                    "INSERT INTO emojis (group_id, filename, original_name, content_hash)"
-                    " VALUES (?,?,?,?)",
-                    (group_id, os.path.basename(r["dest"]), r["original_name"], r["hash"]),
+                    "INSERT INTO emojis (group_id, filename, original_name,"
+                    " content_hash, src_hash)"
+                    " VALUES (?,?,?,?,?)",
+                    (group_id, os.path.basename(r["dest"]), r["original_name"],
+                     r["hash"], r.get("src_hash", "")),
                 )
                 imported += 1
             self._conn.commit()
@@ -498,6 +570,69 @@ class DataManager:
             self._conn.rollback()
             raise
         return (imported, duplicated)
+
+    # Convert every non-gif image in all groups to gif. On success the
+    # original file is deleted and the DB record is updated (content_hash
+    # becomes the gif hash, src_hash keeps the original hash). If the
+    # converted gif already exists in the same group the redundant record is
+    # removed. Returns (converted, failed, deduped).
+    # 把所有分组内非 gif 图片转为 gif：成功后删除原文件并更新记录
+    # （content_hash 变为 gif 哈希，src_hash 保留原始哈希）。同组已有相同
+    # 内容的 gif 时删除冗余记录。返回 (converted, failed, deduped)。
+    def convert_library_to_gif(self, progress_cb=None):
+        rows = self._conn.execute(
+            "SELECT e.id, e.group_id, e.filename, e.content_hash, e.src_hash,"
+            " g.name AS gname FROM emojis e JOIN groups g ON e.group_id=g.id"
+            " WHERE g.type='image' AND e.filename != ''"
+        ).fetchall()
+        pending = [dict(r) for r in rows
+                   if gif_converter.needs_conversion(os.path.join(
+                       self._emojis_dir, r["gname"], r["filename"]))]
+        converted = 0
+        failed = 0
+        deduped = 0
+        total = len(pending)
+        for i, em in enumerate(pending):
+            if progress_cb is not None:
+                progress_cb(i, total, em["filename"])
+            src = os.path.join(self._emojis_dir, em["gname"], em["filename"])
+            dst = os.path.join(self._emojis_dir, em["gname"],
+                               f"{uuid.uuid4().hex[:8]}.gif")
+            if not gif_converter.convert_to_gif(src, dst):
+                failed += 1
+                continue
+            new_hash = self._file_md5(dst)
+            # Same content already in this group -> drop the redundant record /
+            # 同组已有相同内容 → 删除冗余记录
+            dup = self._conn.execute(
+                "SELECT id FROM emojis WHERE group_id=? AND content_hash=? AND id!=?",
+                (em["group_id"], new_hash, em["id"]),
+            ).fetchone()
+            try:
+                os.remove(src)
+            except OSError:
+                pass
+            if dup:
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
+                self._conn.execute(
+                    "DELETE FROM emojis WHERE id=?", (em["id"],))
+                deduped += 1
+            else:
+                old_hash = em["content_hash"]
+                self._conn.execute(
+                    "UPDATE emojis SET filename=?, content_hash=?, src_hash=?"
+                    " WHERE id=?",
+                    (os.path.basename(dst), new_hash,
+                     em["src_hash"] or old_hash, em["id"]),
+                )
+                converted += 1
+            self._conn.commit()
+        if progress_cb is not None and total:
+            progress_cb(total, total, "")
+        return (converted, failed, deduped)
 
     def add_text_emoji(self, group_id, text_content):
         group = self.get_group(group_id)
@@ -707,6 +842,10 @@ class DataManager:
                 key=lambda e: (e.get("created_at", ""), e["id"]),
                 reverse=desc,
             )
+        elif by == "freq":
+            # Usage frequency: ascending = least used first, descending = most used first
+            # 使用频率：升序 = 低频在前，逆序 = 高频在前
+            emojis.sort(key=lambda e: e.get("use_count", 0), reverse=desc)
         else:
             # Name sort: case-insensitive, empty names go last / 名称排序：忽略大小写，空名排后
             emojis.sort(
@@ -834,6 +973,13 @@ class DataManager:
         if not group:
             return None
         return os.path.join(self._emojis_dir, group["name"], emoji["filename"])
+
+    def increment_use_count(self, emoji_id):
+        # Bump the usage counter when an emoji is sent/copied / 发送/复制表情包时使用次数 +1
+        self._conn.execute(
+            "UPDATE emojis SET use_count = use_count + 1 WHERE id=?", (emoji_id,)
+        )
+        self._conn.commit()
 
     # Clipboard / 剪贴板
 

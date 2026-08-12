@@ -1,12 +1,12 @@
 """Emoji grid
 表情包网格"""
+import math
+import time
 from PySide6.QtWidgets import (
     QWidget, QLayout, QLayoutItem, QSizePolicy, QLabel, QVBoxLayout,
 )
 from PySide6.QtCore import Qt, QSize, QRect, Signal, QPoint, QTimer
 from PySide6.QtGui import QContextMenuEvent, QPainter, QColor, QPixmap, QPixmapCache, QPen
-import math
-import time
 
 from app.widgets.emoji_item import EmojiItem, _loader, _thumb_key
 from app.models.lang_manager import tr
@@ -271,6 +271,7 @@ class EmojiGridWidget(QWidget):
         super().__init__(parent)
         self._dm = None
         self._items = []
+        self._thumb_index = {}  # thumb_key -> card for O(1) lookup / 缩略图 key 到卡片的索引
         self._data = []
         self._preview_limits = (100, 200)
         self._lazy_buffer = 300  # Lazy loading of upper and lower buffer pixels / 懒加载上下缓冲像素
@@ -323,11 +324,24 @@ class EmojiGridWidget(QWidget):
         self._drop_overlay.setGeometry(self.rect())
         self._drop_overlay.raise_()
 
+    def release_gif_handles(self):
+        # Stop every animation and detach its QMovie file handle so Windows
+        # allows renaming/deleting the current group folder
+        # 停止所有动画并分离 QMovie 文件句柄，使 Windows 允许重命名/删除当前分组目录
+        for card in self._items:
+            card._stop_gif()
+
     def _on_thumb_ready(self, key, img):
         if img.isNull():
             return
         pix = QPixmap.fromImage(img)
         QPixmapCache.insert(key, pix)
+        # O(1) lookup via index; fall back to scan when the index is stale
+        # 用索引 O(1) 查找；索引滞后时回退遍历
+        card = self._thumb_index.get(key)
+        if card is not None:
+            card.apply_thumb(pix)
+            return
         for card in self._items:
             if card._thumb_path and _thumb_key(card._thumb_path) == key:
                 card.apply_thumb(pix)
@@ -568,6 +582,12 @@ class EmojiGridWidget(QWidget):
         self._flow.relayout()
         self._flow_container.updateGeometry()
         self.updateGeometry()
+        # Rebuild the thumb lookup index after the card set changes
+        # 卡片集合变化后重建缩略图查找索引
+        self._thumb_index = {
+            _thumb_key(card._thumb_path): card
+            for card in self._items if card._thumb_path
+        }
 
         if self.current_group_id is not None:
             QTimer.singleShot(0, self._check_column_merge)
@@ -607,7 +627,7 @@ class EmojiGridWidget(QWidget):
     def _find_data_manager(self):
         p = self.parent()
         while p:
-            if hasattr(p, 'data_manager'):
+            if hasattr(p, "data_manager"):
                 return p.data_manager
             p = p.parent()
         return None
@@ -634,11 +654,17 @@ class EmojiGridWidget(QWidget):
             menu.addSeparator()
             act_name = menu.addAction(tr("sort_by_name"))
             act_time = menu.addAction(tr("sort_by_time"))
+            act_freq = menu.addAction(tr("sort_by_freq"))
             chosen = menu.exec(pos)
             if chosen == act_rearrange:
                 self._rearrange()
-            elif chosen == act_name or chosen == act_time:
-                by = "name" if chosen == act_name else "time"
+            elif chosen in (act_name, act_time, act_freq):
+                if chosen == act_name:
+                    by = "name"
+                elif chosen == act_time:
+                    by = "time"
+                else:
+                    by = "freq"
                 self._sort_group(by)
         event.accept()
 

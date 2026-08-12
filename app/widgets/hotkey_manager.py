@@ -127,7 +127,7 @@ class HotkeyManager(QAbstractNativeEventFilter):
     def nativeEventFilter(self, eventType, message):
         # In PySide6, eventType is a QByteArray → Python bytes
         # PySide6 中 eventType 是 QByteArray → Python bytes
-        et = eventType.data() if hasattr(eventType, 'data') else bytes(eventType)
+        et = eventType.data() if hasattr(eventType, "data") else bytes(eventType)
         if b"windows" in et:
             msg = ctypes.cast(
                 ctypes.c_void_p(int(message)), ctypes.POINTER(wintypes.MSG)

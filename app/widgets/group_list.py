@@ -294,8 +294,17 @@ class GroupListWidget(QWidget):
             self, tr("rename_group_dialog"), tr("new_name"), text=g["name"]
         )
         if ok and new_name.strip():
+            # Detach QMovie file handles first: Windows cannot rename the
+            # group folder while a GIF inside it is being played
+            # 先分离 QMovie 文件句柄：Windows 上 GIF 播放中无法重命名分组目录
+            w = self.window()
+            if hasattr(w, "emoji_grid"):
+                w.emoji_grid.release_gif_handles()
             if not self._dm.rename_group(group_id, new_name.strip()):
-                QMessageBox.warning(self, tr("rename_failed"), tr("rename_failed_msg"))
+                reason = getattr(self._dm, "_last_group_error", "") or "unknown"
+                QMessageBox.warning(
+                    self, tr("rename_failed"), tr(f"rename_fail_{reason}")
+                )
                 return
             self._rebuild()
             self.groups_updated.emit()
@@ -309,6 +318,11 @@ class GroupListWidget(QWidget):
             tr("confirm_delete_group_msg", name=g["name"]),
         )
         if reply == QMessageBox.StandardButton.Yes:
+            # Detach QMovie file handles first so Windows can delete the folder
+            # 先分离 QMovie 文件句柄，Windows 才能删除目录
+            w = self.window()
+            if hasattr(w, "emoji_grid"):
+                w.emoji_grid.release_gif_handles()
             # Remember the group before the deleted one (current visual order, "全部" first)
             # 记住被删分组在当前顺序中的前一个（"全部"在最前）
             ids = list(self._buttons.keys())
