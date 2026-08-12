@@ -66,23 +66,7 @@ This project used AI-assisted development tools:
 ---
 ## UI Layout
 
-```
-+------------------------------------------------------------------+
-| [ 🔍 Search stickers...            ] [Import GIF▾] [+Text] [⚙]  |  ← draggable toolbar
-+------------------------------------------------------------------+
-|                                                                  |
-|   [GIF1]   [GIF2]   [GIF3]   [GIF4]    ← image stickers (grid,   |
-|   [GIF5]   [GIF6]   ...                 masonry columns)         |
-|   ┌──────────────────┐                                            |
-|   │ (｡•̀ᴗ-)✧       │  ← text stickers (compact cards)         |
-|   └──────────────────┘                                            |
-|                                                                  |
-+------------------------------------------------------------------+
-|  All | Default | Memes | Pets | Kaomoji |  ＋                    |  ← bottom group tabs
-+------------------------------------------------------------------+
-|   Default · 128 stickers  |  256 in total                        |  ← status bar
-+------------------------------------------------------------------+
-```
+![GIFManager UI (English)](.github/image/GUI_en.png)
 
 ---
 
