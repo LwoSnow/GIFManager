@@ -5,14 +5,15 @@ import math
 from PySide6.QtWidgets import QFrame, QVBoxLayout, QHBoxLayout, QLabel, QSizePolicy, QApplication
 from PySide6.QtCore import (
     Qt, QSize, QTimer, Signal, QMimeData, QUrl, QPoint, QObject, QRunnable,
-    QThreadPool,
+    QThreadPool, QRect,
 )
 from PySide6.QtGui import (
-    QPixmap, QPixmapCache, QMovie, QFont, QDrag, QMouseEvent, QPainter, QPen,
-    QColor, QImage,
+    QPixmap, QPixmapCache, QMovie, QFont, QFontMetrics, QDrag, QMouseEvent,
+    QPainter, QPen, QColor, QImage, QImageReader,
 )
 
 from app.models.lang_manager import tr
+from app.utils import gif_player
 
 
 # Thumbnail cache capped at 64MB (~2500+ 76x76 thumbs); LRU evicts automatically
@@ -81,13 +82,17 @@ class EmojiItem(QFrame):
 
     CARD_SIZE = 100
     THUMB_SIZE = 84
+    # Height of the name strip under the thumbnail (image cards)
+    # 缩略图下方名称条的高度（图片卡）
+    NAME_AREA = 22
     # Text card fixed width (masonry column width)
     # 文字卡片统一宽度（masonry 列宽）
     TEXT_WIDTH = 220
     TEXT_MAX_WIDTH = 220
 
     def __init__(self, emoji: dict, data_manager, parent=None,
-                 preview_limits=(100, 200), width=None):
+                 preview_limits=(100, 200), width=None, show_name=True,
+                 hover_zoom=1.15, hover_enabled=True):
         super().__init__(parent)
         self._emoji = emoji
         self._dm = data_manager
@@ -97,6 +102,22 @@ class EmojiItem(QFrame):
         self._dragging = False
         self._preview_limits = preview_limits  # (single-line cap, multi-line cap) / (单行上限, 多行上限)
         self._width = width if width else (self.TEXT_WIDTH if self._is_text else self.CARD_SIZE)
+        # Whether the name label under the thumbnail is shown (settings) /
+        # 是否在缩略图下方显示名称（设置项）
+        self._show_name = show_name
+        # Hover zoom factor and master switch (settings) / 悬停放大倍数与总开关（设置）
+        self._hover_zoom = max(1.0, float(hover_zoom))
+        self._hover_enabled = bool(hover_enabled)
+        self._hover_layer = None
+        self._hidden_neighbors = []  # sibling cards hidden by the overlay / 被浮层隐藏的相邻卡
+        # Native GIF playback state (gifdec.dll) / 原生 GIF 播放状态（gifdec.dll）
+        self._frames = None
+        self._delays = None
+        self._frame_idx = 0
+        self._play_timer = None
+        self._playing = False
+        self._decode_connected = False
+        self._decode_req = False
 
         self.setObjectName("emojiCard")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -127,7 +148,6 @@ class EmojiItem(QFrame):
     def text_natural_width(text, font=None):
         if font is None:
             font = QFont("Microsoft YaHei", 12)
-        from PySide6.QtGui import QFontMetrics
         fm = QFontMetrics(font)
         max_line = 0
         for line in text.split("\n"):
@@ -146,29 +166,65 @@ class EmojiItem(QFrame):
     # Image-mode UI / 图片模式 UI
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def card_height(show_name):
+        # Image card height: thumbnail area plus the name strip when names
+        # are shown (settings "show_emoji_name"). Layout code must use this
+        # so cards and scroll range stay consistent when names are hidden.
+        # 图片卡高度：缩略图区 + 名称条（设置"显示表情包名称"开启时）。
+        # 布局代码必须用此方法，隐藏名称时卡片与滚动范围保持一致。
+        return EmojiItem.CARD_SIZE + (EmojiItem.NAME_AREA if show_name else 0)
+
     def _build_image_ui(self):
-        self.setFixedSize(self.CARD_SIZE, self.CARD_SIZE + 22)
+        self.setFixedSize(self.CARD_SIZE, self.card_height(self._show_name))
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 6, 4, 2)
+        if self._show_name:
+            layout.setContentsMargins(4, 6, 4, 2)
+        else:
+            # No name strip: equal stretches above and below center the
+            # thumbnail vertically (top gap == bottom gap), independent of
+            # the exact margins / 无名称条：上下等量 stretch 使缩略图垂直居中
+            # （上间距 = 下间距），不依赖具体边距数值
+            layout.setContentsMargins(4, 0, 4, 0)
         layout.setSpacing(3)
 
         self._thumb_label = QLabel()
         self._thumb_label.setObjectName("thumbLabel")
         self._thumb_label.setFixedSize(self.THUMB_SIZE, self.THUMB_SIZE)
         self._thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self._thumb_label, alignment=Qt.AlignmentFlag.AlignCenter)
+        if self._show_name:
+            layout.addWidget(self._thumb_label,
+                             alignment=Qt.AlignmentFlag.AlignCenter)
+        else:
+            # equal stretch on both sides -> top gap == bottom gap /
+            # 上下等量 stretch → 上间距 = 下间距
+            layout.addStretch(1)
+            layout.addWidget(self._thumb_label,
+                             alignment=Qt.AlignmentFlag.AlignHCenter)
+            layout.addStretch(1)
 
-        name = self._emoji.get("original_name", "")[:10]
-        self._name_label = QLabel(name[:10])
-        self._name_label.setObjectName("nameLabel")
-        self._name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._name_label.setFixedHeight(16)
-        layout.addWidget(self._name_label)
+        if self._show_name:
+            name = self._emoji.get("original_name", "")[:10]
+            self._name_label = QLabel(name[:10])
+            self._name_label.setObjectName("nameLabel")
+            self._name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._name_label.setFixedHeight(16)
+            layout.addWidget(self._name_label)
 
         self._setup_image()
 
     def _setup_image(self):
         filepath = self._dm.emoji_filepath(self._emoji)
+        if filepath != self._thumb_path:
+            # The card switched to a different file: stop native playback
+            # state (a stale decode result must not start playing)
+            # 卡片换到了不同文件：停止原生播放状态（过期解码结果不得开始播放）
+            if self._play_timer is not None:
+                self._play_timer.stop()
+            self._playing = False
+            self._decode_req = False
+            self._frames = None
+            self._delays = None
         if not filepath or not os.path.isfile(filepath):
             self._thumb_label.setText(tr("no_image"))
             return
@@ -184,11 +240,25 @@ class EmojiItem(QFrame):
         # 2) 未命中：占位（label 默认空白）+ 后台异步解码（由 EmojiGridWidget 统一接收）
         _loader.request(filepath, self.THUMB_SIZE - 8)
 
-    # Set thumbnail once the async decode is ready (dispatched centrally by EmojiGridWidget)
-    # 异步缩略图就绪后设置（由 EmojiGridWidget 统一分发）
+    # Set thumbnail once the async decode is ready (dispatched centrally by EmojiGridWidget).
+    # The C++ widget may already be deleted when the decode finishes (the
+    # card was recycled/deleted meanwhile), so guard with shiboken isAlive.
+    # 异步缩略图就绪后设置（由 EmojiGridWidget 统一分发）。解码完成时卡片
+    # 可能已被回收/删除（C++ 对象已销毁），用 shiboken 校验存活。
     def apply_thumb(self, pix):
-        if self._thumb_label is not None and not self._is_text:
+        if self._is_text or self._thumb_label is None:
+            return
+        try:
+            from shiboken6 import isValid
+            if not isValid(self) or not isValid(self._thumb_label):
+                return
+        except ImportError:
+            pass
+        try:
             self._thumb_label.setPixmap(pix)
+            self._update_hover_layer(pix)
+        except RuntimeError:
+            pass  # widget destroyed between the check and the call / 检查与调用间已销毁
 
     def refresh_display(self):
         # Refresh name/text label after rename or text edit
@@ -197,7 +267,7 @@ class EmojiItem(QFrame):
         if self._is_text:
             display, _t = self._display_text()
             self._text_label.setText(display)
-        else:
+        elif self._show_name:
             name = self._emoji.get("original_name", "")[:10]
             self._name_label.setText(name)
 
@@ -331,7 +401,6 @@ class EmojiItem(QFrame):
         content_w = max(label_w - 16, 12)
         if font is None:
             font = QFont("Microsoft YaHei", 12)
-        from PySide6.QtGui import QFontMetrics
         fm = QFontMetrics(font)
         line_spacing = fm.lineSpacing()
         line_count = 0
@@ -388,7 +457,7 @@ class EmojiItem(QFrame):
         # Preview box: same-size white dashed border, no content / 预览框：与卡片同尺寸的白色虚线边框，不显示内容
         w, h = self.width(), self.height()
         if w <= 0 or h <= 0:
-            w, h = self.CARD_SIZE, self.CARD_SIZE + 22
+            w, h = self.CARD_SIZE, self.card_height(self._show_name)
         pix = QPixmap(w, h)
         pix.fill(Qt.GlobalColor.transparent)
         painter = QPainter(pix)
@@ -413,12 +482,120 @@ class EmojiItem(QFrame):
                 "QFrame#emojiCard { background-color: #353535; border: 1px solid "
                 "#4A4A4A; border-radius: 6px; }"
             )
+        else:
+            self._show_hover_zoom()
         super().enterEvent(event)
 
     def leaveEvent(self, event):
+        self._hide_hover_zoom()
         if self._is_text:
             self.setStyleSheet("")
         super().leaveEvent(event)
+
+    # ------------------------------------------------------------------
+    # Hover zoom: an enlarged overlay shown over the card while hovering /
+    # 悬停放大：悬停时在卡片上方显示放大浮层
+    # ------------------------------------------------------------------
+
+    def _ensure_hover_layer(self):
+        if self._hover_layer is None:
+            self._hover_layer = QLabel(self)
+            self._hover_layer.setObjectName("hoverZoom")
+            self._hover_layer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            # Mouse-transparent so the card keeps receiving hover events /
+            # 鼠标穿透，卡片继续接收悬停事件
+            self._hover_layer.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            self._hover_layer.hide()
+
+    def _show_hover_zoom(self):
+        if not self._hover_enabled or self._hover_zoom <= 1.0:
+            return
+        self._ensure_hover_layer()
+        pix = self._thumb_label.pixmap()
+        if pix is None or pix.isNull():
+            return
+        z = self._hover_zoom
+        # Scale by the IMAGE's aspect ratio, not the card shape (a 4:3
+        # sticker grows as a 4:3 rectangle, not as the square card)
+        # 按图片自身的宽高比放大（4:3 的表情包放大为 4:3 矩形，而非方形卡片）
+        w = max(10, int(round(pix.width() * z)))
+        h = max(10, int(round(pix.height() * z)))
+        # center the enlarged overlay on the card / 放大浮层以卡片为中心
+        x = (self.width() - w) // 2
+        y = (self.height() - h) // 2
+        self._hover_layer.setGeometry(x, y, w, h)
+        self._hover_layer.raise_()
+        self._hover_layer.show()
+        self._update_hover_layer(pix)
+        # Hide sibling cards overlapped by the enlarged overlay so it is not
+        # partly covered / 隐藏被放大浮层覆盖的相邻卡片，避免浮层被部分遮挡
+        self._hide_neighbor_cards()
+
+    def _hide_hover_zoom(self):
+        if self._hover_layer is not None:
+            self._hover_layer.hide()
+        self._restore_neighbor_cards()
+
+    def _find_grid(self):
+        p = self.parent()
+        while p is not None:
+            if p.__class__.__name__ == "EmojiGridWidget":
+                return p
+            p = p.parent()
+        return None
+
+    def _hide_neighbor_cards(self):
+        grid = self._find_grid()
+        if grid is None:
+            return
+        orig = self._hover_layer.geometry()
+        top_left = self.mapTo(self.parentWidget(), orig.topLeft())
+        overlay = QRect(top_left, orig.size())
+        hidden = []
+        for other in grid._items:
+            if other is self:
+                continue
+            if other.geometry().intersects(overlay):
+                other.hide()
+                hidden.append(other)
+        self._hidden_neighbors = hidden
+
+    def _restore_neighbor_cards(self):
+        for c in self._hidden_neighbors:
+            if c is None:
+                continue
+            # The neighbor may have been deleted by a rebuild while hidden
+            # (search/group switch); guard like apply_thumb does
+            # 邻居卡可能在隐藏期间被重建删除（搜索/切分组）；与 apply_thumb
+            # 一样用 shiboken 校验存活
+            try:
+                from shiboken6 import isValid
+                if not isValid(c):
+                    continue
+            except ImportError:
+                pass
+            try:
+                c.show()
+            except RuntimeError:
+                pass
+        self._hidden_neighbors = []
+
+    def _update_hover_layer(self, pix):
+        # Keep the enlarged overlay in sync with the current frame (GIFs
+        # animate while hovered) / 放大浮层跟随当前帧（GIF 悬停时持续动画）
+        if self._hover_layer is None or not self._hover_layer.isVisible():
+            return
+        if pix is None or pix.isNull():
+            return
+        w = self._hover_layer.width()
+        h = self._hover_layer.height()
+        scaled = pix.scaled(
+            w, h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self._hover_layer.setPixmap(scaled)
 
     # Whether this card is a GIF animation (content-sniffed, result cached)
     # 当前卡片是否为 GIF 动图（内容识别，缓存结果）
@@ -430,27 +607,118 @@ class EmojiItem(QFrame):
             self._is_gif_file = bool(fp and os.path.isfile(fp) and EmojiItem.is_gif_content(fp))
         return self._is_gif_file
 
-    # Play GIF animation (called by the grid visibility driver; idempotent)
-    # 播放 GIF 动画（由网格可见性驱动调用，幂等）
+    # Play GIF animation (called by the grid visibility driver; idempotent).
+    # Prefers the native gifdec.dll decoder (frames decode off the GUI
+    # thread); falls back to QMovie when the DLL is unavailable.
+    # 播放 GIF 动画（由网格可见性驱动调用，幂等）。优先使用原生 gifdec.dll
+    # 解码器（帧在 GUI 线程外解码）；DLL 不可用时回退 QMovie。
     def play_animation(self):
-        if self._is_text or self._movie or not self.is_gif():
+        if self._is_text or self._playing:
+            return
+        if not self.is_gif():
             return
         fp = self._dm.emoji_filepath(self._emoji)
-        if fp:
-            self._start_gif(fp)
+        if not fp:
+            return
+        if not gif_player.available():
+            self._start_gif(fp)  # QMovie fallback / QMovie 回退
+            return
+        hit = gif_player.cache_get(fp)
+        if hit is not None:
+            self._frames, self._delays = hit
+            self._playing = True
+            self._frame_idx = 0
+            self._start_play_timer()
+            return
+        # Frames not decoded yet: mark playing and start playback when the
+        # background decode finishes / 帧尚未解码：标记播放中，后台解码完成后开始播放
+        self._playing = True
+        if not self._decode_connected:
+            gif_player.connect_decoded(self._on_frames_ready)
+            self._decode_connected = True
+        if not self._decode_req:
+            self._decode_req = True
+            gif_player.request_decode(fp, self.THUMB_SIZE - 4)
+
+    # Native frames are ready (path only; frames live in the cache)
+    # 原生帧已就绪（仅传路径；帧在缓存中）
+    def _on_frames_ready(self, path):
+        if self._thumb_path != path:
+            self._decode_req = False  # stale result / 过期结果
+            return
+        self._decode_req = False
+        if not self._playing:
+            return
+        hit = gif_player.cache_get(path)
+        if hit is None:
+            # Decode failed (corrupt file): release the playing slot so the
+            # card can retry later and does not keep consuming the GIF limit
+            # (previously _playing stayed True forever, blocking retries)
+            # 解码失败（文件损坏）：释放播放名额，允许日后重试且不再占用
+            # GIF 并发上限（此前 _playing 永远为 True，阻塞重试）
+            self._playing = False
+            return
+        self._frames, self._delays = hit
+        self._frame_idx = 0
+        self._start_play_timer()
+
+    def _start_play_timer(self):
+        if self._play_timer is None:
+            self._play_timer = QTimer(self)
+            self._play_timer.setSingleShot(True)
+            self._play_timer.timeout.connect(self._play_next)
+        self._frame_idx = 0
+        self._show_frame(0)
+        self._play_timer.start(self._delays[0] if self._delays else 30)
+
+    def _play_next(self):
+        if not self._frames:
+            return
+        self._frame_idx = (self._frame_idx + 1) % len(self._frames)
+        self._show_frame(self._frame_idx)
+        delay = 30
+        if self._delays and self._frame_idx < len(self._delays):
+            delay = self._delays[self._frame_idx]
+        self._play_timer.start(delay)
+
+    def _show_frame(self, idx):
+        if self._thumb_label is not None and 0 <= idx < len(self._frames):
+            pix = QPixmap.fromImage(self._frames[idx])
+            self._thumb_label.setPixmap(pix)
+            self._update_hover_layer(pix)
 
     # Stop GIF animation and restore the static thumbnail (idempotent)
     # 停止 GIF 动画并恢复静态缩略图（幂等）
     def stop_animation(self):
-        self._stop_gif()
+        self._playing = False
+        if self._play_timer is not None:
+            self._play_timer.stop()
+        self._frames = None
+        self._delays = None
+        self._frame_idx = 0
+        self._stop_gif()  # stops the QMovie fallback and restores the thumb
+        # _stop_gif 停止 QMovie 回退并恢复静态缩略图
 
     def _start_gif(self, filepath):
         if self._movie:
             return
         self._movie = QMovie(filepath)
-        self._movie.setScaledSize(QSize(self.THUMB_SIZE - 4, self.THUMB_SIZE - 4))
+        # Scale preserving the aspect ratio: QMovie.setScaledSize stretches to
+        # the exact size, which distorts non-square GIFs. Compute an
+        # aspect-correct target size from the original frame size first.
+        # 等比缩放：QMovie.setScaledSize 会强制拉伸到指定尺寸，非方形 GIF
+        # 会被压扁变形。先按原始帧尺寸算出等比的目标尺寸再设置。
+        self._movie.setScaledSize(self._gif_scaled_size(filepath))
         self._movie.frameChanged.connect(self._on_frame)
         self._movie.start()
+
+    def _gif_scaled_size(self, filepath):
+        target = self.THUMB_SIZE - 4
+        reader = QImageReader(filepath)
+        size = reader.size()
+        if size.isValid() and size.width() > 0 and size.height() > 0:
+            return size.scaled(target, target, Qt.AspectRatioMode.KeepAspectRatio)
+        return QSize(target, target)
 
     def _stop_gif(self):
         if self._movie:
@@ -469,4 +737,6 @@ class EmojiItem(QFrame):
 
     def _on_frame(self, _frame):
         if self._movie and not self._is_text:
-            self._thumb_label.setPixmap(self._movie.currentPixmap())
+            pix = self._movie.currentPixmap()
+            self._thumb_label.setPixmap(pix)
+            self._update_hover_layer(pix)

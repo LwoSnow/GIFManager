@@ -1,5 +1,6 @@
 """Frameless dialog base: drag + rounded corners
 无边框对话框基类：拖动 + 圆角"""
+import ctypes
 import sys
 from PySide6.QtCore import Qt, QPoint
 from PySide6.QtGui import QMouseEvent
@@ -24,7 +25,6 @@ class FramelessDialog(QDialog):
         if sys.platform != "win32":
             return
         try:
-            import ctypes
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
                 int(self.winId()), 33,
                 ctypes.byref(ctypes.c_int(2)),

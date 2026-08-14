@@ -91,6 +91,14 @@ class UpdateManager(QObject):
         self._start_timeout(self._reply, self._on_check_timeout)
 
     def _on_check_finished(self, reply):
+        # Guard against double delivery: aborting a timed-out reply fires
+        # `finished` again, so an already-handled reply must be ignored
+        # (otherwise the timeout path emits two check_finished signals).
+        # 防止双重回调：abort 超时的 reply 会再次触发 finished，已处理的
+        # reply 必须忽略（否则超时路径会发两次 check_finished 信号）。
+        if self._reply is not reply:
+            reply.deleteLater()
+            return
         self._stop_timeout(reply)
         self._reply = None
         if reply.error() != QNetworkReply.NetworkError.NoError:
@@ -232,9 +240,15 @@ class UpdateManager(QObject):
 
     def _on_check_timeout(self, reply):
         self._stop_timeout(reply)
+        # Clear _reply BEFORE aborting: abort() fires `finished` synchronously,
+        # and the guard in _on_check_finished uses _reply to detect the
+        # duplicate (otherwise two check_finished signals are emitted).
+        # 先清 _reply 再 abort：abort() 会同步触发 finished，_on_check_finished
+        # 的守卫用 _reply 判断重复（否则会发两次 check_finished 信号）。
+        if self._reply is reply:
+            self._reply = None
         if reply is not None and reply.isRunning():
             reply.abort()
-        self._reply = None
         self.check_finished.emit(
             False, None, "", 0, "update_err_timeout", "")
 

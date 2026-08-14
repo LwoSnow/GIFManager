@@ -15,7 +15,9 @@
 a = Analysis(
     ["main.py"],
     pathex=[],
-    binaries=[],
+    binaries=[
+        ("app/utils/gifdec.dll", "app/utils"),   # 原生 GIF 解码器 native GIF decoder
+    ],
     datas=[
         ("language", "language"),   # 翻译文件 language/*.json -> _internal/language/
         ("icon.ico", "."),          # 应用图标 -> _internal/icon.ico

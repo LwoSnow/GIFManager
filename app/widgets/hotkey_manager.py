@@ -103,16 +103,37 @@ class HotkeyManager(QAbstractNativeEventFilter):
     # Register a global hotkey. mods: Qt modifiers, vk: Qt Key, callback: zero-arg callback
     # 注册全局热键。mods: Qt 修饰键，vk: Qt 键，callback: 无参回调
     def register(self, mods, vk, callback):
-        self.unregister()
+        # Same hotkey: just refresh the callback / 相同热键：仅更新回调
+        if self._registered and self._mods == mods and self._vk == vk:
+            self._callback = callback
+            return True
         wm = _qt_mods_to_win(mods)
         win_vk = VK_MAP.get(vk, vk)
-        ok = user32.RegisterHotKey(0, self.HOTKEY_ID, wm, win_vk)
-        if ok:
-            self._registered = True
-            self._mods = mods
-            self._vk = vk
-            self._callback = callback
-        return bool(ok)
+        # Probe the new combination with a temporary id first: if it is taken
+        # by another app, fail WITHOUT unregistering the currently registered
+        # hotkey (the old code unregistered first, silently losing the old
+        # hotkey on a busy new one). / 先用临时 id 探测新组合：若被其他程序
+        # 占用则失败且不注销当前已注册热键（旧代码先注销，新键被占用时会
+        # 静默丢失旧热键）。
+        probe_id = self.HOTKEY_ID + 100
+        ok = user32.RegisterHotKey(0, probe_id, wm, win_vk)
+        if not ok:
+            return False
+        user32.UnregisterHotKey(0, probe_id)
+        # Probe succeeded: replace the old registration / 探测成功：替换旧注册
+        self.unregister()
+        ok2 = user32.RegisterHotKey(0, self.HOTKEY_ID, wm, win_vk)
+        if not ok2:
+            # Extremely unlikely: leave a clean unregistered state / 极罕见：
+            # 保持干净的未注册状态
+            self._registered = False
+            self._callback = None
+            return False
+        self._registered = True
+        self._mods = mods
+        self._vk = vk
+        self._callback = callback
+        return True
 
     def unregister(self):
         if self._registered:

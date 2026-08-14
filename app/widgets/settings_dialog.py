@@ -1,11 +1,13 @@
 """Settings dialog — left category navigation + right option pages
 设置对话框 — 左侧分类导航 + 右侧选项分页"""
 import os
+import sys
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QRadioButton,
     QPushButton, QGroupBox, QButtonGroup, QDialogButtonBox,
     QCheckBox, QComboBox, QLineEdit, QSpinBox, QListWidget,
     QStackedWidget, QWidget, QFrame, QScrollArea, QProgressBar,
+    QAbstractSpinBox,
 )
 from PySide6.QtCore import Qt, QPoint, Signal, QStandardPaths
 from PySide6.QtGui import QPixmap, QPainter, QColor, QFont
@@ -46,6 +48,13 @@ class HotkeyCapture(QLineEdit):
         self._capturing = False
         self._mods = 0
         self._vk = 0
+        # Previous hotkey/text, restored when capture ends without a key
+        # (clicking the box then saving must NOT wipe a registered hotkey)
+        # 捕获前的热键与文本：未按键就结束时恢复（点击输入框后保存不得
+        # 清空已注册的热键）
+        self._prev_mods = 0
+        self._prev_vk = 0
+        self._prev_text = ""
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -57,6 +66,11 @@ class HotkeyCapture(QLineEdit):
 
     def _start_capture(self):
         self._capturing = True
+        # Remember the current hotkey so "click then save" cannot wipe it /
+        # 记住当前热键，避免"点击后直接保存"误清空
+        self._prev_mods = self._mods
+        self._prev_vk = self._vk
+        self._prev_text = self.text()
         self._mods = 0
         self._vk = 0
         self.setText(tr("hotkey_capturing"))
@@ -69,7 +83,11 @@ class HotkeyCapture(QLineEdit):
         self.releaseKeyboard()
         self.setStyleSheet("")
         if self._mods == 0 and self._vk == 0:
-            self.setText(tr("hotkey_unset"))
+            # No key was pressed: restore the previous hotkey instead of
+            # clearing it / 未按下任何键：恢复原热键而不是清空
+            self._mods = self._prev_mods
+            self._vk = self._prev_vk
+            self.setText(self._prev_text or tr("hotkey_unset"))
 
     def keyPressEvent(self, event: QKeyEvent):
         if not self._capturing:
@@ -77,6 +95,11 @@ class HotkeyCapture(QLineEdit):
             return
         key = event.key()
         if key == Qt.Key.Key_Escape:
+            # ESC means "clear": also drop the remembered previous hotkey so
+            # _stop_capture does not restore it / ESC 表示"清空"：同时清掉
+            # 记忆的旧热键，_stop_capture 才不会恢复它
+            self._prev_mods = 0
+            self._prev_vk = 0
             self._mods = 0
             self._vk = 0
             self.setText(tr("hotkey_unset"))
@@ -117,11 +140,15 @@ class SettingsDialog(QDialog):
                  always_on_top=False, text_limit_single=100, text_limit_multi=200,
                  thread_count=0, theme="dark",
                  global_sort_enabled=False, global_sort_by="time", global_sort_desc=False,
-                 auto_convert_gif=True, auto_update=False,
+                 auto_convert_gif=True, auto_update=False, show_emoji_name=True,
+                 hover_zoom=1.15, hover_preview_enabled=True,
                  data_manager=None, hotkey_desc="", parent=None):
         super().__init__(parent)
         self.setWindowTitle(tr("settings"))
-        self.setFixedSize(440, 480)
+        # 470x510: slightly larger than before so English texts (longer than
+        # Chinese) do not squeeze the option pages / 470x510：比原来略大，
+        # 英文文案比中文长，避免挤压右侧选项页
+        self.setFixedSize(470, 510)
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog
         )
@@ -143,6 +170,12 @@ class SettingsDialog(QDialog):
         self._auto_convert_gif = auto_convert_gif
         # Auto-update check on startup / 启动时自动检查更新
         self._auto_update = auto_update
+        # Show the emoji name under the thumbnail / 缩略图下方显示表情包名称
+        self._show_emoji_name = show_emoji_name
+        # Hover zoom factor for image cards / 图片卡悬停放大倍数
+        self._hover_zoom = max(1.0, float(hover_zoom))
+        # Master switch for the hover preview / 悬停预览总开关
+        self._hover_preview_enabled = hover_preview_enabled
         self._dm = data_manager
         self._hotkey_mods = 0
         self._hotkey_vk = 0
@@ -164,7 +197,6 @@ class SettingsDialog(QDialog):
             )
 
     def _apply_rounded(self):
-        import sys
         if sys.platform != "win32":
             return
         try:
@@ -207,11 +239,11 @@ class SettingsDialog(QDialog):
         layout.setContentsMargins(16, 12, 16, 12)
 
         title_bar = QHBoxLayout()
-        title_label = QLabel(tr("settings"))
+        self._title_label = QLabel(tr("settings"))
         # Color is inherited from the active theme
         # 颜色继承主题
-        title_label.setStyleSheet("font-size: 15px; font-weight: bold;")
-        title_bar.addWidget(title_label)
+        self._title_label.setStyleSheet("font-size: 15px; font-weight: bold;")
+        title_bar.addWidget(self._title_label)
         title_bar.addStretch()
         btn_close = QPushButton("✕")
         btn_close.setFixedSize(26, 26)
@@ -226,6 +258,12 @@ class SettingsDialog(QDialog):
 
         self._cat_list = QListWidget()
         self._cat_list.setFixedWidth(118)
+        # Hide the horizontal scrollbar and elide long English category
+        # names (e.g. "Performance") instead of showing a scrollbar
+        # 隐藏横向滚动条，超长的英文分类名（如 Performance）用省略号截断
+        self._cat_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._cat_list.setTextElideMode(Qt.TextElideMode.ElideRight)
         for key in ("cat_general", "cat_send", "cat_hotkey", "cat_text", "cat_perf"):
             self._cat_list.addItem(tr(key))
         self._cat_list.addItem(tr("cat_update"))
@@ -335,6 +373,33 @@ class SettingsDialog(QDialog):
         theme_layout.addStretch()
         self._page_layout.addWidget(self._theme_group)
 
+        # Hover zoom factor / 悬停放大倍数
+        self._zoom_group = QGroupBox(tr("hover_zoom_group"))
+        zoom_layout = QVBoxLayout(self._zoom_group)
+        self._cb_hover_preview = QCheckBox(tr("hover_preview_enable"))
+        self._cb_hover_preview.setChecked(self._hover_preview_enabled)
+        zoom_layout.addWidget(self._cb_hover_preview)
+        zoom_row = QHBoxLayout()
+        self._label_zoom = QLabel(tr("hover_zoom"))
+        zoom_row.addWidget(self._label_zoom)
+        # Compact spinbox: no arrow buttons, wheel-scroll to adjust, the
+        # percent sign sits OUTSIDE the box / 紧凑数字框：无上下箭头按钮、
+        # 鼠标滚轮调节、百分号在框外
+        self._spin_zoom = QSpinBox()
+        self._spin_zoom.setRange(100, 200)
+        self._spin_zoom.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self._spin_zoom.setFixedWidth(64)
+        self._spin_zoom.setValue(int(round(self._hover_zoom * 100)))
+        zoom_row.addWidget(self._spin_zoom)
+        self._label_zoom_pct = QLabel("%")
+        zoom_row.addWidget(self._label_zoom_pct)
+        zoom_row.addStretch()
+        zoom_layout.addLayout(zoom_row)
+        # master switch disables the zoom box when off / 总开关关闭时禁用倍数框
+        self._cb_hover_preview.toggled.connect(self._spin_zoom.setEnabled)
+        self._spin_zoom.setEnabled(self._hover_preview_enabled)
+        self._page_layout.addWidget(self._zoom_group)
+
         self._lang_group = QGroupBox(tr("language_group"))
         lang_layout = QHBoxLayout(self._lang_group)
         self._lang_combo = QComboBox()
@@ -359,6 +424,9 @@ class SettingsDialog(QDialog):
         self._cb_top = QCheckBox(tr("always_on_top"))
         self._cb_top.setChecked(self._always_on_top)
         other_layout.addWidget(self._cb_top)
+        self._cb_show_name = QCheckBox(tr("show_emoji_name"))
+        self._cb_show_name.setChecked(self._show_emoji_name)
+        other_layout.addWidget(self._cb_show_name)
         self._page_layout.addWidget(self._other_group)
 
         # Global sorting mode / 全局排序模式
@@ -390,33 +458,28 @@ class SettingsDialog(QDialog):
         row_enable.addWidget(self._cb_gs)
         row_enable.addStretch()
         gs_layout.addLayout(row_enable)
-        combo_style = (
-            "QComboBox { background:#2B2B2B; border:1px solid #3A3A3A;"
-            " border-radius:4px; padding:2px 6px; color:#CCC; }"
-            "QComboBox::drop-down { border:none; width:16px; }"
-            "QComboBox::down-arrow { image:none; width:0; height:0; }"
-            "QComboBox QAbstractItemView { background:#2B2B2B; color:#CCC;"
-            " selection-background-color:#1677FF; }"
-        )
+        # The sort combos have no inline stylesheet so they follow the active
+        # theme (hardcoded dark QSS here used to stay dark in light mode).
+        # 排序下拉框不设内联样式，跟随当前主题（此前硬编码的暗色 QSS 在亮色模式下不换色）
         row_by = QHBoxLayout()
-        row_by.addWidget(QLabel(tr("global_sort_by")))
+        self._label_gs_by = QLabel(tr("global_sort_by"))
+        row_by.addWidget(self._label_gs_by)
         self._combo_gs_by = QComboBox()
         self._combo_gs_by.addItem(tr("sort_by_time"), "time")
         self._combo_gs_by.addItem(tr("sort_by_name"), "name")
         self._combo_gs_by.addItem(tr("sort_by_freq"), "freq")
         self._combo_gs_by.setCurrentIndex(
             max(0, ["time", "name", "freq"].index(self._gs_by)))
-        self._combo_gs_by.setStyleSheet(combo_style)
         row_by.addWidget(self._combo_gs_by)
         row_by.addStretch()
         gs_layout.addLayout(row_by)
         row_dir = QHBoxLayout()
-        row_dir.addWidget(QLabel(tr("global_sort_dir")))
+        self._label_gs_dir = QLabel(tr("global_sort_dir"))
+        row_dir.addWidget(self._label_gs_dir)
         self._combo_gs_dir = QComboBox()
         self._combo_gs_dir.addItem(tr("sort_dir_asc"), False)
         self._combo_gs_dir.addItem(tr("sort_dir_desc"), True)
         self._combo_gs_dir.setCurrentIndex(1 if self._gs_desc else 0)
-        self._combo_gs_dir.setStyleSheet(combo_style)
         row_dir.addWidget(self._combo_gs_dir)
         row_dir.addStretch()
         gs_layout.addLayout(row_dir)
@@ -553,8 +616,11 @@ class SettingsDialog(QDialog):
         layout = self._page_layout
 
         # Current version / 当前版本
+        # No hardcoded foreground color: inherit the active theme (the old
+        # #DDDDDD was nearly invisible on the light theme)
+        # 不硬编码前景色：继承当前主题（旧 #DDDDDD 在亮色主题下几乎不可见）
         self._lbl_current = QLabel(tr("update_current", version=__version__))
-        self._lbl_current.setStyleSheet("color: #DDDDDD; font-size: 13px;")
+        self._lbl_current.setStyleSheet("font-size: 13px;")
         layout.addWidget(self._lbl_current)
 
         # Auto-update switch / 自动更新开关
@@ -572,8 +638,7 @@ class SettingsDialog(QDialog):
         # 信息区（页内联显示，错误红色，不弹窗）
         self._lbl_update_info = QLabel("")
         self._lbl_update_info.setWordWrap(True)
-        self._lbl_update_info.setStyleSheet(
-            "color: #BBBBBB; font-size: 12px;")
+        self._lbl_update_info.setStyleSheet("font-size: 12px;")
         layout.addWidget(self._lbl_update_info)
 
         # Download row: button + progress bar / 下载行：按钮 + 进度条
@@ -607,8 +672,9 @@ class SettingsDialog(QDialog):
         self._update_mgr.check_updates()
 
     def _info_normal(self, text):
-        self._lbl_update_info.setStyleSheet(
-            "color: #BBBBBB; font-size: 12px;")
+        # Inherit the theme foreground color; the old #BBBBBB was hard to
+        # read on the light theme / 继承主题前景色（旧 #BBBBBB 亮色下难读）
+        self._lbl_update_info.setStyleSheet("font-size: 12px;")
         self._lbl_update_info.setText(text)
 
     def _info_error(self, text):
@@ -718,6 +784,10 @@ class SettingsDialog(QDialog):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        # Hide the horizontal scrollbar: long English words must wrap, not
+        # stretch the page sideways (the bar appears in the English UI)
+        # 隐藏横向滚动条：长英文应换行而非横向撑开页面（英文界面下会出现横条）
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         mit_container = QWidget()
         mit_layout = QVBoxLayout(mit_container)
         mit_layout.setContentsMargins(4, 4, 4, 4)
@@ -812,7 +882,13 @@ class SettingsDialog(QDialog):
     # 语言切换后刷新全部界面文本（保留当前控件值）
     def refresh_translations(self):
         self.setWindowTitle(tr("settings"))
-        keys = ("cat_general", "cat_send", "cat_hotkey", "cat_text", "cat_perf", "cat_about")
+        self._title_label.setText(tr("settings"))
+        # The list has 7 items (general/send/hotkey/text/perf/update/about);
+        # a mismatched key list used to set "Update" to the "About" text and
+        # left "About" stale / 列表共 7 项（通用/发送/快捷键/文字/性能/更新/关于）；
+        # 此前键列表与列表错位，导致"更新"被写成"关于"且"关于"不刷新
+        keys = ("cat_general", "cat_send", "cat_hotkey", "cat_text",
+                "cat_perf", "cat_update", "cat_about")
         for i, key in enumerate(keys):
             item = self._cat_list.item(i)
             if item is not None:
@@ -823,14 +899,20 @@ class SettingsDialog(QDialog):
         for i in range(self._theme_combo.count()):
             key = "theme_dark" if self._theme_combo.itemData(i) == "dark" else "theme_light"
             self._theme_combo.setItemText(i, tr(key))
+        self._zoom_group.setTitle(tr("hover_zoom_group"))
+        self._cb_hover_preview.setText(tr("hover_preview_enable"))
+        self._label_zoom.setText(tr("hover_zoom"))
         self._lang_group.setTitle(tr("language_group"))
         self._other_group.setTitle(tr("other_group"))
         self._cb_remember.setText(tr("remember_group"))
         self._cb_autostart.setText(tr("autostart"))
         self._cb_top.setText(tr("always_on_top"))
+        self._cb_show_name.setText(tr("show_emoji_name"))
         self._gs_title.setText(tr("global_sort_group"))
         self._cb_gs.setText(tr("global_sort_enable"))
         self._gs_hint.setToolTip(tr("global_sort_hint"))
+        self._label_gs_by.setText(tr("global_sort_by"))
+        self._label_gs_dir.setText(tr("global_sort_dir"))
         for i in range(self._combo_gs_by.count()):
             key = {"time": "sort_by_time", "name": "sort_by_name",
                    "freq": "sort_by_freq"}[self._combo_gs_by.itemData(i)]
@@ -930,6 +1012,15 @@ class SettingsDialog(QDialog):
     def always_on_top(self):
         return self._cb_top.isChecked()
 
+    def show_emoji_name(self):
+        return self._cb_show_name.isChecked()
+
+    def hover_zoom(self):
+        return self._spin_zoom.value() / 100.0
+
+    def hover_preview_enabled(self):
+        return self._cb_hover_preview.isChecked()
+
     def text_limit_single(self):
         return self._spin_single.value()
 
@@ -937,4 +1028,9 @@ class SettingsDialog(QDialog):
         return self._spin_multi.value()
 
     def thread_count(self):
-        return self._spin_threads.value()
+        # Keep the "0 = automatic" semantics: when the shown value equals the
+        # recommended default, persist 0 instead of freezing the recommendation
+        # as an explicit fixed core count / 保留"0 = 自动"语义：当显示值等于
+        # 推荐值时持久化 0，而不是把推荐值固化为显式核数
+        v = self._spin_threads.value()
+        return 0 if v == recommended_thread_count() else v

@@ -1,10 +1,11 @@
+import ctypes
 import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtCore import Qt, QTimer, QSettings
 from PySide6.QtGui import QFont
 from app.main_window import MainWindow
 
@@ -13,7 +14,6 @@ def _enable_win11_rounded_corners():  # Window rounded corners / 窗口圆角 (D
     if sys.platform != "win32":
         return
     try:
-        import ctypes
         DWMWA_WINDOW_CORNER_PREFERENCE = 33
         DWMWCP_ROUND = 2
         ctypes.windll.dwmapi.DwmSetWindowAttribute(
@@ -40,7 +40,6 @@ def _acquire_single_instance_mutex():
     global _INSTANCE_MUTEX
     if sys.platform != "win32":
         return False
-    import ctypes
     kernel32 = ctypes.windll.kernel32
     handle = kernel32.CreateMutexW(None, False, "Local\\GIFManager_SingleInstance")
     # ERROR_ALREADY_EXISTS (183) -> another instance already owns it / 已有实例持有
@@ -66,8 +65,6 @@ def main():
     # Single-instance check: show a notice and exit if already running /
     # 单实例检测：若已有实例在运行，弹窗提示后退出
     if _acquire_single_instance_mutex():
-        from PySide6.QtCore import QSettings
-        from PySide6.QtWidgets import QMessageBox
         from app.models.lang_manager import set_language, tr
         lang = QSettings().value("language", "")
         if lang:
@@ -80,7 +77,6 @@ def main():
     window.show()
 
     # Enable fillets after window display (requires valid HWND) / 窗口显示后启用圆角（需要有效的 HWND）
-    from PySide6.QtCore import QTimer
     QTimer.singleShot(100, _enable_win11_rounded_corners)
 
     sys.exit(app.exec())

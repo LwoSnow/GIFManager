@@ -37,7 +37,13 @@ class LangManager:
     def t(self, key, **kwargs):
         text = self._texts.get(key, key)
         if kwargs:
-            return text.format(**kwargs)
+            # A malformed translation string (unpaired brace / unknown
+            # placeholder) must not crash the calling UI slot / 翻译串异常
+            # （未配对花括号/未知占位符）不得导致调用它的 UI 槽崩溃
+            try:
+                return text.format(**kwargs)
+            except (KeyError, ValueError, IndexError):
+                return text
         return text
 
     def available_languages(self):

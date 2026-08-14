@@ -116,6 +116,12 @@ class GroupListWidget(QWidget):
         self._scroll.setWidgetResizable(True)
 
         self._btn_container = _DropContainer()
+        # Allow the scroll area to shrink below the buttons' natural total
+        # width: many groups would otherwise inflate the window's minimum
+        # width (the container's minimumSizeHint is the sum of all tabs)
+        # 允许滚动区缩小到按钮自然总宽以下：分组多时，容器的 minimumSizeHint
+        # 是全部标签宽度之和，会把窗口最小宽度撑大
+        self._btn_container.setMinimumWidth(60)
         self._btn_layout = QHBoxLayout(self._btn_container)
         self._btn_layout.setContentsMargins(0, 0, 0, 0)
         self._btn_layout.setSpacing(4)

@@ -3,7 +3,7 @@
 import math
 import time
 from PySide6.QtWidgets import (
-    QWidget, QLayout, QLayoutItem, QSizePolicy, QLabel, QVBoxLayout,
+    QWidget, QLayout, QLayoutItem, QSizePolicy, QLabel, QVBoxLayout, QMenu,
 )
 from PySide6.QtCore import Qt, QSize, QRect, Signal, QPoint, QTimer
 from PySide6.QtGui import QContextMenuEvent, QPainter, QColor, QPixmap, QPixmapCache, QPen
@@ -145,6 +145,11 @@ class FlowLayout(QLayout):
     def _do_layout(self, rect: QRect, test_only=False):
         if self._masonry:
             return self._do_masonry(rect, test_only)
+        grid = self._grid_widget()
+        if grid is not None and grid._is_all_view:
+            # All view: data-driven lazy grid (fixed-size image cards)
+            # All 视图：数据驱动的懒加载网格（固定尺寸图片卡）
+            return grid._do_all_grid(rect, test_only)
         m = self.contentsMargins()
         usable = max(rect.width() - m.left() - m.right(), 10)
         x = m.left()
@@ -271,9 +276,19 @@ class EmojiGridWidget(QWidget):
         super().__init__(parent)
         self._dm = None
         self._items = []
-        self._thumb_index = {}  # thumb_key -> card for O(1) lookup / 缩略图 key 到卡片的索引
+        self._thumb_index = {}  # thumb_key -> list of cards / 缩略图 key 到卡片列表
         self._data = []
         self._preview_limits = (100, 200)
+        self._layout_cache = None  # masonry layout cache (width, data id) / masonry 布局缓存
+        self._all_cache = None     # All-view grid cache / All 视图网格缓存
+        # Whether image cards show their name (settings "show_emoji_name") /
+        # 图片卡是否显示名称（设置"显示表情包名称"）
+        self._show_emoji_name = True
+        # Hover zoom factor for image cards (settings "hover_zoom") /
+        # 图片卡悬停放大倍数（设置"悬停放大倍数"）
+        self._hover_zoom = 1.15
+        # Master switch for the hover preview (settings) / 悬停预览总开关（设置）
+        self._hover_preview_enabled = True
         self._lazy_buffer = 300  # Lazy loading of upper and lower buffer pixels / 懒加载上下缓冲像素
         # Current group (None = All, not involved in sorting) / 当前分组（None = All，不参与排序）
         self.current_group_id = None
@@ -300,6 +315,14 @@ class EmojiGridWidget(QWidget):
         self._merge_timer.setInterval(150)
         self._merge_timer.timeout.connect(self._check_column_merge)
 
+        # Resize refresh (debounced): lazy-create cards and refresh the
+        # visible-GIF set after the window size settles
+        # resize 后刷新（防抖）：窗口尺寸稳定后懒加载创建卡片并刷新可见 GIF
+        self._resize_refresh_timer = QTimer(self)
+        self._resize_refresh_timer.setSingleShot(True)
+        self._resize_refresh_timer.setInterval(150)
+        self._resize_refresh_timer.timeout.connect(self._on_resize_refresh)
+
         # Asynchronous thumbnails / 异步缩略图
         _loader.done.connect(self._on_thumb_ready)
 
@@ -325,22 +348,25 @@ class EmojiGridWidget(QWidget):
         self._drop_overlay.raise_()
 
     def release_gif_handles(self):
-        # Stop every animation and detach its QMovie file handle so Windows
+        # Stop every animation and detach its file handles so Windows
         # allows renaming/deleting the current group folder
-        # 停止所有动画并分离 QMovie 文件句柄，使 Windows 允许重命名/删除当前分组目录
+        # 停止所有动画并分离文件句柄，使 Windows 允许重命名/删除当前分组目录
         for card in self._items:
-            card._stop_gif()
+            card.stop_animation()
 
     def _on_thumb_ready(self, key, img):
         if img.isNull():
             return
         pix = QPixmap.fromImage(img)
         QPixmapCache.insert(key, pix)
-        # O(1) lookup via index; fall back to scan when the index is stale
-        # 用索引 O(1) 查找；索引滞后时回退遍历
-        card = self._thumb_index.get(key)
-        if card is not None:
-            card.apply_thumb(pix)
+        # O(1) lookup via the index (key -> list of cards: the All view can
+        # show the same file in several folded cards); fall back to a scan
+        # when the index is stale / 用索引 O(1) 查找（key -> 卡片列表：
+        # All 视图同一文件可能折叠为多张卡）；索引滞后时回退遍历
+        cards = self._thumb_index.get(key)
+        if cards:
+            for card in cards:
+                card.apply_thumb(pix)
             return
         for card in self._items:
             if card._thumb_path and _thumb_key(card._thumb_path) == key:
@@ -349,11 +375,71 @@ class EmojiGridWidget(QWidget):
     def set_data_manager(self, dm):
         self._dm = dm
 
+    @property
+    def _is_all_view(self):
+        # True in the "All" aggregation view (lazy grid layout) / "全部"聚合视图
+        return self.current_group_id is None and bool(self._data)
+
+    def _all_grid_data(self, usable):
+        # Grid layout for the All view: every card is a fixed-size image
+        # card (no text cards in All), so positions are pure arithmetic.
+        # Returns (rects: {emoji_id: (x,y,w,h)}, total_h, per_row).
+        # All 视图网格布局：卡片全部为固定尺寸图片卡（All 视图不含文字卡），
+        # 位置为纯算术。返回 (rects: {emoji_id: (x,y,w,h)}, total_h, per_row)。
+        key = (usable, id(self._data))
+        cached = getattr(self, "_all_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        m = self._flow.contentsMargins()
+        spacing = self._flow.spacing()
+        cw = EmojiItem.CARD_SIZE
+        ch = EmojiItem.card_height(self._show_emoji_name)
+        per_row = max(1, (usable + spacing) // (cw + spacing))
+        rects = {}
+        for i, em in enumerate(self._data):
+            rects[em["id"]] = (
+                m.left() + (i % per_row) * (cw + spacing),
+                m.top() + (i // per_row) * (ch + spacing),
+                cw, ch,
+            )
+        rows = (len(self._data) + per_row - 1) // per_row if self._data else 0
+        total_h = m.top() + rows * (ch + spacing) - spacing + m.bottom()
+        total_h = max(total_h, 0)
+        result = (rects, total_h, per_row)
+        self._all_cache = (key, result)
+        return result
+
+    def _do_all_grid(self, rect, test_only=False):
+        m = self._flow.contentsMargins()
+        usable = max(rect.width() - m.left() - m.right(), 10)
+        rects, total_h, _per_row = self._all_grid_data(usable)
+        if not test_only:
+            for card in self._items:
+                r = rects.get(card._emoji.get("id"))
+                if r is not None:
+                    card.setGeometry(r[0], r[1], r[2], r[3])
+            pw = self._flow.parentWidget()
+            if pw is not None:
+                pw.setMinimumWidth(max(usable + m.left() + m.right(), 10))
+                gp = pw.parentWidget()
+                if gp is not None:
+                    gp.updateGeometry()
+        return total_h
+
     def _masonry_layout_data(self, usable):
         # Calculate the masonry layout in full based on self._data and return
         # (rects: {emoji_id: (x,y,w,h)}, total_w, total_h, col_info)
         # 基于 self._data 全量计算 masonry 布局，
         # 返回 (rects: {emoji_id: (x,y,w,h)}, total_w, total_h, col_info)
+        # Cache the result: the layout depends only on the usable width and
+        # the data set, so per-scroll recomputation is wasted work (this ran
+        # on every scrollbar tick with 600+ items, hurting scroll smoothness)
+        # 缓存结果：布局只取决于可用宽度与数据集，滚动时逐次重算是浪费
+        # （此前每次滚动都会对 600+ 项全量重算，影响滚动流畅度）
+        key = (usable, id(self._data))
+        cached = getattr(self, "_layout_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
         m = self._flow.contentsMargins()
         spacing = self._flow.spacing()
         cols = {}
@@ -386,37 +472,40 @@ class EmojiGridWidget(QWidget):
                 if em.get("text_content"):
                     h = EmojiItem.estimate_height_static(em.get("text_content", ""), w)
                 else:
-                    h = EmojiItem.CARD_SIZE + 22
+                    h = EmojiItem.card_height(self._show_emoji_name)
                 rects[em["id"]] = (col_x[ci], cy, w, h)
                 cy += h + spacing
             col_h[ci] = cy - spacing
         total_h = max(col_h.values()) + m.bottom()
-        return rects, total_w, total_h, {
+        result = (rects, total_w, total_h, {
             "col_x": col_x, "col_widths": col_widths, "col_h": col_h,
-        }
+        })
+        self._layout_cache = (key, result)
+        return result
 
     def _do_masonry_data(self, rect, test_only=False):
         m = self._flow.contentsMargins()
         spacing = self._flow.spacing()
         usable = max(rect.width() - m.left() - m.right(), 10)
-        _rects, total_w, total_h, info = self._masonry_layout_data(usable)
+        rects, total_w, total_h, info = self._masonry_layout_data(usable)
         if not test_only:
-            by_col = {}
+            # Position every created card by its DATA rect (absolute layout
+            # position). Re-packing the _items list from the top of each
+            # column is wrong under lazy loading + recycling: _items only
+            # holds the cards near the viewport, so re-packing moved them
+            # all to the top and the recycle pass deleted them as "scrolled
+            # out" (bottom cards went missing). / 按数据 rect（绝对布局位置）
+            # 定位每张已创建的卡。懒加载+回收下 _items 只含视口附近的卡，
+            # 从列顶重排会把它们全挪到顶部，回收逻辑误判"滚出"而删除
+            # （导致下方卡片大量缺失）。
             for card in self._items:
-                by_col.setdefault(int(card._emoji.get("col_index", 0)), []).append(card)
-            for ci, cards in by_col.items():
-                if ci not in info["col_x"]:
+                r = rects.get(card._emoji.get("id"))
+                if r is None:
                     continue
-                w = info["col_widths"][ci]
-                cx = info["col_x"][ci]
-                cy = m.top()
-                cards.sort(key=lambda c: int(c._emoji.get("sort_order", 0)))
-                for card in cards:
-                    if card._is_text and card.width() != w:
-                        card.reflow(w)
-                    h = card.height()
-                    card.setGeometry(cx, cy, w, h)
-                    cy += h + spacing
+                x, y, w, h = r
+                if card._is_text and card.width() != w:
+                    card.reflow(w)
+                card.setGeometry(x, y, w, h)
             pw = self._flow.parentWidget()
             if pw is not None:
                 pw.setMinimumWidth(max(total_w, 10))
@@ -428,9 +517,24 @@ class EmojiGridWidget(QWidget):
     def _usable_width(self):
         return max(self._viewport_width() - 20, 10)
 
+    def _layout_usable(self):
+        # Width used by the actual layout: the flow container's real width
+        # (at least the viewport; wider when columns overflow), matching
+        # _do_masonry_data / _do_all_grid so lazy creation and layout agree.
+        # 实际布局使用的宽度：flow 容器的真实宽度（至少与视口等宽，列超宽时
+        # 更宽），与 _do_masonry_data / _do_all_grid 一致，保证懒加载创建
+        # 与布局计算不产生偏差。
+        cw = self._flow_container.width()
+        if cw > 0:
+            return max(cw - 20, self._usable_width())
+        return self._usable_width()
+
     def _ensure_visible(self):
-        # Lazy loading / 懒加载
-        if not self._data or self.current_group_id is None:
+        # Lazy loading: create only the cards inside the visible band
+        # (plus a buffer). Group views use the masonry layout, the All
+        # view uses the fixed-size grid. / 懒加载：只为可见区域（含缓冲）
+        # 创建卡片。分组视图用 masonry 布局，All 视图用固定尺寸网格。
+        if not self._data:
             return
         sc = self._find_scroll()
         if sc is None:
@@ -438,7 +542,10 @@ class EmojiGridWidget(QWidget):
         sb = sc.verticalScrollBar()
         y0 = sb.value() - self._lazy_buffer
         y1 = sb.value() + sc.viewport().height() + self._lazy_buffer
-        rects, _tw, _th, _info = self._masonry_layout_data(self._usable_width())
+        if self.current_group_id is None:
+            rects, _tw, _th = self._all_grid_data(self._layout_usable())
+        else:
+            rects, _tw, _th, _info = self._masonry_layout_data(self._layout_usable())
         dm = self._find_data_manager()
         existing = {card._emoji.get("id") for card in self._items}
         created = False
@@ -451,16 +558,52 @@ class EmojiGridWidget(QWidget):
             if r[1] > y1 or r[1] + r[3] < y0:
                 continue
             card = EmojiItem(em, dm, self._flow_container,
-                             preview_limits=self._preview_limits)
+                             preview_limits=self._preview_limits,
+                             show_name=self._show_emoji_name,
+                             hover_zoom=self._hover_zoom,
+                             hover_enabled=self._hover_preview_enabled)
             card.clicked.connect(self._on_card_clicked)
             self._items.append(card)
             self._flow.addWidget(card)
+            self._index_add(card)
             created = True
         if created:
             self._flow.invalidate()
             self._flow.activate()
             self._flow.relayout()
             self._update_visible_gifs()
+        # Recycle cards scrolled far outside the buffer, so a long browsing
+        # session does not accumulate every widget ever created (the lazy
+        # loader previously only created cards, never removed them)
+        # 回收滚出缓冲区的卡片：长时间浏览大库不会累积所有创建过的控件
+        # （此前懒加载只创建、从不回收）
+        far = [c for c in self._items
+               if c.geometry().y() > y1 + 100
+               or c.geometry().y() + c.height() < y0 - 100]
+        for c in far:
+            self._items.remove(c)
+            self._index_remove(c)
+            c._stop_gif()
+            c.deleteLater()
+
+    def _index_add(self, card):
+        # A file may appear in multiple cards (All view folds duplicates by
+        # content_hash); the index maps key -> list of cards
+        # 同一文件可能对应多张卡（All 视图按 content_hash 折叠重复）；
+        # 索引为 key -> 卡片列表
+        if card._thumb_path:
+            self._thumb_index.setdefault(
+                _thumb_key(card._thumb_path), []).append(card)
+
+    def _index_remove(self, card):
+        if not card._thumb_path:
+            return
+        key = _thumb_key(card._thumb_path)
+        lst = self._thumb_index.get(key)
+        if lst and card in lst:
+            lst.remove(card)
+            if not lst:
+                self._thumb_index.pop(key, None)
 
     def _ensure_scroll_connected(self):
         if getattr(self, "_scroll_connected", False):
@@ -541,30 +684,41 @@ class EmojiGridWidget(QWidget):
             dm = self._find_data_manager()
 
             if self.current_group_id is None:
-                old_cards = {card._emoji.get("id"): card for card in self._items}
-                new_items = []
-                for em in emojis:
-                    card = old_cards.pop(em.get("id"), None)
-                    if card is not None and card._is_text == bool(em.get("text_content")):
-                        card._emoji = em
+                # All view: lazy grid — keep cards whose id is still
+                # present, delete the rest; the visible band is created by
+                # _ensure_visible (avoids building 500+ widgets at once,
+                # which made switching to All noticeably slow)
+                # All 视图：懒加载网格——保留仍存在的卡片，删除其余；
+                # 可视区由 _ensure_visible 创建（避免一次性构建 500+ 控件，
+                # 这是切换到 All 时卡顿的根源）
+                keep_ids = {em.get("id") for em in emojis}
+                emap = {em.get("id"): em for em in emojis}
+                survivors = []
+                for card in self._items:
+                    cid = card._emoji.get("id")
+                    # Reuse only when the card still matches the current
+                    # show-name setting; otherwise rebuild it (e.g. after
+                    # toggling "show emoji name" in settings) / 仅在卡片与
+                    # 当前"显示名称"设置一致时复用，否则重建（如设置中切换
+                    # "显示表情包名称"后需立即生效）
+                    if cid in keep_ids and card._show_name == self._show_emoji_name:
+                        card._emoji = emap[cid]
                         card.refresh_display()
+                        survivors.append(card)
                     else:
-                        card = EmojiItem(em, dm, self._flow_container,
-                                         preview_limits=preview_limits)
-                        card.clicked.connect(self._on_card_clicked)
-                    new_items.append(card)
-                    self._flow.addWidget(card)
-                for card in old_cards.values():
-                    card._stop_gif()
-                    card.deleteLater()
-                self._items = new_items
+                        card._stop_gif()
+                        card.deleteLater()
+                self._items = survivors
+                self._ensure_scroll_connected()
+                self._ensure_visible()
             else:
                 keep_ids = {em.get("id") for em in emojis}
                 emap = {em.get("id"): em for em in emojis}
                 survivors = []
                 for card in self._items:
                     cid = card._emoji.get("id")
-                    if cid in keep_ids:
+                    # Same reuse rule as the All view / 与 All 视图相同的复用规则
+                    if cid in keep_ids and card._show_name == self._show_emoji_name:
                         card._emoji = emap[cid]
                         card.refresh_display()
                         survivors.append(card)
@@ -583,15 +737,28 @@ class EmojiGridWidget(QWidget):
         self._flow_container.updateGeometry()
         self.updateGeometry()
         # Rebuild the thumb lookup index after the card set changes
-        # 卡片集合变化后重建缩略图查找索引
-        self._thumb_index = {
-            _thumb_key(card._thumb_path): card
-            for card in self._items if card._thumb_path
-        }
+        # (key -> list of cards, so folded duplicates in the All view all
+        # receive the decoded thumbnail) / 卡片集合变化后重建缩略图查找索引
+        # （key -> 卡片列表，All 视图折叠的重复卡都能收到解码的缩略图）
+        self._thumb_index = {}
+        for card in self._items:
+            self._index_add(card)
 
         if self.current_group_id is not None:
             QTimer.singleShot(0, self._check_column_merge)
         QTimer.singleShot(0, self._update_visible_gifs)
+        # Reset the vertical scroll to the top when the data set changes:
+        # switching to a smaller group used to keep the previous group's
+        # bottom scroll position. Runs after the layout settles so the new
+        # scroll range is valid. / 数据集变化时垂直滚动回到顶部：此前切换到
+        # 更小的分组会停留在上一分组底部位置。在布局稳定后执行，确保
+        # 新滚动范围已生效。
+        QTimer.singleShot(0, self._reset_scroll_top)
+
+    def _reset_scroll_top(self):
+        sc = self._find_scroll()
+        if sc is not None:
+            sc.verticalScrollBar().setValue(0)
 
     # After loading/resizing, check whether columns that cannot be fully shown should be merged
     # into the front ones (lightweight internal refresh, no rebuild)
@@ -648,7 +815,6 @@ class EmojiGridWidget(QWidget):
         # Right-click on blank space: sort/rearrange menu
         # 空白处右键：整理/排序菜单
         if self.current_group_id is not None and self._data:
-            from PySide6.QtWidgets import QMenu
             menu = QMenu(self)
             act_rearrange = menu.addAction(tr("rearrange"))
             menu.addSeparator()
@@ -690,6 +856,11 @@ class EmojiGridWidget(QWidget):
         _grid_log().info("Sort group -> group=%s by=%s desc=%s cards=%d",
                          self.current_group_id, by, desc, len(self._data))
         self._refresh_cards_after_merge()
+        # Re-check column fit: after re-sorting, columns that no longer fit
+        # the current width are merged so the bottom stays flush and no
+        # column is clipped off-screen / 重排后复查列是否放得下：放不下的列
+        # 被融合，保证底部平整、无列被裁出屏幕
+        QTimer.singleShot(0, self._check_column_merge)
 
     # One-click rearrange: compute the column count from the current window width (icon column
     # count is decided by window/screen size), then evenly re-distribute all cards in global
@@ -718,6 +889,10 @@ class EmojiGridWidget(QWidget):
         _grid_log().info("One-click rearrange -> group=%s cols=%d cards=%d",
                          self.current_group_id, k, len(self._data))
         self._refresh_cards_after_merge()
+        # Re-check column fit so the rearranged columns always fit the
+        # current width (avoids clipped columns and bottom gaps)
+        # 复查列是否放得下（避免列被裁切与底部缺口）
+        QTimer.singleShot(0, self._check_column_merge)
 
     # ------------------------------------------------------------------
     # Drag & drop: text groups move across columns / image groups sort within the group
@@ -1023,6 +1198,17 @@ class EmojiGridWidget(QWidget):
         # 缩小窗口时融合溢出列（150ms 防抖：拖拽窗口边缘的 resize 风暴只触发一次）
         if self.current_group_id is not None and self._data:
             self._merge_timer.start()
+        # Resizing changes which cards/GIFs are visible: refresh lazy card
+        # creation and the visible-GIF set after the resize settles. Without
+        # this, enlarging the window left newly visible GIFs static (they
+        # only started playing on the next scroll).
+        # 尺寸变化会改变可见卡片/GIF：resize 稳定后刷新懒加载创建与可见 GIF
+        # 播放集。此前放大窗口后新进入视野的 GIF 不播放（要等下次滚动）。
+        self._resize_refresh_timer.start()
+
+    def _on_resize_refresh(self):
+        self._ensure_visible()
+        self._update_visible_gifs()
 
     def _find_scroll(self):
         from PySide6.QtWidgets import QScrollArea

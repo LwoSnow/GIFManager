@@ -7,9 +7,11 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 import uuid
 from PySide6.QtCore import QStandardPaths, QMimeData, QUrl
 from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtWidgets import QApplication
 
 from app.utils import gif_converter
 
@@ -19,6 +21,28 @@ _GROUP_NAME_RE = re.compile(r'^[\w\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\- ]+$'
 
 def _is_valid_group_name(name):
     return bool(_GROUP_NAME_RE.match(name)) and len(name.strip()) <= 32
+
+
+def _remove_dir_retry(path, tries=5, delay=0.2):
+    # Remove a directory with retries: Windows may briefly hold one of its
+    # files open (async thumbnail decode / GIF playback teardown). Never
+    # raises, so callers (e.g. delete_group) are never blocked by a
+    # transient lock. / 带重试地删除目录：Windows 可能短暂占用其中文件
+    # （异步缩略图解码 / GIF 播放收尾）。不抛异常，调用方（如 delete_group）
+    # 不会被瞬态锁阻塞。
+    for i in range(tries):
+        try:
+            shutil.rmtree(path)
+            return True
+        except OSError:
+            if i == tries - 1:
+                try:
+                    shutil.rmtree(path, ignore_errors=True)
+                except OSError:
+                    pass
+                return False
+            time.sleep(delay)
+    return False
 
 
 def _app_data_dir():
@@ -77,6 +101,7 @@ class DataManager:
                 type TEXT NOT NULL DEFAULT 'image',
                 sort_order INTEGER NOT NULL DEFAULT 0,
                 is_builtin INTEGER NOT NULL DEFAULT 0,
+                builtin_role TEXT DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
             )
         """)
@@ -118,51 +143,64 @@ class DataManager:
             self._conn.execute(
                 "ALTER TABLE emojis ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0"
             )
+        # Builtin groups are identified by an explicit role column ('all' /
+        # 'default'), NOT by their sort_order position: the user may drag the
+        # builtin default group to another position, and the old
+        # sort_order-based lookup then returned None and re-created a
+        # duplicate builtin on restart (which merged away the user's rename).
+        # 内置分组用显式角色列（'all'/'default'）识别，不依赖 sort_order
+        # 位置：用户可拖拽内置默认分组到其他位置，旧版按 sort_order 查找
+        # 会返回 None 并在重启时重建重复内置组（进而吞掉用户重命名）。
+        gcols = [r[1] for r in self._conn.execute("PRAGMA table_info(groups)")]
+        if "builtin_role" not in gcols:
+            self._conn.execute("ALTER TABLE groups ADD COLUMN builtin_role TEXT DEFAULT ''")
+            self._conn.execute(
+                "UPDATE groups SET builtin_role='all' WHERE is_builtin=1 AND sort_order=0")
+            self._conn.execute(
+                "UPDATE groups SET builtin_role='default' WHERE is_builtin=1 AND sort_order=1")
         self._conn.commit()
-        self._ensure_builtin("All", "image", 0)
-        self._ensure_builtin("Default Expression", "image", 1)
+        self._ensure_builtin("All", "image", "all")
+        self._ensure_builtin("Default Expression", "image", "default")
         self._cleanup_duplicate_builtins()
 
     def _cleanup_duplicate_builtins(self):
-        # An older buggy version matched builtin groups by name, so renaming the default group
-        # created a duplicate builtin default group. Merge every duplicate into the canonical
-        # one (sort_order=1) and re-normalize its columns.
-        # 旧版按名字匹配内置分组，重命名默认分组会产生重复的内置默认分组。
-        # 将重复分组合并到正统分组（sort_order=1）并重排其列。
-        all_id = self._all_group_id()
-        rows = self._conn.execute(
-            "SELECT * FROM groups WHERE is_builtin=1"
-        ).fetchall()
-        defaults = [dict(r) for r in rows if r["id"] != all_id]
-        if len(defaults) <= 1:
-            return
-        keep = min(defaults, key=lambda g: (g["sort_order"], g["id"]))
-        keep_dir = os.path.join(self._emojis_dir, keep["name"])
-        for dup in defaults:
-            if dup["id"] == keep["id"]:
+        # An older buggy version matched builtin groups by name, so renaming
+        # the default group created duplicate builtin groups. Merge every
+        # duplicate per role into the canonical one and re-normalize its
+        # columns. / 旧版按名字匹配内置分组，重命名默认分组会产生重复的内置
+        # 分组。按角色把重复分组合并到正统分组并重排其列。
+        for role in ("all", "default"):
+            rows = [dict(r) for r in self._conn.execute(
+                "SELECT * FROM groups WHERE builtin_role=?", (role,)).fetchall()]
+            if len(rows) <= 1:
                 continue
-            dup_dir = os.path.join(self._emojis_dir, dup["name"])
-            for e in self._conn.execute(
-                "SELECT * FROM emojis WHERE group_id=?", (dup["id"],)
-            ).fetchall():
-                em = dict(e)
-                # Move the file only when the directories differ / 目录不同才移动文件
-                if em["filename"] and dup_dir != keep_dir:
-                    src = os.path.join(dup_dir, em["filename"])
-                    dst = os.path.join(keep_dir, em["filename"])
-                    if os.path.isfile(src):
-                        os.makedirs(keep_dir, exist_ok=True)
-                        try:
-                            shutil.move(src, dst)
-                        except OSError:
-                            pass
-                self._conn.execute(
-                    "UPDATE emojis SET group_id=? WHERE id=?",
-                    (keep["id"], em["id"]),
-                )
-            self._conn.execute("DELETE FROM groups WHERE id=?", (dup["id"],))
-        self._conn.commit()
-        self._renormalize_columns(keep["id"])
+            keep = min(rows, key=lambda g: (g["sort_order"], g["id"]))
+            keep_dir = os.path.join(self._emojis_dir, keep["name"])
+            for dup in rows:
+                if dup["id"] == keep["id"]:
+                    continue
+                dup_dir = os.path.join(self._emojis_dir, dup["name"])
+                for e in self._conn.execute(
+                    "SELECT * FROM emojis WHERE group_id=?", (dup["id"],)
+                ).fetchall():
+                    em = dict(e)
+                    # Move the file only when the directories differ / 目录不同才移动文件
+                    if em["filename"] and dup_dir != keep_dir:
+                        src = os.path.join(dup_dir, em["filename"])
+                        dst = os.path.join(keep_dir, em["filename"])
+                        if os.path.isfile(src):
+                            os.makedirs(keep_dir, exist_ok=True)
+                            try:
+                                shutil.move(src, dst)
+                            except OSError:
+                                pass
+                    self._conn.execute(
+                        "UPDATE emojis SET group_id=? WHERE id=?",
+                        (keep["id"], em["id"]),
+                    )
+                self._conn.execute("DELETE FROM groups WHERE id=?", (dup["id"],))
+            self._conn.commit()
+            self._renormalize_columns(keep["id"])
 
     def _renormalize_columns(self, group_id):
         # Re-distribute all cards of a group row-first keeping their relative global order
@@ -174,18 +212,21 @@ class DataManager:
         col_count = len({int(e.get("col_index", 0)) for e in emojis}) or 1
         self._redistribute([e["id"] for e in emojis], group_id, col_count)
 
-    def _ensure_builtin(self, name, grp_type, sort_order):
+    def _ensure_builtin(self, name, grp_type, role):
         # Create builtin groups only when missing; never force-rename them
-        # (users may rename builtin groups freely, keep their choice)
-        # 仅在缺失时创建内置分组；不强制改名（允许用户自由重命名内置分组）
+        # (users may rename builtin groups freely, keep their choice).
+        # Identification is by role, so dragging the default group to another
+        # position cannot break the lookup. / 仅在缺失时创建内置分组；不强制
+        # 改名（允许用户自由重命名内置分组）。按角色识别，拖拽默认分组到
+        # 其他位置不会破坏查找。
         cur = self._conn.execute(
-            "SELECT id FROM groups WHERE is_builtin=1 AND sort_order=?",
-            (sort_order,),
+            "SELECT id FROM groups WHERE builtin_role=?", (role,),
         )
         if cur.fetchone() is None:
             self._conn.execute(
-                "INSERT INTO groups (name, type, sort_order, is_builtin) VALUES (?,?,?,1)",
-                (name, grp_type, sort_order)
+                "INSERT INTO groups (name, type, is_builtin, builtin_role)"
+                " VALUES (?,?,1,?)",
+                (name, grp_type, role)
             )
             self._conn.commit()
 
@@ -197,15 +238,16 @@ class DataManager:
 
     def _all_group_id(self):
         r = self._conn.execute(
-            "SELECT id FROM groups WHERE is_builtin=1 AND sort_order=0 LIMIT 1"
+            "SELECT id FROM groups WHERE builtin_role='all' LIMIT 1"
         ).fetchone()
         return r[0] if r else None
 
     def default_group_id(self):
-        # Builtin default group (sort_order=1); name-independent so renaming works
-        # 内置默认分组（sort_order=1），按标记识别不依赖名字（重命名后仍有效）
+        # Builtin default group identified by role, so renaming OR dragging it
+        # to another position keeps the lookup working / 内置默认分组按角色
+        # 识别，重命名或拖拽到其他位置后查找依然有效
         r = self._conn.execute(
-            "SELECT id FROM groups WHERE is_builtin=1 AND sort_order=1 LIMIT 1"
+            "SELECT id FROM groups WHERE builtin_role='default' LIMIT 1"
         ).fetchone()
         return r[0] if r else None
 
@@ -311,11 +353,15 @@ class DataManager:
         old = self.get_group(group_id)
         if not old or old["is_builtin"]:
             return False
-        # Delete the emoji pack file / 删除表情包文件
+        # Delete the emoji pack file (with retries: Windows may briefly
+        # hold a GIF open during async thumbnail decode / playback teardown,
+        # which used to raise PermissionError and leave the group half-deleted)
+        # 删除表情包文件（带重试：Windows 可能在异步缩略图解码 / 播放收尾时
+        # 短暂占用 GIF，此前会抛 PermissionError 导致分组删除到一半）
         if old["type"] == "image":
             gdir = os.path.join(self._emojis_dir, old["name"])
             if os.path.isdir(gdir):
-                shutil.rmtree(gdir)
+                _remove_dir_retry(gdir)
         self._conn.execute("DELETE FROM emojis WHERE group_id=?", (group_id,))
         self._conn.execute("DELETE FROM groups WHERE id=?", (group_id,))
         self._conn.commit()
@@ -579,7 +625,7 @@ class DataManager:
     # 把所有分组内非 gif 图片转为 gif：成功后删除原文件并更新记录
     # （content_hash 变为 gif 哈希，src_hash 保留原始哈希）。同组已有相同
     # 内容的 gif 时删除冗余记录。返回 (converted, failed, deduped)。
-    def convert_library_to_gif(self, progress_cb=None):
+    def convert_library_to_gif(self, progress_cb=None, workers=None):
         rows = self._conn.execute(
             "SELECT e.id, e.group_id, e.filename, e.content_hash, e.src_hash,"
             " g.name AS gname FROM emojis e JOIN groups g ON e.group_id=g.id"
@@ -588,20 +634,47 @@ class DataManager:
         pending = [dict(r) for r in rows
                    if gif_converter.needs_conversion(os.path.join(
                        self._emojis_dir, r["gname"], r["filename"]))]
-        converted = 0
-        failed = 0
-        deduped = 0
         total = len(pending)
-        for i, em in enumerate(pending):
-            if progress_cb is not None:
-                progress_cb(i, total, em["filename"])
+
+        # Convert in worker threads (ffmpeg/Pillow are pure file IO); the DB
+        # writes stay on the main thread because the sqlite3 connection is
+        # not thread-safe. Returns (em, (src, dst, new_hash)) or (em, None).
+        # 转换在 worker 线程执行（ffmpeg/Pillow 是纯文件 IO）；数据库写入
+        # 留在主线程（sqlite3 连接非线程安全）。返回 (em, (src, dst, hash))
+        # 或 (em, None)。
+        def convert_one(em):
             src = os.path.join(self._emojis_dir, em["gname"], em["filename"])
             dst = os.path.join(self._emojis_dir, em["gname"],
                                f"{uuid.uuid4().hex[:8]}.gif")
             if not gif_converter.convert_to_gif(src, dst):
+                return (em, None)
+            try:
+                h = self._file_md5(dst)
+            except OSError:
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
+                return (em, None)
+            return (em, (src, dst, h))
+
+        if workers is None or workers <= 1 or len(pending) <= 1:
+            results = [convert_one(em) for em in pending]
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                results = list(ex.map(convert_one, pending))
+
+        converted = 0
+        failed = 0
+        deduped = 0
+        for i, (em, r) in enumerate(results):
+            if progress_cb is not None:
+                progress_cb(i, total, em["filename"])
+            if r is None:
                 failed += 1
                 continue
-            new_hash = self._file_md5(dst)
+            src, dst, new_hash = r
             # Same content already in this group -> drop the redundant record /
             # 同组已有相同内容 → 删除冗余记录
             dup = self._conn.execute(
@@ -720,8 +793,23 @@ class DataManager:
                 dst_path = os.path.join(dst_dir, em["filename"])
                 if os.path.isfile(src_path):
                     shutil.move(src_path, dst_path)
-        self._conn.execute("UPDATE emojis SET group_id=? WHERE id=?", (target_group_id, emoji_id))
+        # Reset the column state: the moved card must not keep the source
+        # group's col_index/sort_order (that created orphan columns / number
+        # gaps in the target group). Mark it unassigned so the target group's
+        # assign_unassigned_columns / _redistribute places it fresh.
+        # 重置列状态：被移动的卡不得保留源组的 col_index/sort_order
+        # （否则目标组会出现孤列/列号空洞）。标记为未分配，由目标组的
+        # assign_unassigned_columns / _redistribute 重新分配。
+        self._conn.execute(
+            "UPDATE emojis SET group_id=?, col_index=0, sort_order=0,"
+            " user_sorted=0 WHERE id=?",
+            (target_group_id, emoji_id),
+        )
         self._conn.commit()
+        # Text groups: compact column numbers so no hole remains / 文字分组：
+        # 压缩列号，避免空洞
+        if target["type"] == "text":
+            self.compact_text_columns(target_group_id)
         return True
 
     # Text Grouping: Stable Column Containers / 文字分组：稳定单列排序
@@ -919,9 +1007,16 @@ class DataManager:
             pending.extend(cols.pop(ci, []))
         if not pending or not cols:
             return 0
+        # Distribute the pending cards across the target columns, always
+        # into the currently shortest one, so merged columns stay balanced
+        # (target_cols is the caller's list of columns that fit; it was
+        # previously ignored) / 把待并入的卡片分配到 target_cols 中当前最短
+        # 的列，保持并入后各列均衡（target_cols 是调用方指定的"能完整显示"
+        # 的列，此前被忽略）
+        targets = [t for t in target_cols if t in cols] or list(cols.keys())
         for e in pending:
-            min_col = min(cols, key=lambda ci: len(cols[ci]))
-            cols[min_col].append(e)
+            t = min(targets, key=lambda ci: len(cols[ci]))
+            cols[t].append(e)
         self._conn.execute("BEGIN")
         try:
             for ci, lst in cols.items():
@@ -984,9 +1079,6 @@ class DataManager:
     # Clipboard / 剪贴板
 
     def copy_to_clipboard(self, emoji, mode=0):
-        from PySide6.QtWidgets import QApplication
-        from PySide6.QtGui import QClipboard
-
         clipboard = QApplication.clipboard()
 
         if emoji.get("text_content"):

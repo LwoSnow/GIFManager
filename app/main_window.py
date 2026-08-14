@@ -2,6 +2,7 @@
 主窗口管理"""
 import os
 import sys
+import tempfile
 import ctypes
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
@@ -9,7 +10,9 @@ from PySide6.QtWidgets import (
     QFileDialog, QMessageBox, QStatusBar, QApplication, QInputDialog,
     QSystemTrayIcon, QProgressDialog,
 )
-from PySide6.QtCore import Qt, QSize, QMimeData, QPoint, QTimer, QSettings, QThreadPool
+from PySide6.QtCore import (
+    Qt, QSize, QMimeData, QPoint, QTimer, QSettings, QThreadPool, QStandardPaths,
+)
 from PySide6.QtGui import (
     QDragEnterEvent, QDropEvent, QIcon, QAction, QKeyEvent, QKeySequence,
     QMouseEvent,
@@ -119,21 +122,28 @@ class MainWindow(QMainWindow):
     # QSettings / QSettings 设置持久化
 
     def _load_settings(self):
-        self._send_mode = int(self._settings.value("send_mode", 0))
+        # All numeric reads use QSettings' type= keyword (returns the default
+        # on corrupt/typed-mismatch values); direct int()/float() casts used
+        # to crash startup on dirty registry data / 所有数值读取都用 QSettings
+        # 的 type= 关键字（类型不符/脏数据时返回默认值）；此前直接用
+        # int()/float() 强转，注册表脏数据会导致启动崩溃
+        self._send_mode = self._settings.value("send_mode", 0, type=int)
         self._remember_group = self._settings.value("remember_group", True, type=bool)
         self._autostart = self._settings.value("autostart", False, type=bool)
         self._always_on_top = self._settings.value("always_on_top", False, type=bool)
         # Number of multi-threaded cores (0 = automatic, use recommended values)
         # 多线程核心数（0 = 自动，使用推荐值）
-        self._thread_count = int(self._settings.value("thread_count", 0))
+        self._thread_count = self._settings.value("thread_count", 0, type=int)
         self._apply_thread_count()
         # Theme (dark light)
         # 主题（暗色/亮色）
         self._theme = self._settings.value("theme", "dark")
         # Text preview restrictions (single line, multiple lines independent)
         # 文字预览限制（单行 / 多行独立）
-        self._text_limit_single = int(self._settings.value("text_preview_limit_single", 100))
-        self._text_limit_multi = int(self._settings.value("text_preview_limit_multi", 200))
+        self._text_limit_single = self._settings.value(
+            "text_preview_limit_single", 100, type=int)
+        self._text_limit_multi = self._settings.value(
+            "text_preview_limit_multi", 200, type=int)
         # Global sorting mode (time/name/freq, asc/desc) / 全局排序模式（时间/名称/频率，正/逆序）
         self._gs_enabled = self._settings.value("global_sort_enabled", False, type=bool)
         by = self._settings.value("global_sort_by", "time")
@@ -143,6 +153,17 @@ class MainWindow(QMainWindow):
         self._auto_convert_gif = self._settings.value("auto_convert_gif", True, type=bool)
         # Auto-update check on startup / 启动时自动检查更新
         self._auto_update = self._settings.value("auto_update", False, type=bool)
+        # Show the emoji name under the thumbnail / 缩略图下方显示表情包名称
+        self._show_emoji_name = self._settings.value("show_emoji_name", True, type=bool)
+        # Hover zoom factor for image cards / 图片卡悬停放大倍数
+        try:
+            self._hover_zoom = max(
+                1.0, float(self._settings.value("hover_zoom", 1.15)))
+        except (TypeError, ValueError):
+            self._hover_zoom = 1.15
+        # Master switch for the hover preview / 悬停预览总开关
+        self._hover_preview_enabled = self._settings.value(
+            "hover_preview_enabled", True, type=bool)
         lang = self._settings.value("language", "zh_CN")
         try:
             set_language(lang)
@@ -154,13 +175,18 @@ class MainWindow(QMainWindow):
     def _apply_thread_count(self):
         # Multi-threaded core limit setting
         # 多线程核心数限制设置
-        from PySide6.QtCore import QThreadPool
         n = self._thread_count if self._thread_count > 0 else recommended_thread_count()
         pool = QThreadPool.globalInstance()
         if pool.maxThreadCount() != n:
             pool.setMaxThreadCount(n)
         if hasattr(self, "emoji_grid"):
-            self.emoji_grid._gif_limit = max(2, n * 2)
+            # GIF frames are decoded off the GUI thread (gifdec.dll) and
+            # cached, so playback is just a pixmap swap; raise the
+            # concurrent-playback cap accordingly (was core*2, too low on
+            # multi-core machines) / GIF 帧已在后台（gifdec.dll）解码并缓存，
+            # 播放只是切换 pixmap，故提高同时播放上限（原为核心数×2，多核
+            # 机器上偏少）
+            self.emoji_grid._gif_limit = max(8, n * 4)
 
     def _save_settings(self):
         self._settings.setValue("send_mode", self._send_mode)
@@ -176,6 +202,9 @@ class MainWindow(QMainWindow):
         self._settings.setValue("global_sort_desc", self._gs_desc)
         self._settings.setValue("auto_convert_gif", self._auto_convert_gif)
         self._settings.setValue("auto_update", self._auto_update)
+        self._settings.setValue("show_emoji_name", self._show_emoji_name)
+        self._settings.setValue("hover_zoom", self._hover_zoom)
+        self._settings.setValue("hover_preview_enabled", self._hover_preview_enabled)
         self._settings.setValue("language", current_language())
 
     def _restore_geometry(self):
@@ -307,6 +336,9 @@ class MainWindow(QMainWindow):
         self._scroll_area.setWidgetResizable(True)
         self._scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.emoji_grid = EmojiGridWidget()
+        self.emoji_grid._show_emoji_name = self._show_emoji_name
+        self.emoji_grid._hover_zoom = self._hover_zoom
+        self.emoji_grid._hover_preview_enabled = self._hover_preview_enabled
         self._scroll_area.setWidget(self.emoji_grid)
         root.addWidget(self._scroll_area, 1)
 
@@ -321,7 +353,80 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         self._act_import_folder = menu.addAction(tr("from_folder"))
         self._act_import_files = menu.addAction(tr("from_file"))
+        # Connect here (not only in _connect_signals): _reload_language
+        # rebuilds the menu on a language switch, and the old actions would
+        # otherwise lose their connections, making the import menu dead.
+        # 在此处连接（而非仅在 _connect_signals）：切换语言时 _reload_language
+        # 会重建菜单，否则旧 action 的连接丢失，导入菜单会失效。
+        self._act_import_folder.triggered.connect(self._import_from_folder)
+        self._act_import_files.triggered.connect(self._import_from_files)
+        # QQ emoji one-click import (multi-account) / QQ 表情一键导入（多账号）
+        self._qq_sub = QMenu(tr("import_qq"), menu)
+        # Re-scan the QQ accounts every time the submenu opens, so newly
+        # saved stickers show up without restarting
+        # 每次打开子菜单时重新扫描账号，新保存的表情无需重启即可出现
+        self._qq_sub.aboutToShow.connect(self._refresh_qq_submenu)
+        menu.addMenu(self._qq_sub)
         self.btn_import.setMenu(menu)
+
+    def _qq_emoji_base(self):
+        # Documents\Tencent Files under the current user's documents folder
+        # (honours the OneDrive Documents redirection) / 当前用户文档目录下的
+        # Documents\Tencent Files（跟随 OneDrive 文档重定向）
+        docs = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.DocumentsLocation)
+        if not docs:
+            docs = os.path.join(os.path.expanduser("~"), "Documents")
+        return os.path.join(docs, "Tencent Files")
+
+    def _scan_qq_accounts(self):
+        # Scan Tencent Files for QQ accounts (pure-digit folders) that have
+        # a personal emoji Ori folder; returns [{qq, path, count}]
+        # 扫描 Tencent Files 下的 QQ 号（纯数字文件夹）及其个人表情 Ori 目录
+        base = self._qq_emoji_base()
+        accounts = []
+        if not os.path.isdir(base):
+            return accounts
+        for name in sorted(os.listdir(base)):
+            if not name.isdigit():
+                continue  # QQ account folders are pure digits / QQ 号是纯数字目录
+            emoji_dir = os.path.join(
+                base, name, "nt_qq", "nt_data", "Emoji", "personal_emoji", "Ori")
+            if not os.path.isdir(emoji_dir):
+                continue
+            files = [f for f in os.listdir(emoji_dir)
+                     if os.path.splitext(f)[1].lower() in gif_converter.IMPORT_EXTS]
+            if files:
+                accounts.append({
+                    "qq": name, "path": emoji_dir, "count": len(files)})
+        return accounts
+
+    def _refresh_qq_submenu(self):
+        self._qq_sub.clear()
+        accounts = self._scan_qq_accounts()
+        if not accounts:
+            act = self._qq_sub.addAction(tr("import_qq_none"))
+            act.setEnabled(False)
+            return
+        for acc in accounts:
+            label = f"{acc['qq']}（{acc['count']} 个）"
+            act = self._qq_sub.addAction(label)
+            act.triggered.connect(
+                lambda checked, p=acc["path"]: self._import_from_qq(p))
+
+    def _import_from_qq(self, emoji_dir):
+        # Import every supported image in one QQ account's personal emoji
+        # folder (mislabeled GIFs/PNGs are handled by content detection)
+        # 导入单个 QQ 号个人表情目录下的全部支持图片（伪装 GIF/PNG 由内容检测处理）
+        files = []
+        for fn in os.listdir(emoji_dir):
+            if os.path.splitext(fn)[1].lower() in gif_converter.IMPORT_EXTS:
+                files.append(os.path.join(emoji_dir, fn))
+        if not files:
+            QMessageBox.information(self, "GIFManager", tr("import_qq_none"))
+            return
+        self._log.info("Import from QQ -> dir=%s files=%d", emoji_dir, len(files))
+        self._do_import(files)
 
     def _apply_theme(self):
         self.setStyleSheet(DARK_QSS if self._theme != "light" else LIGHT_QSS)
@@ -366,6 +471,10 @@ class MainWindow(QMainWindow):
         self._save_settings()
         if self._hotkey_mgr:
             self._hotkey_mgr.unregister()
+        # Stop the GIF decode worker thread before the interpreter exits
+        # 解释器退出前停止 GIF 解码工作线程
+        from app.utils import gif_player
+        gif_player.shutdown()
         self._tray.hide()
         QApplication.quit()
 
@@ -373,6 +482,14 @@ class MainWindow(QMainWindow):
         self._save_geometry()
         self._save_current_group()
         self._save_settings()
+        # Without a system tray there is no way to bring the window back
+        # (Qt.Tool windows have no taskbar entry), so close for real /
+        # 无系统托盘时窗口无法再找回（Qt.Tool 窗口无任务栏入口），真正退出
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self._log.info("No system tray -> quit on close")
+            self._real_quit()
+            event.accept()
+            return
         self._log.info("Window closing -> hide to tray")
         event.ignore()
         self.hide()
@@ -385,8 +502,9 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self):
         self.search_bar.textChanged.connect(self._on_search)
-        self._act_import_folder.triggered.connect(self._import_from_folder)
-        self._act_import_files.triggered.connect(self._import_from_files)
+        # Import menu actions are connected inside _build_import_menu because
+        # the menu is rebuilt on language switches / 导入菜单 action 在
+        # _build_import_menu 内连接（菜单会在语言切换时重建）
         self.btn_settings.clicked.connect(self._open_settings)
         self.group_list.group_changed.connect(self._on_group_changed)
         self.group_list.groups_updated.connect(self._refresh_emoji_grid)
@@ -400,6 +518,11 @@ class MainWindow(QMainWindow):
         self._gs_timer.setInterval(400)
         self._gs_timer.timeout.connect(self._on_gs_freq_timeout)
         self._gs_pending_group = None
+        # Search debounce timer / 搜索防抖定时器
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(200)
+        self._search_timer.timeout.connect(self._on_search_timeout)
         # Silent update check on startup (tray bubble when a new version
         # exists; failures are logged only). / 启动静默检查更新（发现新版本
         # 用托盘气泡提示；失败仅记录日志）
@@ -492,6 +615,12 @@ class MainWindow(QMainWindow):
         )
 
     def _on_search(self, _text):
+        # Debounce: rebuilding the grid on every keystroke is expensive with
+        # a large library; refresh 200 ms after typing pauses / 防抖：大图库
+        # 下逐键重建网格开销大；停止输入 200ms 后再刷新
+        self._search_timer.start()
+
+    def _on_search_timeout(self):
         self._refresh_emoji_grid()
 
     # Import / 导入
@@ -587,7 +716,6 @@ class MainWindow(QMainWindow):
         dlg.setAutoClose(False)
         ready = []
         imported = duplicated = converted_n = fail_n = 0
-        import tempfile as _tf
         try:
             for i, f in enumerate(files):
                 if dlg.wasCanceled():
@@ -597,7 +725,7 @@ class MainWindow(QMainWindow):
                 QApplication.processEvents()
                 if gif_converter.needs_conversion(f):
                     tmp = os.path.join(
-                        _tf.gettempdir(), f"gm_conv_{os.urandom(4).hex()}.gif")
+                        tempfile.gettempdir(), f"gm_conv_{os.urandom(4).hex()}.gif")
                     if gif_converter.convert_to_gif(f, tmp):
                         ready.append(tmp)
                         converted_n += 1
@@ -618,7 +746,7 @@ class MainWindow(QMainWindow):
             # Clean up temp gif files (already copied into the library) /
             # 清理临时 gif 文件（已复制入库）
             for p in ready:
-                if p.endswith(".gif") and os.path.dirname(p) == _tf.gettempdir():
+                if p.endswith(".gif") and os.path.dirname(p) == tempfile.gettempdir():
                     try:
                         os.remove(p)
                     except OSError:
@@ -652,7 +780,10 @@ class MainWindow(QMainWindow):
 
         try:
             converted, failed, deduped = \
-                self.data_manager.convert_library_to_gif(progress_cb=cb)
+                self.data_manager.convert_library_to_gif(
+                    progress_cb=cb,
+                    workers=QThreadPool.globalInstance().maxThreadCount(),
+                )
         finally:
             dlg.close()
         self._refresh_emoji_grid()
@@ -934,18 +1065,6 @@ class MainWindow(QMainWindow):
             )
         menu.addMenu(sub)
 
-    def _move_emoji(self, emoji):
-        groups = self.data_manager.get_all_groups()
-        image_groups = [g for g in groups if g["type"] == "image" and g["id"] != emoji["group_id"]]
-        if not image_groups:
-            QMessageBox.information(self, "GIFManager", tr("no_move_target"))
-            return
-        menu = QMenu(self)
-        for g in image_groups:
-            act = menu.addAction(g["name"])
-            act.triggered.connect(lambda checked, gid=g["id"]: self._do_move(emoji, gid))
-        menu.exec(self.btn_import.mapToGlobal(QPoint(0, 30)))
-
     def _do_move(self, emoji, target_group_id):
         self.data_manager.move_emoji(emoji["id"], target_group_id)
         self._log.info("Move emoji -> id=%s target_group=%s", emoji["id"], target_group_id)
@@ -955,6 +1074,11 @@ class MainWindow(QMainWindow):
     # Settings / 设置
 
     def _open_settings(self):
+        # Settings is always-on-top; when it is already open, ignore the
+        # repeated click silently (no popup needed) / 设置窗口置顶，已打开时
+        # 静默忽略重复点击（无需提示框）
+        if self._settings_dialog is not None:
+            return
         dlg = SettingsDialog(
             self._send_mode, self._remember_group,
             self._autostart, self._always_on_top,
@@ -962,7 +1086,12 @@ class MainWindow(QMainWindow):
             self._thread_count, self._theme,
             self._gs_enabled, self._gs_by, self._gs_desc,
             self._auto_convert_gif, self._auto_update,
-            self.data_manager, self._hotkey_desc(), self
+            show_emoji_name=self._show_emoji_name,
+            hover_zoom=self._hover_zoom,
+            hover_preview_enabled=self._hover_preview_enabled,
+            data_manager=self.data_manager,
+            hotkey_desc=self._hotkey_desc(),
+            parent=self,
         )
         dlg.convert_library_requested.connect(self._on_convert_library)
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
@@ -973,7 +1102,6 @@ class MainWindow(QMainWindow):
         dlg.show()
 
     def _on_clear_logs(self):
-        from PySide6.QtWidgets import QMessageBox
         count = clear_logs()
         self._log = get_logger()  # 清除后重建的新会话日志
         self._log.info("Clear logs -> removed %d file(s)", count)
@@ -1018,6 +1146,24 @@ class MainWindow(QMainWindow):
         # Auto-convert setting may change without closing the dialog / 自动转换开关可能在对话框内直接变化
         self._auto_convert_gif = dlg.auto_convert_gif()
         self._auto_update = dlg.auto_update()
+        # Show/hide the emoji name: pass it to the grid so rebuilt cards
+        # (and the layout heights) use the new setting / 显示/隐藏表情包名称：
+        # 传给网格，重建的卡片与布局高度使用新设置
+        self._show_emoji_name = dlg.show_emoji_name()
+        self.emoji_grid._show_emoji_name = self._show_emoji_name
+        # Hover zoom factor / 悬停放大倍数（新建卡片时使用）
+        self._hover_zoom = dlg.hover_zoom()
+        self.emoji_grid._hover_zoom = self._hover_zoom
+        # Hover preview master switch / 悬停预览总开关
+        self._hover_preview_enabled = dlg.hover_preview_enabled()
+        self.emoji_grid._hover_preview_enabled = self._hover_preview_enabled
+        # Apply to already-created cards immediately (no need to switch
+        # groups) / 立即应用到已创建的卡片（无需切换分组）
+        for card in self.emoji_grid._items:
+            card._hover_enabled = self._hover_preview_enabled
+            card._hover_zoom = self._hover_zoom
+            if not self._hover_preview_enabled:
+                card._hide_hover_zoom()
         theme_changed = (dlg.theme() != self._theme)
         self._theme = dlg.theme()
         self._log.info(
@@ -1068,8 +1214,11 @@ class MainWindow(QMainWindow):
 
     def _init_hotkey_mgr(self):
         self._hotkey_mgr = HotkeyManager(self)
-        self._hotkey_mods = int(self._settings.value("hotkey_mods", 0))
-        self._hotkey_vk = int(self._settings.value("hotkey_vk", Qt.Key.Key_F10))
+        # type=int guards against dirty registry values (startup crash fix) /
+        # type=int 防止注册表脏数据导致启动崩溃
+        self._hotkey_mods = self._settings.value("hotkey_mods", 0, type=int)
+        self._hotkey_vk = self._settings.value(
+            "hotkey_vk", Qt.Key.Key_F10, type=int)
         if self._hotkey_vk == 0:
             self._hotkey_mods = 0
             self._hotkey_vk = Qt.Key.Key_F10
