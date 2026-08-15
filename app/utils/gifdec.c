@@ -393,15 +393,22 @@ static int lzw_decode(const uint8_t* data, size_t data_len, int min_code,
 
 /* Interlace inverse mapping: screen row -> data row (LZW data is stored
  * in interlace pass order, so drawing screen row r needs data row inv[r]).
+ * Rows are stored as int, NOT uint8_t: a GIF taller than 256px has data
+ * row numbers beyond 255, and uint8_t truncation corrupted every pass-3/4
+ * row of interlaced tall images (the 2026-08 bug where some QQ-imported
+ * GIF87a stickers previewed scrambled while system viewers were fine).
  * 隔行逆映射：屏幕行 -> 数据行（LZW 数据按隔行扫描的 pass 顺序存储，
- * 绘制屏幕行 r 需取数据行 inv[r]）。 */
-static void build_interlace_map(int h, uint8_t* inv) {
+ * 绘制屏幕行 r 需取数据行 inv[r]）。行号用 int 而非 uint8_t：超过 256px
+ * 高的 GIF 数据行号会大于 255，uint8_t 截断会让交织图 pass 3/4 的所有
+ * 行错乱（2026-08 的 bug：部分 QQ 导入的 GIF87a 表情预览花屏，而系统
+ * 查看器正常）。 */
+static void build_interlace_map(int h, uint32_t* inv) {
     static const int starts[4] = {0, 4, 2, 1};
     static const int steps[4] = {8, 8, 4, 2};
     int p, r, n = 0;
     for (p = 0; p < 4 && n < h; p++) {
         for (r = starts[p]; r < h && n < h; r += steps[p]) {
-            inv[r] = (uint8_t)n;
+            inv[r] = (uint32_t)n;
             n++;
         }
     }
@@ -476,7 +483,7 @@ static int decode_upto(Gif* g, int target) {
     }
     for (i = g->decoded_upto + 1; i <= target; i++) {
         const Frame* fr = &g->frames[i];
-        uint8_t* imap = NULL;
+        uint32_t* imap = NULL;
         int fw = fr->width, fh = fr->height;
         int py, px;
         /* apply the previous frame's disposal / 应用上一帧的处置方式 */
@@ -511,7 +518,7 @@ static int decode_upto(Gif* g, int target) {
             return 0;
         }
         if (fr->interlace) {
-            imap = (uint8_t*)malloc((size_t)fh);
+            imap = (uint32_t*)malloc((size_t)fh * sizeof(uint32_t));
             if (!imap) return 0;
             build_interlace_map(fh, imap);
         }

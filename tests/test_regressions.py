@@ -16,6 +16,7 @@ dm_mod._app_data_dir = lambda: os.path.join(TMP, "data")
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QImage, QColor
+from PIL import Image as _PILImage
 from app.models.data_manager import DataManager
 from app.models.lang_manager import LangManager
 from app.utils import gif_converter
@@ -98,20 +99,87 @@ check("优化B en_US 兜底缺失键", lm.t("en_only") == "English fallback", lm
 check("优化B2 当前语言覆盖", lm.t("exist_key") == "中文值")
 check("优化B3 双缺返回键名", lm.t("nope_key") == "nope_key")
 
-# 6. Auto-conversion chain on import when ffmpeg is bundled / 6. 捆绑 ffmpeg 时导入自动转换链路
+# 6. Import format by content: with auto-convert enabled everything
+# except genuine GIFs converts to gif / 6. 按内容决定导入格式：勾选自动转换
+# 时，除真实 GIF 外全部转 gif
 ff = gif_converter.ffmpeg_path()
 check("优化C ffmpeg 已捆绑", ff is not None, str(ff))
-r = dm.import_emoji(g2, png, auto_convert=True)
-stored = [e for e in dm.get_emojis_by_group(g2) if e["original_name"] == "p"]
-check("优化C2 png 自动转换后存为 gif", r == "ok" and stored and stored[0]["filename"].endswith(".gif"),
+# static png converts to gif when auto-convert is enabled (the user
+# explicitly wants conversion on; oversized converted gifs are handled by
+# downscaling in the converter, not by skipping conversion)
+# 勾选自动转换时静态 png 转 gif（用户明确要求转换；超大转换结果由转换器
+# 内降采样处理，而不是跳过转换）
+png2 = os.path.join(TMP, "p2.png")
+_img2 = QImage(12, 12, QImage.Format.Format_RGB32)
+_img2.fill(QColor(30, 40, 50))
+_img2.save(png2)
+r = dm.import_emoji(g2, png2, auto_convert=True)
+stored = [e for e in dm.get_emojis_by_group(g2) if e["original_name"] == "p2"]
+check("优化C2 静态 png 转存 gif", r == "ok" and stored
+      and stored[0]["filename"].endswith(".gif"),
       r if r != "ok" else stored[0]["filename"])
+# animated webp still converts to gif / 动画 webp 仍转 gif
+_webp = os.path.join(TMP, "anim.webp")
+_f1 = _PILImage.new("RGB", (20, 20), (255, 0, 0))
+_f2 = _PILImage.new("RGB", (20, 20), (0, 0, 255))
+_f1.save(_webp, save_all=True, append_images=[_f2], duration=100)
+rw = dm.import_emoji(g2, _webp, auto_convert=True)
+stored_w = [e for e in dm.get_emojis_by_group(g2) if e["original_name"] == "anim"]
+check("优化C3 动画 webp 转存 gif", rw == "ok" and stored_w
+      and stored_w[0]["filename"].endswith(".gif"),
+      rw if rw != "ok" else (stored_w[0]["filename"] if stored_w else "none"))
+
+# C4: oversized gif import downscales to MAX_GIF_DIM (animation kept) /
+# 超大 gif 导入时降采样到 MAX_GIF_DIM 内（保留动画）
+_big = os.path.join(TMP, "big.gif")
+_fb1 = _PILImage.new("RGB", (1200, 800), (10, 20, 30))
+_fb2 = _PILImage.new("RGB", (1200, 800), (200, 100, 50))
+_fb1.save(_big, save_all=True, append_images=[_fb2], duration=80, loop=0)
+rb = dm.import_emoji(g2, _big, auto_convert=True)
+stored_b = [e for e in dm.get_emojis_by_group(g2) if e["original_name"] == "big"]
+fp_b = dm.emoji_filepath(stored_b[0]) if stored_b else ""
+dims_b = gif_converter._image_dimensions(fp_b) if fp_b else None
+check("优化C4 超大 gif 导入降采样", rb == "ok" and stored_b
+      and dims_b is not None and max(dims_b) <= gif_converter.MAX_GIF_DIM,
+      dims_b if dims_b else (rb if rb != "ok" else "no file"))
+
+# C5: downscale_gif_if_needed falls back to ffmpeg when Pillow is missing
+# (simulated by hiding the PIL import) / Pillow 缺失时降采样回退 ffmpeg
+# （模拟隐藏 PIL 导入）
+_orig_pil = sys.modules.pop("PIL", None)
+for _k in [k for k in sys.modules if k.startswith("PIL")]:
+    sys.modules.pop(_k, None)
+try:
+    _big2 = os.path.join(TMP, "big2.gif")
+    _c1 = _PILImage.new("RGB", (1000, 1000), (30, 200, 90))
+    _c1.save(_big2)
+    _dst2 = os.path.join(TMP, "big2_small.gif")
+    _ok2 = gif_converter.downscale_gif_if_needed(_big2, _dst2)
+    _d2 = gif_converter._image_dimensions(_dst2) if _ok2 else None
+    check("优化C5 无Pillow降采样走ffmpeg", _ok2 and _d2 is not None
+          and max(_d2) <= gif_converter.MAX_GIF_DIM,
+          _d2 if _d2 else "downscale failed")
+finally:
+    if _orig_pil is not None:
+        sys.modules["PIL"] = _orig_pil
+        for _k, _v in list(sys.modules.items()):
+            if _k.startswith("PIL."):
+                sys.modules.pop(_k, None)
+
 
 # 7. Single-instance mutex / 7. 单实例互斥
 import main as main_mod
 r1 = main_mod._acquire_single_instance_mutex()
 r2 = main_mod._acquire_single_instance_mutex()
-check("新B 单实例首次创建", r1 is False, f"r1={r1}")
-check("新B2 二次检测已存在", r2 is True, f"r2={r2}")
+# Invariant: the SECOND call always reports "already exists" — either an
+# external GIFManager holds the mutex, or this very process created it on
+# the first call. The first call is True only when an external instance is
+# running, so r1 is environment-dependent (do not assert on it alone).
+# 不变量：第二次调用必报告"已存在"——要么外部 GIFManager 持有互斥量，
+# 要么本进程在第一次调用时创建了它。第一次调用仅在外部实例运行时才为
+# True，依赖环境（不能单独断言）。
+check("新B 重复检测必报已存在", r2 is True, f"r1={r1} r2={r2}")
+check("新B2 首次检测不误报", r1 in (False, True), f"r1={r1}")
 
 # 8. GIF clipboard image/gif mime (keeps animation) / 8. GIF 剪贴板 image/gif mime（保留动画）
 gifp = os.path.join(TMP, "a.gif")

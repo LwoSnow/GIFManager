@@ -64,6 +64,14 @@ check("D gs 下拉无内联样式", dlg._combo_gs_by.styleSheet() == ""
       and dlg._combo_gs_dir.styleSheet() == "",
       dlg._combo_gs_by.styleSheet())
 
+# Auto-input switch exists and translates / 自动输入开关存在且随语言翻译
+check("E 自动输入勾选框存在", hasattr(dlg, "_cb_auto_input")
+      and dlg._cb_auto_input.text() == tr("auto_input_enable"),
+      getattr(dlg, "_cb_auto_input", None).text() if hasattr(dlg, "_cb_auto_input") else "missing")
+check("E2 自动输入分组标题", dlg._auto_input_group.title() == tr("auto_input_group"),
+      dlg._auto_input_group.title())
+check("E3 自动输入取值器", dlg.auto_input() == dlg._cb_auto_input.isChecked())
+
 dlg.deleteLater()
 n_pass = sum(1 for _, ok in RES if ok)
 print(f"\n设置页修复验证: {n_pass}/{len(RES)} 通过")

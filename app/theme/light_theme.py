@@ -162,6 +162,34 @@ QLabel#nameLabel {
     font-size: 10px;
     background: transparent;
 }
+QLabel#checkBadge {
+    color: #FFFFFF;
+    font-size: 12px;
+    font-weight: bold;
+    background-color: #1677FF;
+    border: 1px solid #FFFFFF;
+    border-radius: 9px;
+}
+QLabel#editCount {
+    color: #666666;
+    font-size: 11px;
+    background: transparent;
+}
+QPushButton#editToolBtn {
+    color: #333333;
+    background-color: #F0F0F0;
+    border: 1px solid #CCCCCC;
+    border-radius: 4px;
+    padding: 3px 10px;
+    font-size: 11px;
+}
+QPushButton#editToolBtn:hover {
+    background-color: #E0E0E0;
+}
+QPushButton#editToolBtn:disabled {
+    color: #AAAAAA;
+    background-color: #F5F5F5;
+}
 
 /* ========== 分组标签按钮 ========== */
 QPushButton#groupTab {

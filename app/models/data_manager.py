@@ -1,6 +1,7 @@
 """Data management SQLite & file management
 数据管理 SQLite & 文件管理"""
 import hashlib
+import logging
 import os
 import re
 import shutil
@@ -9,11 +10,13 @@ import sys
 import tempfile
 import time
 import uuid
-from PySide6.QtCore import QStandardPaths, QMimeData, QUrl
+from PySide6.QtCore import QStandardPaths, QMimeData, QUrl, QTimer
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import QApplication
 
 from app.utils import gif_converter
+
+log = logging.getLogger("GIFManager")
 
 # Valid characters for group names: Chinese and English, numbers, spaces, short lines /
 # 分组名合法字符：中英文、数字、空格、短横线
@@ -84,6 +87,7 @@ class DataManager:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._last_group_error = ""  # last rename_group failure reason / 上次重命名失败原因
+        self._pending_send_temps = set()  # temp send copies awaiting cleanup / 待清理的发送临时副本
         self._init_tables()
         # Speed up GROUP BY content_hash in get_all_emojis for large libraries
         # 为 get_all_emojis 的 GROUP BY content_hash 建索引（大图库提速）
@@ -480,24 +484,98 @@ class DataManager:
         ext = os.path.splitext(filepath)[1].lower()
         if ext not in gif_converter.IMPORT_EXTS:
             return "error"
-        # Convert non-gif images to gif first (keeps size/ratio unchanged) /
-        # 先把非 gif 图片转为 gif（尺寸比例不变）
+        # Store-format decision by CONTENT: with auto-convert enabled every
+        # non-GIF file (animated webp/apng/mjpeg, static jpg/png) converts to
+        # gif — the user explicitly wants conversion on, and oversized
+        # results are downscaled inside the converter so chat apps still
+        # recognize them as pictures. Genuine GIF content (even under a .jpg
+        # name) stores as .gif; oversized gifs (e.g. 1920x1920 2MB) are
+        # downscaled on import too, because chat apps paste such files as
+        # attachments rather than pictures.
+        # 按内容决定存储格式：勾选自动转换时，一切非 GIF 文件（动画
+        # webp/apng/mjpeg、静态 jpg/png）都转为 gif——用户明确要求转换，
+        # 超大结果在转换器内降采样，聊天软件仍能识别为图片。真实 GIF
+        # 内容（即使伪装 .jpg）存 .gif；超大 gif（如 1920x1920、2MB）在
+        # 导入时同样降采样——聊天软件会把这类文件当附件粘贴而非图片。
         src_hash = ""
         src = filepath
-        if auto_convert and gif_converter.needs_conversion(filepath):
+        store_ext = ext or ".gif"
+        if auto_convert and gif_converter.needs_gif_conversion(filepath):
             src_hash = self._file_md5(filepath)
             tmp_gif = os.path.join(
                 tempfile.gettempdir(), f"gm_conv_{uuid.uuid4().hex}.gif")
             if gif_converter.convert_to_gif(filepath, tmp_gif):
                 src = tmp_gif
+                store_ext = ".gif"
+            else:
+                log.warning("import_emoji: convert_to_gif failed for %s, store original", filepath)
+        elif gif_converter._content_kind(filepath) == "gif":
+            store_ext = ".gif"
+            # Oversized gif -> downscale before storing so it sends as a
+            # picture (animation kept). Follows the auto-convert switch: with
+            # it off the file is stored as-is (the send path still
+            # downscales on the fly). / 超大 gif → 入库前降采样（保留动画），
+            # 保证发送时被识别为图片。跟随"自动转换"开关：关闭时原样入库
+            # （发送路径仍会即时降采样）。
+            if auto_convert:
+                dims = gif_converter._image_dimensions(filepath)
+                if dims and max(dims) > gif_converter.MAX_GIF_DIM:
+                    src_hash = self._file_md5(filepath)
+                    tmp_gif = os.path.join(
+                        tempfile.gettempdir(), f"gm_conv_{uuid.uuid4().hex}.gif")
+                    if gif_converter.downscale_gif_if_needed(filepath, tmp_gif):
+                        src = tmp_gif
+                    else:
+                        log.warning(
+                            "import_emoji: downscale oversized gif failed for %s "
+                            "(dims=%s), store original",
+                            filepath, dims)
+                elif dims is None:
+                    log.warning(
+                        "import_emoji: cannot read dimensions of %s, store original",
+                        filepath)
+
+        gdir = os.path.join(self._emojis_dir, group["name"])
+        os.makedirs(gdir, exist_ok=True)
+
+        unique_id = uuid.uuid4().hex[:8]
+        new_name = f"{unique_id}{store_ext}"
+        dest = os.path.join(gdir, new_name)
+        # Copy via gif_converter so a GIF87a source is upgraded to GIF89a
+        # (WeChat/QQ send GIF87a as a file, not as an emoji). The stored
+        # hash is computed AFTER the copy so dedup matches the actual bytes.
+        # 经 gif_converter 复制，GIF87a 源自动升级为 GIF89a（微信/QQ 把
+        # GIF87a 当文件发送，不当表情）。入库哈希在复制后计算，保证去重
+        # 与实际存储字节一致。
+        try:
+            if store_ext == ".gif":
+                gif_converter._copy_as_gif(src, dest)
+            else:
+                shutil.copy2(src, dest)
+        except OSError:
+            if src != filepath:
+                try:
+                    os.remove(src)
+                except OSError:
+                    pass
+            return "error"
         # Calculate the stored-file hash for dedup: after conversion the gif
         # hash matches other gifs of the same picture, so png and gif of the
         # same image de-duplicate each other.
         # 以实际存储文件哈希查重：转换后 gif 哈希与同图其他 gif 一致，
         # 因此同一张图的 png 与 gif 可以互相去重。
         try:
-            content_hash = self._file_md5(src)
+            content_hash = self._file_md5(dest)
         except OSError:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            if src != filepath:
+                try:
+                    os.remove(src)  # clean temp gif too / 临时 gif 一并清理
+                except OSError:
+                    pass
             return "error"
         dup = self._conn.execute(
             "SELECT id, original_name FROM emojis "
@@ -505,21 +583,16 @@ class DataManager:
             (content_hash, group_id),
         ).fetchone()
         if dup:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
             if src != filepath:
                 try:
                     os.remove(src)  # clean temp gif / 清理临时 gif
                 except OSError:
                     pass
             return "duplicate"
-
-        gdir = os.path.join(self._emojis_dir, group["name"])
-        os.makedirs(gdir, exist_ok=True)
-
-        unique_id = uuid.uuid4().hex[:8]
-        store_ext = os.path.splitext(src)[1].lower() or ".gif"
-        new_name = f"{unique_id}{store_ext}"
-        dest = os.path.join(gdir, new_name)
-        shutil.copy2(src, dest)
 
         original_name = os.path.splitext(os.path.basename(filepath))[0]
         self._conn.execute(
@@ -548,26 +621,73 @@ class DataManager:
         os.makedirs(gdir, exist_ok=True)
 
         def work(src):
-            # worker Thread: convert -> hash -> copy to target (uuid named)
-            # worker 线程：转换 → 哈希 → 复制到目标（uuid 命名）
+            # worker Thread: convert non-GIF (incl. static, see import_emoji)
+            # -> copy (GIF87a->GIF89a) -> hash / worker 线程：转换非 GIF
+            # （含静态图，见 import_emoji）→ 复制（GIF87a 升级 GIF89a）→ 哈希
             try:
                 src_hash = ""
                 store = src
-                if auto_convert and gif_converter.needs_conversion(src):
+                store_ext = os.path.splitext(src)[1].lower() or ".gif"
+                if auto_convert and gif_converter.needs_gif_conversion(src):
                     src_hash = self._file_md5(src)
                     tmp_gif = os.path.join(
                         tempfile.gettempdir(), f"gm_conv_{uuid.uuid4().hex}.gif")
                     if gif_converter.convert_to_gif(src, tmp_gif):
                         store = tmp_gif
-                h = self._file_md5(store)
-                store_ext = os.path.splitext(store)[1].lower() or ".gif"
+                        store_ext = ".gif"
+                    else:
+                        log.warning(
+                            "import_batch: convert_to_gif failed for %s, "
+                            "store original", src)
+                elif gif_converter._content_kind(src) == "gif":
+                    store_ext = ".gif"
+                    # Oversized gif -> downscale before storing so it sends
+                    # as a picture (animation kept). Follows the auto-convert
+                    # switch. / 超大 gif → 入库前降采样（保留动画），保证
+                    # 发送时被识别为图片。跟随"自动转换"开关。
+                    if auto_convert:
+                        dims = gif_converter._image_dimensions(src)
+                        if dims and max(dims) > gif_converter.MAX_GIF_DIM:
+                            src_hash = self._file_md5(src)
+                            tmp_gif = os.path.join(
+                                tempfile.gettempdir(),
+                                f"gm_conv_{uuid.uuid4().hex}.gif")
+                            if gif_converter.downscale_gif_if_needed(src,
+                                                                     tmp_gif):
+                                store = tmp_gif
+                            else:
+                                log.warning(
+                                    "import_batch: downscale oversized gif failed "
+                                    "for %s (dims=%s), store original",
+                                    src, dims)
+                        elif dims is None:
+                            log.warning(
+                                "import_batch: cannot read dimensions of %s, "
+                                "store original", src)
                 dest = os.path.join(gdir, f"{uuid.uuid4().hex[:8]}{store_ext}")
-                shutil.copy2(store, dest)
-                if store != src:
-                    try:
-                        os.remove(store)  # remove temp gif / 删除临时 gif
-                    except OSError:
-                        pass
+                # Copy via gif_converter so GIF87a is upgraded to GIF89a
+                # (WeChat/QQ send GIF87a as a file, not as an emoji). Hash is
+                # computed AFTER the copy so dedup matches the stored bytes.
+                # 经 gif_converter 复制，GIF87a 升级为 GIF89a（微信/QQ 把
+                # GIF87a 当文件发送，不当表情）。哈希在复制后计算，保证去重
+                # 与实际存储字节一致。
+                try:
+                    if store_ext == ".gif":
+                        gif_converter._copy_as_gif(store, dest)
+                    else:
+                        shutil.copy2(store, dest)
+                    h = self._file_md5(dest)
+                finally:
+                    # Always clean the temp gif even when the copy or hash
+                    # failed (a failed _copy_as_gif leaves gm_conv_*.gif
+                    # behind in %TEMP% otherwise) / 复制或哈希失败时也清理
+                    # 临时 gif（否则 _copy_as_gif 失败会在 %TEMP% 残留
+                    # gm_conv_*.gif）
+                    if store != src:
+                        try:
+                            os.remove(store)
+                        except OSError:
+                            pass
             except OSError:
                 return None
             return {"dest": dest, "hash": h, "src_hash": src_hash,
@@ -631,9 +751,18 @@ class DataManager:
             " g.name AS gname FROM emojis e JOIN groups g ON e.group_id=g.id"
             " WHERE g.type='image' AND e.filename != ''"
         ).fetchall()
-        pending = [dict(r) for r in rows
-                   if gif_converter.needs_conversion(os.path.join(
-                       self._emojis_dir, r["gname"], r["filename"]))]
+        # Pending = non-gif files (jpg/png -> gif) plus oversized gifs
+        # (downscaled so chat apps paste them as pictures). / 待处理 = 非 gif
+        # 文件（jpg/png 转 gif）+ 超大 gif（降采样，聊天软件才能粘贴为图片）。
+        pending = []
+        for r in rows:
+            fp = os.path.join(self._emojis_dir, r["gname"], r["filename"])
+            if gif_converter.needs_conversion(fp):
+                pending.append(dict(r))
+            elif gif_converter._content_kind(fp) == "gif":
+                dims = gif_converter._image_dimensions(fp)
+                if dims and max(dims) > gif_converter.MAX_GIF_DIM:
+                    pending.append(dict(r))
         total = len(pending)
 
         # Convert in worker threads (ffmpeg/Pillow are pure file IO); the DB
@@ -646,7 +775,14 @@ class DataManager:
             src = os.path.join(self._emojis_dir, em["gname"], em["filename"])
             dst = os.path.join(self._emojis_dir, em["gname"],
                                f"{uuid.uuid4().hex[:8]}.gif")
-            if not gif_converter.convert_to_gif(src, dst):
+            if gif_converter._content_kind(src) == "gif":
+                # Oversized gif -> downscale only (keeps animation) /
+                # 超大 gif → 仅降采样（保留动画）
+                ok = gif_converter.downscale_gif_if_needed(src, dst)
+            else:
+                ok = gif_converter.convert_to_gif(src, dst)
+            if not ok:
+                log.warning("convert_library: convert/downscale failed for %s", src)
                 return (em, None)
             try:
                 h = self._file_md5(dst)
@@ -784,26 +920,45 @@ class DataManager:
             return False
         if em["filename"] and target["type"] != "image":
             return False
+        new_filename = em["filename"]
         if em["filename"]:
             src_group = self.get_group(em["group_id"])
             if src_group:
                 src_path = os.path.join(self._emojis_dir, src_group["name"], em["filename"])
                 dst_dir = os.path.join(self._emojis_dir, target["name"])
                 os.makedirs(dst_dir, exist_ok=True)
+                # Avoid silent overwrite ... / 避免静默覆盖...
                 dst_path = os.path.join(dst_dir, em["filename"])
+                if os.path.exists(dst_path):
+                    base, ext = os.path.splitext(em["filename"])
+                    i = 1
+                    while True:
+                        cand = os.path.join(dst_dir, f"{base}_{i}{ext}")
+                        if not os.path.exists(cand):
+                            dst_path = cand
+                            break
+                        i += 1
                 if os.path.isfile(src_path):
-                    shutil.move(src_path, dst_path)
+                    try:
+                        shutil.move(src_path, dst_path)
+                    except OSError:
+                        self._last_move_error = "locked"
+                        return False
+                new_filename = os.path.basename(dst_path)
         # Reset the column state: the moved card must not keep the source
         # group's col_index/sort_order (that created orphan columns / number
         # gaps in the target group). Mark it unassigned so the target group's
-        # assign_unassigned_columns / _redistribute places it fresh.
+        # assign_unassigned_columns / _redistribute places it fresh. Also
+        # sync the filename when a unique name was used.
         # 重置列状态：被移动的卡不得保留源组的 col_index/sort_order
         # （否则目标组会出现孤列/列号空洞）。标记为未分配，由目标组的
-        # assign_unassigned_columns / _redistribute 重新分配。
+        # assign_unassigned_columns / _redistribute 重新分配。使用唯一名时
+        # 同步 filename。
+        new_filename = os.path.basename(dst_path) if em["filename"] else em["filename"]
         self._conn.execute(
-            "UPDATE emojis SET group_id=?, col_index=0, sort_order=0,"
+            "UPDATE emojis SET group_id=?, filename=?, col_index=0, sort_order=0,"
             " user_sorted=0 WHERE id=?",
-            (target_group_id, emoji_id),
+            (target_group_id, new_filename, emoji_id),
         )
         self._conn.commit()
         # Text groups: compact column numbers so no hole remains / 文字分组：
@@ -1089,9 +1244,25 @@ class DataManager:
         if not filepath or not os.path.isfile(filepath):
             return False
 
+        # Oversized gifs (e.g. a 1920x1920 2MB single-frame gif) are often
+        # NOT recognized by chat apps when pasted — they fall back to a file
+        # attachment. Downscale such gifs to a temp copy so the paste is
+        # recognized as a picture; the temp file is cleaned up shortly after.
+        # 超大 gif（如 1920x1920、2MB 的单帧 gif）粘贴时常不被聊天软件识别
+        # 为图片——退化为文件附件。发送时将其降采样为临时副本，保证粘贴
+        # 识别为图片；临时文件稍后自动清理。
+        send_path = filepath
+        if self._is_oversized_gif(filepath):
+            send_path = self._downscaled_send_copy(filepath)
+            if send_path is None:
+                log.warning(
+                    "copy_to_clipboard: downscaled send copy failed for %s, "
+                    "use original", filepath)
+                send_path = filepath
+
         if mode == 0:
             mime = QMimeData()
-            mime.setUrls([QUrl.fromLocalFile(filepath)])
+            mime.setUrls([QUrl.fromLocalFile(send_path)])
             clipboard.setMimeData(mime)
         else:
             # GIF must keep animation: QImage decodes only the first frame,
@@ -1102,24 +1273,99 @@ class DataManager:
             # mime，供微信/QQ 识别为动图；同时附带文件路径增强兼容。
             is_gif = False
             try:
-                with open(filepath, "rb") as f:
+                with open(send_path, "rb") as f:
                     is_gif = f.read(4) == b"GIF8"
-            except OSError:
-                pass
+            except OSError as exc:
+                log.warning("copy_to_clipboard: cannot read %s -> %s", send_path, exc)
             if is_gif:
+                # Put the raw GIF bytes into image/gif for apps that
+                # understand it (keeps the animation), PLUS a standard
+                # bitmap (QImage -> CF_DIB) so WeChat/QQ always recognize
+                # the paste as a picture — image/gif alone is NOT a standard
+                # clipboard format and chat apps ignore it, falling back to
+                # the file URL and sending a file attachment. The bitmap
+                # shows the first frame; apps that support image/gif still
+                # get the animated version.
+                # 原始 GIF 字节放入 image/gif（保留动画，供能识别的程序用），
+                # 同时放入标准位图（QImage → CF_DIB）——微信/QQ 必能识别为
+                # 图片。仅 image/gif 不是标准剪贴板格式，聊天软件会忽略它，
+                # 退回按文件路径发送附件。位图显示首帧；支持 image/gif 的
+                # 程序仍可获得动图。
                 mime = QMimeData()
                 try:
-                    with open(filepath, "rb") as f:
+                    with open(send_path, "rb") as f:
                         mime.setData("image/gif", f.read())
-                except OSError:
+                except OSError as exc:
+                    log.warning("copy_to_clipboard: read image/gif bytes failed "
+                                "for %s -> %s", send_path, exc)
                     return False
-                mime.setUrls([QUrl.fromLocalFile(filepath)])
+                frame = QImage(send_path)
+                if not frame.isNull():
+                    mime.setImageData(frame)
+                else:
+                    log.warning("copy_to_clipboard: QImage cannot decode %s "
+                                "(bitmap fallback skipped)", send_path)
+                mime.setUrls([QUrl.fromLocalFile(send_path)])
                 clipboard.setMimeData(mime)
             else:
-                img = QImage(filepath)
+                img = QImage(send_path)
                 if img.isNull():
+                    log.warning("copy_to_clipboard: QImage cannot decode %s "
+                                "(mode=%s)", send_path, mode)
                     return False
                 clipboard.setImage(img)
 
         return True
+
+    # True when the file is a gif whose larger side exceeds MAX_GIF_DIM,
+    # i.e. likely to be pasted as a file attachment by chat apps.
+    # 文件是 gif 且较长边超过 MAX_GIF_DIM（聊天软件大概率将其粘贴为文件
+    # 附件）时返回 True。
+    def _is_oversized_gif(self, filepath):
+        try:
+            with open(filepath, "rb") as f:
+                if f.read(4) != b"GIF8":
+                    return False
+        except OSError as exc:
+            log.warning("is_oversized_gif: cannot read %s -> %s", filepath, exc)
+            return False
+        dims = gif_converter._image_dimensions(filepath)
+        if dims is None:
+            log.warning("is_oversized_gif: cannot read dimensions of %s", filepath)
+            return False
+        return max(dims) > gif_converter.MAX_GIF_DIM
+
+    # Write a downscaled temp gif for clipboard use, or None on failure.
+    # The temp file is removed after a delay so the pasted path stays valid.
+    # 为剪贴板生成降采样临时 gif，失败返回 None。临时文件延迟删除，
+    # 保证粘贴时路径仍然有效。
+    def _downscaled_send_copy(self, filepath):
+        try:
+            fd, tmp = tempfile.mkstemp(suffix=".gif", prefix="gm_send_")
+            os.close(fd)
+        except OSError as exc:
+            log.warning("downscaled_send_copy: mkstemp failed -> %s", exc)
+            return None
+        if not gif_converter.downscale_gif_if_needed(filepath, tmp):
+            log.warning("downscaled_send_copy: downscale failed for %s", filepath)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return None
+        self._pending_send_temps.add(tmp)
+        # Keep the temp copy long enough for the user to switch to the chat
+        # app and paste (10 min); the OS temp dir is cleaned by the system
+        # anyway. / 临时副本保留足够长的时间供用户切到聊天软件粘贴（10 分钟）；
+        # 系统本就会清理临时目录。
+        QTimer.singleShot(600000, lambda p=tmp: self._cleanup_send_temp(p))
+        return tmp
+
+    # Delete a temp send copy (best-effort) / 删除发送用临时副本（尽力而为）
+    def _cleanup_send_temp(self, path):
+        self._pending_send_temps.discard(path)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 

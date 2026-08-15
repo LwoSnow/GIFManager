@@ -29,11 +29,6 @@ QWidget#mainToolbar {
     border-bottom: 1px solid #333333;
 }
 
-/* ========== 自定义标题栏 ========== */
-QWidget#titleBar {
-    background-color: rgba(30, 30, 30, 200);
-}
-
 /* ========== 搜索栏 ========== */
 QLineEdit {
     background-color: #2B2B2B;
@@ -202,6 +197,34 @@ QLabel#nameLabel {
     color: #999999;
     font-size: 10px;
     background: transparent;
+}
+QLabel#checkBadge {
+    color: #FFFFFF;
+    font-size: 12px;
+    font-weight: bold;
+    background-color: #1677FF;
+    border: 1px solid #FFFFFF;
+    border-radius: 9px;
+}
+QLabel#editCount {
+    color: #BBBBBB;
+    font-size: 11px;
+    background: transparent;
+}
+QPushButton#editToolBtn {
+    color: #DDDDDD;
+    background-color: #3A3A3A;
+    border: 1px solid #4A4A4A;
+    border-radius: 4px;
+    padding: 3px 10px;
+    font-size: 11px;
+}
+QPushButton#editToolBtn:hover {
+    background-color: #4A4A4A;
+}
+QPushButton#editToolBtn:disabled {
+    color: #666666;
+    background-color: #2A2A2A;
 }
 
 /* ========== 分组标签按钮 ========== */

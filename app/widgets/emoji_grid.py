@@ -271,6 +271,8 @@ class EmojiGridWidget(QWidget):
     emoji_clicked = Signal(dict)
     emoji_right_clicked = Signal(dict, QPoint)
     emojis_reordered = Signal()
+    selection_changed = Signal(int)  # number of selected items / 选中数量
+    edit_mode_changed = Signal(bool)  # multi-select mode entered/left / 多选模式进入/退出
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -281,6 +283,9 @@ class EmojiGridWidget(QWidget):
         self._preview_limits = (100, 200)
         self._layout_cache = None  # masonry layout cache (width, data id) / masonry 布局缓存
         self._all_cache = None     # All-view grid cache / All 视图网格缓存
+        # Multi-select edit mode / 多选编辑模式
+        self._selection_mode = False
+        self._selection = {}  # emoji id str -> emoji dict / 选中的表情
         # Whether image cards show their name (settings "show_emoji_name") /
         # 图片卡是否显示名称（设置"显示表情包名称"）
         self._show_emoji_name = True
@@ -561,8 +566,21 @@ class EmojiGridWidget(QWidget):
                              preview_limits=self._preview_limits,
                              show_name=self._show_emoji_name,
                              hover_zoom=self._hover_zoom,
-                             hover_enabled=self._hover_preview_enabled)
+                             # Disable hover zoom while in edit mode: a zoom
+                             # overlay hides neighboring cards and fights the
+                             # selection badges (previously only cards that
+                             # existed when edit mode started had hover
+                             # disabled; newly created ones re-enabled it).
+                             # 编辑模式下禁用悬停放大：放大浮层会隐藏相邻卡、
+                             # 与勾选角标交互冲突（此前只有进入编辑模式时已
+                             # 存在的卡被禁用，新建的卡会重新启用）。
+                             hover_enabled=(self._hover_preview_enabled
+                                            and not self._selection_mode))
             card.clicked.connect(self._on_card_clicked)
+            card.selection_toggled.connect(self._on_selection_toggled)
+            card.set_selection_mode(self._selection_mode)
+            if self._selection_mode and str(em.get("id", "")) in self._selection:
+                card.set_checked(True)
             self._items.append(card)
             self._flow.addWidget(card)
             self._index_add(card)
@@ -743,6 +761,9 @@ class EmojiGridWidget(QWidget):
         self._thumb_index = {}
         for card in self._items:
             self._index_add(card)
+        # Re-apply multi-select mode to recycled/rebuilt cards /
+        # 对回收/重建的卡片重新应用多选模式
+        self._sync_selection_mode_on_rebuild()
 
         if self.current_group_id is not None:
             QTimer.singleShot(0, self._check_column_merge)
@@ -801,6 +822,74 @@ class EmojiGridWidget(QWidget):
 
     def _on_card_clicked(self, emoji):
         self.emoji_clicked.emit(emoji)
+
+    # --- Multi-select edit mode / 多选编辑模式 ---
+
+    def enter_edit_mode(self):
+        # Enter multi-select edit mode: all visible cards show a check
+        # badge; clicks toggle selection instead of sending. Hover zoom is
+        # disabled so it does not fight the check interactions.
+        # 进入多选编辑模式：所有可见卡片显示勾选角标；点击切换选中而非发送。
+        # 停用悬停放大，避免与勾选交互冲突。
+        if self._selection_mode:
+            return
+        self._selection_mode = True
+        self._selection.clear()
+        for card in self._items:
+            card.set_selection_mode(True)
+            card._hover_enabled = False
+            card._hide_hover_zoom()
+        self.edit_mode_changed.emit(True)
+        self.selection_changed.emit(0)
+
+    def exit_edit_mode(self):
+        # Leave multi-select edit mode and clear the selection; restore
+        # hover preview / 退出多选编辑模式并清空选择；恢复悬停预览
+        if not self._selection_mode:
+            return
+        self._selection_mode = False
+        self._selection.clear()
+        for card in self._items:
+            card.set_selection_mode(False)
+            card._hover_enabled = self._hover_preview_enabled
+        self.edit_mode_changed.emit(False)
+        self.selection_changed.emit(0)
+
+    def in_edit_mode(self):
+        return self._selection_mode
+
+    def selected_emojis(self):
+        # List of selected emoji dicts (stable by id) / 选中的表情列表（按 id 稳定排序）
+        return [self._selection[k] for k in sorted(self._selection)]
+
+    def selection_count(self):
+        return len(self._selection)
+
+    def _on_selection_toggled(self, emoji_id, checked):
+        # Update the selection map from a card's toggle signal / 由卡片信号
+        # 更新选中集合
+        if not self._selection_mode:
+            return
+        if checked:
+            # Store the emoji dict from the current data / 从当前数据取表情
+            for em in self._data:
+                if str(em.get("id", "")) == emoji_id:
+                    self._selection[emoji_id] = em
+                    break
+        else:
+            self._selection.pop(emoji_id, None)
+        self.selection_changed.emit(len(self._selection))
+
+    def _sync_selection_mode_on_rebuild(self):
+        # Re-apply selection mode to cards after a rebuild (recycled cards
+        # are recreated without the flag) / 重建后重新应用多选模式（回收重
+        # 建的卡片不带该标志）
+        if self._selection_mode:
+            for card in self._items:
+                card.set_selection_mode(True)
+                card._hover_enabled = False
+                if str(card._emoji.get("id", "")) in self._selection:
+                    card.set_checked(True)
 
     def contextMenuEvent(self, event):
         pos = event.globalPos()

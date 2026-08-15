@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import ctypes
+import warnings
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
     QPushButton, QMenu, QScrollArea, QFrame, QLabel,
@@ -76,11 +77,17 @@ class MainWindow(QMainWindow):
         self.resize(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
         self.setMinimumSize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
         self.setAcceptDrops(True)
-        # Tool flag keeps the window out of the taskbar (tray-only UI) /
-        # Tool 标志使窗口不显示在任务栏（仅托盘图标）
+        # Tool flag keeps the window out of the taskbar (tray-only UI);
+        # StaysOnTopHint keeps it visible above the chat window; combined
+        # with WA_ShowWithoutActivating it never steals focus on show.
+        # Tool 标志使窗口不显示在任务栏（仅托盘图标）；StaysOnTopHint 保持
+        # 窗口在聊天窗口之上；配合 WA_ShowWithoutActivating，显示时不抢焦点。
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
+            | Qt.WindowType.WindowStaysOnTopHint
         )
+        self.setAttribute(
+            Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
 
         icon_path = os.path.join(_root_dir(), "icon.ico")
         if os.path.isfile(icon_path):
@@ -110,6 +117,7 @@ class MainWindow(QMainWindow):
         self._setup_tray()
         self._init_hotkey_mgr()
         self._apply_thread_count()
+        self._install_no_activate_filter()
 
         self._restore_geometry()
 
@@ -164,6 +172,9 @@ class MainWindow(QMainWindow):
         # Master switch for the hover preview / 悬停预览总开关
         self._hover_preview_enabled = self._settings.value(
             "hover_preview_enabled", True, type=bool)
+        # Click an emoji -> auto-type (Ctrl+V) into the focused chat input /
+        # 点击表情 → 自动输入（Ctrl+V）到焦点聊天输入框
+        self._auto_input = self._settings.value("auto_input", True, type=bool)
         lang = self._settings.value("language", "zh_CN")
         try:
             set_language(lang)
@@ -188,6 +199,22 @@ class MainWindow(QMainWindow):
             # 机器上偏少）
             self.emoji_grid._gif_limit = max(8, n * 4)
 
+    def _install_no_activate_filter(self):
+        # Start the focus guard: clicking this window must never steal focus
+        # from the chat input — the auto-input feature pastes (Ctrl+V) into
+        # the window that still owns focus. The guard tracks "the last
+        # non-manager foreground window" and hands focus back whenever the
+        # manager gets activated by a click.
+        # 启动焦点守卫：点击本窗口不得夺走聊天输入框焦点——自动输入功能向
+        # 仍持有焦点的窗口粘贴（Ctrl+V）。守卫跟踪"最近一个非管理器的前台
+        # 窗口"，管理器被点击激活时立即归还焦点。
+        try:
+            from app.utils.input_sender import FocusGuard
+            self._focus_guard = FocusGuard(int(self.winId()))
+            self._focus_guard.start()
+        except Exception:
+            self._log.exception("Install focus guard failed")
+
     def _save_settings(self):
         self._settings.setValue("send_mode", self._send_mode)
         self._settings.setValue("remember_group", self._remember_group)
@@ -205,6 +232,7 @@ class MainWindow(QMainWindow):
         self._settings.setValue("show_emoji_name", self._show_emoji_name)
         self._settings.setValue("hover_zoom", self._hover_zoom)
         self._settings.setValue("hover_preview_enabled", self._hover_preview_enabled)
+        self._settings.setValue("auto_input", self._auto_input)
         self._settings.setValue("language", current_language())
 
     def _restore_geometry(self):
@@ -277,6 +305,13 @@ class MainWindow(QMainWindow):
         super().showEvent(event)
         self._apply_rounded()
         QTimer.singleShot(200, self._register_hotkey_if_needed)
+        # Keep the focus guard's manager handle in sync / 同步焦点守卫的
+        # 管理器句柄
+        try:
+            if getattr(self, "_focus_guard", None) is not None:
+                self._focus_guard.set_manager(int(self.winId()))
+        except Exception:
+            pass
 
     def _apply_rounded(self):
         if sys.platform != "win32":
@@ -347,7 +382,217 @@ class MainWindow(QMainWindow):
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
+        self._build_edit_toolbar()
         self._refresh_status()
+
+    def _build_edit_toolbar(self):
+        # Multi-select edit toolbar, shown in the status bar while edit mode
+        # is active: delete selected, move selected to another group of the
+        # same type, exit. / 多选编辑操作栏：多选模式下显示在状态栏：删除
+        # 所选、移动到同类型分组、退出。
+        from PySide6.QtWidgets import QHBoxLayout, QPushButton, QWidget
+        bar = QWidget(self)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(4, 0, 4, 0)
+        lay.setSpacing(6)
+        self._edit_count_label = QLabel("0")
+        self._edit_count_label.setObjectName("editCount")
+        lay.addWidget(self._edit_count_label)
+        self._btn_edit_select_all = QPushButton(tr("edit_select_all"))
+        self._btn_edit_select_all.setObjectName("editToolBtn")
+        self._btn_edit_select_all.clicked.connect(self._edit_select_all)
+        lay.addWidget(self._btn_edit_select_all)
+        self._btn_edit_delete = QPushButton(tr("edit_delete"))
+        self._btn_edit_delete.setObjectName("editToolBtn")
+        self._btn_edit_delete.clicked.connect(self._edit_delete_selected)
+        lay.addWidget(self._btn_edit_delete)
+        self._edit_move_btn = QPushButton(tr("edit_move"))
+        self._edit_move_btn.setObjectName("editToolBtn")
+        lay.addWidget(self._edit_move_btn)
+        self._btn_edit_exit = QPushButton(tr("edit_exit"))
+        self._btn_edit_exit.setObjectName("editToolBtn")
+        self._btn_edit_exit.clicked.connect(self._exit_edit_mode)
+        lay.addWidget(self._btn_edit_exit)
+        bar.hide()
+        self._edit_bar = bar
+        self.status_bar.addPermanentWidget(bar)
+
+    def _enter_edit_mode(self):
+        # Enter multi-select edit mode on the grid / 让网格进入多选编辑模式
+        self.emoji_grid.enter_edit_mode()
+
+    def _exit_edit_mode(self):
+        self.emoji_grid.exit_edit_mode()
+
+    def _on_edit_mode_changed(self, enabled):
+        # Show/hide the edit toolbar and stop hover previews while editing /
+        # 显示/隐藏编辑操作栏；编辑期间停用悬停预览
+        self._edit_bar.setVisible(bool(enabled))
+        if not enabled:
+            self._refresh_status()
+        else:
+            self._update_edit_count(0)
+
+    def _on_selection_count_changed(self, count):
+        self._update_edit_count(count)
+
+    def _update_edit_count(self, count):
+        self._edit_count_label.setText(tr("edit_selected", count=count))
+        # Only enable the move submenu when at least one item is selected /
+        # 至少选中一项时才允许移动
+        has = count > 0
+        self._btn_edit_delete.setEnabled(has)
+        self._edit_move_btn.setEnabled(has)
+        # Rebuild the move targets filtered by the selection's type /
+        # 按所选内容的类型重建移动目标
+        self._rebuild_edit_move_menu()
+
+    def _rebuild_edit_move_menu(self):
+        # Move targets must match the type of the selected items (image
+        # groups only for images, text groups only for text) so the two
+        # kinds never mix. / 移动目标必须与所选内容的类型一致（图片只能进
+        # 图片分组、文字只能进文字分组），两类互不串组。
+        # Disconnect the previous slot; a fresh click connection is created
+        # below. The RuntimeWarning from disconnect() on an unconnected
+        # signal is suppressed (it is benign). / 断开旧槽，下方新建点击连接。
+        # disconnect() 对未连接的信号会打 RuntimeWarning，属良性，忽略之。
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            try:
+                self._edit_move_btn.clicked.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+        selected = self.emoji_grid.selected_emojis()
+        if not selected:
+            self._edit_move_btn.clicked.connect(self._noop_move)
+            return
+        is_text = all(bool(e.get("text_content")) for e in selected)
+        groups = self.data_manager.get_all_groups()
+        all_id = self.data_manager._all_group_id()
+        cur_gid = self.current_group_id
+        targets = [
+            g for g in groups
+            if g["id"] != all_id
+            and g["id"] != cur_gid
+            and g["type"] == ("text" if is_text else "image")
+        ]
+        if not targets:
+            self._edit_move_btn.clicked.connect(self._noop_move)
+            return
+        menu = QMenu(self)
+        for g in targets:
+            menu.addAction(g["name"]).triggered.connect(
+                lambda checked, gid=g["id"]: self._edit_move_selected(gid)
+            )
+        self._edit_move_btn.clicked.connect(
+            lambda: menu.exec(self._edit_move_btn.mapToGlobal(
+                self._edit_move_btn.rect().bottomLeft())))
+
+    def _noop_move(self):
+        pass
+
+    def _edit_select_all(self):
+        # Select (or clear) every item in the current DATA set, not just the
+        # lazily-created visible cards: _items is only the visible band, so
+        # selecting by _items would silently select a subset on large
+        # libraries, and the toggle check would misbehave after cards were
+        # recycled. / 按当前数据集全选（或清空），而非仅懒加载可见卡：
+        # _items 只是可视区子集，按 _items 全选在大图库下会静默只选子集，
+        # 且卡片被回收后切换判定会失效。
+        grid = self.emoji_grid
+        if not grid.in_edit_mode():
+            return
+        data = grid._data
+        if not data:
+            return
+        if grid.selection_count() >= len(data):
+            target = False
+        else:
+            target = True
+        for em in data:
+            card = None
+            for c in grid._items:
+                if str(c._emoji.get("id", "")) == str(em.get("id", "")):
+                    card = c
+                    break
+            if card is not None:
+                card.set_checked(target)
+            else:
+                # Card not materialized yet: update the selection map directly
+                # (the card applies its state when it is created later).
+                # 卡片尚未物化：直接更新选中集合（卡片稍后创建时套用状态）。
+                if target:
+                    grid._selection[str(em.get("id", ""))] = em
+                else:
+                    grid._selection.pop(str(em.get("id", "")), None)
+        grid.selection_changed.emit(grid.selection_count())
+
+    def _edit_move_selected(self, target_group_id):
+        # Move all selected emojis to a same-type group / 把所选表情全部
+        # 移到同类型分组
+        selected = self.emoji_grid.selected_emojis()
+        if not selected:
+            return
+        # Detach QMovie file handles first: Windows cannot move a GIF while
+        # it is being played (same requirement as group rename/delete).
+        # 先分离 QMovie 文件句柄：GIF 播放中 Windows 无法移动文件
+        # （与分组改名/删除的要求一致）。
+        self.emoji_grid.release_gif_handles()
+        moved = 0
+        failed = 0
+        for em in selected:
+            try:
+                if self.data_manager.move_emoji(em["id"], target_group_id):
+                    moved += 1
+                else:
+                    failed += 1
+            except OSError:
+                failed += 1
+                self._log.exception("Edit move failed for id=%s", em.get("id"))
+        self._log.info("Edit move -> count=%s target=%s", moved, target_group_id)
+        self._exit_edit_mode()
+        self._refresh_emoji_grid()
+        self._refresh_status()
+        if moved:
+            self.status_bar.showMessage(
+                f"  ✓ {tr('edit_moved', count=moved)}", 2500)
+        if failed:
+            self.status_bar.showMessage(
+                f"  ⚠ {tr('edit_move_failed', count=failed)}", 4000)
+
+    def _edit_delete_selected(self):
+        # Delete all selected emojis after confirmation / 确认后删除全部所选
+        selected = self.emoji_grid.selected_emojis()
+        if not selected:
+            return
+        reply = QMessageBox.question(
+            self, tr("confirm_delete"),
+            tr("edit_delete_confirm", count=len(selected)),
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        # Detach QMovie file handles first: Windows cannot delete a GIF
+        # while it is being played (same requirement as group delete).
+        # 先分离 QMovie 文件句柄：GIF 播放中 Windows 无法删除文件
+        # （与分组删除的要求一致）。
+        self.emoji_grid.release_gif_handles()
+        failed = 0
+        for em in selected:
+            try:
+                self.data_manager.delete_emoji(em["id"])
+            except Exception:
+                failed += 1
+                self._log.exception("Edit delete failed for id=%s", em.get("id"))
+        self._log.info("Edit delete -> count=%s", len(selected) - failed)
+        self._exit_edit_mode()
+        self._refresh_emoji_grid()
+        self._refresh_status()
+        if failed:
+            self.status_bar.showMessage(
+                f"  ⚠ {tr('edit_delete_failed', count=failed)}", 4000)
+        else:
+            self.status_bar.showMessage(
+                f"  ✓ {tr('edit_deleted', count=len(selected))}", 2500)
 
     def _build_import_menu(self):
         menu = QMenu(self)
@@ -511,6 +756,8 @@ class MainWindow(QMainWindow):
         self.emoji_grid.emoji_clicked.connect(self._on_emoji_clicked)
         self.emoji_grid.emoji_right_clicked.connect(self._on_emoji_right_clicked)
         self.emoji_grid.emojis_reordered.connect(self._refresh_emoji_grid)
+        self.emoji_grid.edit_mode_changed.connect(self._on_edit_mode_changed)
+        self.emoji_grid.selection_changed.connect(self._on_selection_count_changed)
         self.btn_add_text.clicked.connect(self._add_text_emoji)
         # Debounce timer for global freq sort (merge rapid usage) / 频率全局排序防抖定时器
         self._gs_timer = QTimer(self)
@@ -535,6 +782,9 @@ class MainWindow(QMainWindow):
     # Group / 分组
 
     def _on_group_changed(self, group_id):
+        # Leave multi-select edit mode when switching groups (selection is
+        # per-group) / 切换分组时退出多选编辑模式（选择是按分组的）
+        self.emoji_grid.exit_edit_mode()
         # "All" is a virtual aggregation group: its database id is
         # equivalent to "No group selected" (identified by the builtin flag,
         # so it keeps working after renaming).
@@ -723,17 +973,49 @@ class MainWindow(QMainWindow):
                 dlg.setValue(i)
                 dlg.setLabelText(tr("converting_file", name=os.path.basename(f)))
                 QApplication.processEvents()
-                if gif_converter.needs_conversion(f):
+                if gif_converter.needs_gif_conversion(f):
+                    # Non-GIF content (animated or static) -> convert to gif;
+                    # oversized results are downscaled inside the converter
+                    # so chat apps still recognize them as pictures.
+                    # 非 GIF 内容（动画或静态）→ 转 gif；超大结果在转换器内
+                    # 降采样，聊天软件仍能识别为图片。
                     tmp = os.path.join(
                         tempfile.gettempdir(), f"gm_conv_{os.urandom(4).hex()}.gif")
                     if gif_converter.convert_to_gif(f, tmp):
                         ready.append(tmp)
                         converted_n += 1
                     else:
-                        ready.append(f)  # failed -> keep original format / 失败保持原格式
+                        # failed -> keep original format / 失败保持原格式
+                        self._log.warning(
+                            "import_progress: convert_to_gif failed for %s, "
+                            "store original", f)
+                        ready.append(f)
                         fail_n += 1
                 else:
-                    ready.append(f)
+                    # Genuine GIF: copy as-is unless oversized — downscale it
+                    # here so chat apps paste it as a picture, not a file
+                    # attachment (animation kept). / 真 GIF：除非超大否则原样
+                    # 复制——超大则在此降采样，聊天软件才能粘贴为图片而非
+                    # 文件附件（保留动画）。
+                    dims = gif_converter._image_dimensions(f)
+                    if dims and max(dims) > gif_converter.MAX_GIF_DIM:
+                        tmp = os.path.join(
+                            tempfile.gettempdir(),
+                            f"gm_conv_{os.urandom(4).hex()}.gif")
+                        if gif_converter.downscale_gif_if_needed(f, tmp):
+                            ready.append(tmp)
+                        else:
+                            self._log.warning(
+                                "import_progress: downscale oversized gif failed "
+                                "for %s (dims=%s), store original", f, dims)
+                            ready.append(f)
+                    elif dims is None:
+                        self._log.warning(
+                            "import_progress: cannot read dimensions of %s, "
+                            "store original", f)
+                        ready.append(f)
+                    else:
+                        ready.append(f)
             dlg.setValue(len(files))
             if ready:
                 imported, duplicated = self.data_manager.import_emojis_batch(
@@ -852,6 +1134,13 @@ class MainWindow(QMainWindow):
             self._do_import(files)
 
     def keyPressEvent(self, event: QKeyEvent):
+        # Ctrl+A in multi-select edit mode selects all / clears selection /
+        # 多选编辑模式下 Ctrl+A 全选/取消全选
+        if self.emoji_grid.in_edit_mode() and event.key() == Qt.Key.Key_A \
+                and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self._edit_select_all()
+            event.accept()
+            return
         if event.matches(QKeySequence.StandardKey.Paste):
             if self.current_group_id is not None:
                 g = self.data_manager.get_group(self.current_group_id)
@@ -897,12 +1186,66 @@ class MainWindow(QMainWindow):
             name = emoji.get("original_name") or emoji.get("text_content", "emoji")
             mode_label = tr("copied_path") if self._send_mode == 0 else tr("copied_image")
             self.status_bar.showMessage(f"  ✓ {tr('copied_msg', mode=mode_label, name=name)}", 2000)
+            # Auto-type into the chat input. The focus guard keeps focus on
+            # the chat window even while clicking emojis here, so Ctrl+V
+            # pastes straight into the still-focused input. / 自动输入到聊天
+            # 输入框。焦点守卫保证点击表情时焦点仍在聊天窗口，Ctrl+V 直接
+            # 粘贴进仍持有焦点的输入框。
+            if self._auto_input:
+                self._auto_input_paste(emoji)
         # Global freq sort: debounced re-sort on usage / 全局频率排序：使用时防抖重排
         if self._gs_enabled and self._gs_by == "freq":
             gid = emoji.get("group_id")
             if gid is not None and success:
                 self._gs_pending_group = gid
                 self._gs_timer.start()
+
+    def _auto_input_paste(self, emoji):
+        guard = getattr(self, "_focus_guard", None)
+        try:
+            from app.utils.input_sender import (
+                paste_to_window, paste_to_foreground, foreground_window,
+                bring_to_front,
+            )
+            import time
+            # The tracker remembered the chat window (the last foreground
+            # window that was not the manager). Hand focus back to it once
+            # and paste. This happens only on an emoji click, so normal
+            # interaction (search, settings, right-click) is never disturbed.
+            # 跟踪器记住了聊天窗口（最近一个非管理器的前台窗口）。点击表情
+            # 时一次性把焦点归还给它并粘贴。仅在点击表情时发生，因此正常
+            # 交互（搜索、设置、右键）不受干扰。
+            target = guard.target() if guard is not None else 0
+            me = int(self.winId()) if self.winId() else 0
+            ok = False
+            if target and target != me:
+                # Bring the chat window to the front, then paste into it /
+                # 把聊天窗口带回前台，然后粘贴进去
+                for _ in range(10):  # up to ~0.3 s / 最多约 0.3 秒
+                    if foreground_window() == target:
+                        break
+                    bring_to_front(target)
+                    time.sleep(0.03)
+                    try:
+                        from PySide6.QtCore import QCoreApplication
+                        QCoreApplication.processEvents()
+                    except Exception:
+                        pass
+                time.sleep(0.1)  # let the target restore its input focus / 让目标恢复输入焦点
+                ok = paste_to_window(target, delay_ms=30)
+            if not ok:
+                # Foreground Ctrl+V via SendInput (Qt WeChat needs keyboard
+                # input) / 向前台 SendInput Ctrl+V（Qt 微信需要键盘输入）
+                ok = paste_to_foreground(delay_ms=60)
+            if ok:
+                self._log.info("Auto-input pasted emoji id=%s target=%s",
+                               emoji.get("id"), target)
+            else:
+                self._log.warning(
+                    "Auto-input failed to send keys for emoji id=%s",
+                    emoji.get("id"))
+        except Exception:
+            self._log.exception("Auto-input paste failed")
 
     # Global sorting mode / 全局排序模式
     def _apply_global_sort(self, group_id):
@@ -979,6 +1322,10 @@ class MainWindow(QMainWindow):
 
     def _on_emoji_right_clicked(self, emoji, pos):
         menu = QMenu(self)
+        # Multi-select edit mode entry: edit several emojis/text at once /
+        # 多选编辑入口：同时对多个表情包/文字操作
+        menu.addAction(tr("edit_mode")).triggered.connect(self._enter_edit_mode)
+        menu.addSeparator()
         menu.addAction(tr("send_copy")).triggered.connect(lambda: self._on_emoji_clicked(emoji))
         menu.addSeparator()
         if emoji.get("text_content"):
@@ -1089,6 +1436,7 @@ class MainWindow(QMainWindow):
             show_emoji_name=self._show_emoji_name,
             hover_zoom=self._hover_zoom,
             hover_preview_enabled=self._hover_preview_enabled,
+            auto_input=self._auto_input,
             data_manager=self.data_manager,
             hotkey_desc=self._hotkey_desc(),
             parent=self,
@@ -1146,6 +1494,10 @@ class MainWindow(QMainWindow):
         # Auto-convert setting may change without closing the dialog / 自动转换开关可能在对话框内直接变化
         self._auto_convert_gif = dlg.auto_convert_gif()
         self._auto_update = dlg.auto_update()
+        # Click-emoji auto-input switch / 点击表情自动输入开关
+        self._auto_input = dlg.auto_input()
+        if getattr(self, "_focus_guard", None) is not None:
+            self._focus_guard.set_enabled(self._auto_input)
         # Show/hide the emoji name: pass it to the grid so rebuilt cards
         # (and the layout heights) use the new setting / 显示/隐藏表情包名称：
         # 传给网格，重建的卡片与布局高度使用新设置

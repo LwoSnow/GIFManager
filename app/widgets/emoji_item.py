@@ -79,6 +79,7 @@ _loader = _ThumbLoader()
 class EmojiItem(QFrame):
 
     clicked = Signal(dict)  # carries emoji dict / 携带 emoji 字典
+    selection_toggled = Signal(str, bool)  # emoji id str, checked / 表情 id、勾选状态
 
     CARD_SIZE = 100
     THUMB_SIZE = 84
@@ -125,6 +126,10 @@ class EmojiItem(QFrame):
         # GIF-flag result cached after first content check
         # 首次判定后缓存（GIF 内容识别）
         self._is_gif_file = None
+        # Multi-select edit mode state / 多选编辑模式状态
+        self._selection_mode = False
+        self._checked = False
+        self._check_badge = None  # top-left corner badge / 左上角角标
 
         if self._is_text:
             self._build_text_ui()
@@ -416,13 +421,77 @@ class EmojiItem(QFrame):
     # Overridden events — click + drag / 覆盖的事件 — 点击 + 拖拽
     # ------------------------------------------------------------------
 
+    # Multi-select edit mode / 多选编辑模式
+    def set_selection_mode(self, enabled):
+        # Toggle multi-select mode. In this mode a click toggles the check
+        # badge instead of sending the emoji. / 切换多选模式。该模式下点击
+        # 切换勾选角标，而非发送表情。
+        self._selection_mode = bool(enabled)
+        if enabled and self._check_badge is None:
+            self._check_badge = QLabel(self)
+            self._check_badge.setObjectName("checkBadge")
+            self._check_badge.setFixedSize(18, 18)
+            self._check_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._check_badge.move(2, 2)
+            self._check_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._check_badge.raise_()
+        if not enabled:
+            self.set_checked(False)
+        self._update_badge()
+
+    def set_checked(self, checked):
+        # Set the checked state and refresh the corner badge. Emits
+        # selection_toggled only on actual changes. / 设置勾选状态并刷新角标。
+        # 仅在实际变化时发射 selection_toggled。
+        checked = bool(checked)
+        if checked == self._checked:
+            return
+        self._checked = checked
+        self._update_badge()
+        self.selection_toggled.emit(str(self._emoji.get("id", "")), self._checked)
+
+    def is_checked(self):
+        return self._checked
+
+    def _update_badge(self):
+        # Refresh the check badge: an empty grey circle when unselected, a
+        # solid blue circle when selected (mirrors the send-mode radio
+        # buttons). / 刷新勾选角标：未选中为灰色空心圆，选中为蓝色实心圆
+        # （与发送模式单选按钮同款样式）。
+        if self._check_badge is None:
+            return
+        if not self._selection_mode:
+            self._check_badge.hide()
+            return
+        if self._checked:
+            self._check_badge.setStyleSheet(
+                "QLabel { background-color: #1677FF;"
+                " border: 2px solid #1677FF; border-radius: 8px; }")
+        else:
+            self._check_badge.setStyleSheet(
+                "QLabel { background-color: transparent;"
+                " border: 2px solid #8A8A8A; border-radius: 8px; }")
+        self._check_badge.show()
+
     def mousePressEvent(self, event: QMouseEvent):
+        if self._selection_mode:
+            # In multi-select mode any click toggles the check state; no
+            # drag/send is started. / 多选模式下任意点击切换勾选；不启动拖拽
+            # 或发送。
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.set_checked(not self._checked)
+                event.accept()
+                return
         if event.button() == Qt.MouseButton.LeftButton:
             self._press_pos = event.position().toPoint()
             self._dragging = False
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent):
+        if self._selection_mode:
+            # No drag while multi-selecting / 多选模式下不启动拖拽
+            event.accept()
+            return
         if (event.buttons() & Qt.MouseButton.LeftButton) and self._press_pos is not None:
             if (event.position().toPoint() - self._press_pos).manhattanLength() > (
                 QApplication.startDragDistance()
@@ -432,6 +501,13 @@ class EmojiItem(QFrame):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
+        if self._selection_mode:
+            # Multi-select mode: the press already toggled the check state.
+            # / 多选模式：按下时已切换勾选状态，这里不再发送。
+            self._dragging = False
+            self._press_pos = None
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton and not self._dragging:
             self.clicked.emit(self._emoji)
         self._dragging = False

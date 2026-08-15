@@ -141,7 +141,7 @@ class SettingsDialog(QDialog):
                  thread_count=0, theme="dark",
                  global_sort_enabled=False, global_sort_by="time", global_sort_desc=False,
                  auto_convert_gif=True, auto_update=False, show_emoji_name=True,
-                 hover_zoom=1.15, hover_preview_enabled=True,
+                 hover_zoom=1.15, hover_preview_enabled=True, auto_input=True,
                  data_manager=None, hotkey_desc="", parent=None):
         super().__init__(parent)
         self.setWindowTitle(tr("settings"))
@@ -176,6 +176,8 @@ class SettingsDialog(QDialog):
         self._hover_zoom = max(1.0, float(hover_zoom))
         # Master switch for the hover preview / 悬停预览总开关
         self._hover_preview_enabled = hover_preview_enabled
+        # Click emoji -> auto-type into the focused chat input / 点击表情自动输入
+        self._auto_input = auto_input
         self._dm = data_manager
         self._hotkey_mods = 0
         self._hotkey_vk = 0
@@ -538,6 +540,19 @@ class SettingsDialog(QDialog):
         send_layout.addLayout(_row(self._rb_image, self._label_image))
         self._page_layout.addWidget(self._send_group)
 
+        # Auto-input group: click emoji -> paste into the focused input /
+        # 自动输入分组：点击表情 → 粘贴到焦点输入框
+        self._auto_input_group = QGroupBox(tr("auto_input_group"))
+        ai_layout = QVBoxLayout(self._auto_input_group)
+        self._cb_auto_input = QCheckBox(tr("auto_input_enable"))
+        self._cb_auto_input.setChecked(self._auto_input)
+        ai_layout.addWidget(self._cb_auto_input)
+        self._ai_hint = QLabel(tr("auto_input_hint"))
+        self._ai_hint.setStyleSheet("color: #888; font-size: 11px;")
+        self._ai_hint.setWordWrap(True)
+        ai_layout.addWidget(self._ai_hint)
+        self._page_layout.addWidget(self._auto_input_group)
+
         # GIF conversion group / GIF 转换分组
         self._conv_group = QGroupBox(tr("gif_conv_group"))
         conv_layout = QVBoxLayout(self._conv_group)
@@ -641,7 +656,8 @@ class SettingsDialog(QDialog):
         self._lbl_update_info.setStyleSheet("font-size: 12px;")
         layout.addWidget(self._lbl_update_info)
 
-        # Download row: button + progress bar / 下载行：按钮 + 进度条
+        # Download row: button + progress bar + cancel button / 下载行：
+        # 按钮 + 进度条 + 取消按钮
         self._btn_download = QPushButton(tr("update_download"))
         self._btn_download.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_download.setEnabled(False)
@@ -649,7 +665,15 @@ class SettingsDialog(QDialog):
         # 仅在确实有更新时显示下载按钮
         self._btn_download.setVisible(False)
         self._btn_download.clicked.connect(self._on_download_update)
-        layout.addWidget(self._btn_download)
+        dl_row = QHBoxLayout()
+        dl_row.addWidget(self._btn_download)
+        self._btn_dl_cancel = QPushButton(tr("update_cancel"))
+        self._btn_dl_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_dl_cancel.setVisible(False)
+        self._btn_dl_cancel.clicked.connect(self._on_cancel_download)
+        dl_row.addWidget(self._btn_dl_cancel)
+        dl_row.addStretch()
+        layout.addLayout(dl_row)
         self._progress = QProgressBar()
         self._progress.setRange(0, 100)
         self._progress.setValue(0)
@@ -715,17 +739,31 @@ class SettingsDialog(QDialog):
                f"{self._latest_version[1]}.{self._latest_version[2]}.exe"
         dest = os.path.join(_download_dir(), name)
         self._btn_download.setEnabled(False)
+        self._btn_dl_cancel.setVisible(True)
         self._progress.setVisible(True)
         self._progress.setValue(0)
         self._info_normal(tr("update_downloading", name=name))
         self._update_mgr.download_update(dest)
 
+    def _on_cancel_download(self):
+        # Abort the in-flight download (single-stream or parallel segments).
+        # The manager cleans up the half-written file via its own paths.
+        # 中止进行中的下载（单流或并行分段）。管理器自身清理半成品文件。
+        self._btn_dl_cancel.setVisible(False)
+        self._btn_dl_cancel.setEnabled(False)
+        self._update_mgr.cancel_download()
+
     def _on_dl_progress(self, received, total):
         if total > 0:
-            self._progress.setValue(int(received * 100 / total))
+            # Clamp to 100: a single progress signal may report slightly
+            # above total on the final chunk. / 钳制到 100：最后一块的单个
+            # 进度信号可能略超总量。
+            self._progress.setValue(min(100, int(received * 100 / total)))
 
     def _on_dl_done(self, ok, path_or_err):
         self._btn_download.setEnabled(True)
+        self._btn_dl_cancel.setVisible(False)
+        self._btn_dl_cancel.setEnabled(True)
         self._progress.setVisible(False)
         if not ok:
             key, _, detail = path_or_err.partition("|")
@@ -735,7 +773,19 @@ class SettingsDialog(QDialog):
             self._info_error(msg)
             return
         self._info_normal(tr("update_downloaded", path=path_or_err))
-        # Auto-launch the installer / 自动运行安装程序
+        # Confirm before launching the installer: the file came from the
+        # network, so auto-executing it without a prompt is a code-injection
+        # surface. / 启动安装程序前确认：文件来自网络，未经确认自动执行是
+        # 代码注入面。
+        from PySide6.QtWidgets import QMessageBox
+        ret = QMessageBox.question(
+            self, tr("update_launch_title"),
+            tr("update_launch_confirm", path=path_or_err),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
         from PySide6.QtCore import QProcess
         if not QProcess.startDetached(path_or_err, []):
             self._info_error(tr("update_launch_fail", path=path_or_err))
@@ -927,6 +977,9 @@ class SettingsDialog(QDialog):
         self._send_group.setTitle(tr("send_mode"))
         self._label_file.setText(tr("send_mode_file"))
         self._label_image.setText(tr("send_mode_image"))
+        self._auto_input_group.setTitle(tr("auto_input_group"))
+        self._cb_auto_input.setText(tr("auto_input_enable"))
+        self._ai_hint.setText(tr("auto_input_hint"))
         self._conv_group.setTitle(tr("gif_conv_group"))
         self._cb_auto_convert.setText(tr("gif_auto_convert"))
         self._conv_hint.setText(tr("gif_auto_convert_hint"))
@@ -997,6 +1050,9 @@ class SettingsDialog(QDialog):
 
     def auto_convert_gif(self):
         return self._auto_convert_gif
+
+    def auto_input(self):
+        return self._cb_auto_input.isChecked()
 
     def auto_update(self):
         return self._auto_update

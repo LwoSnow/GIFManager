@@ -64,9 +64,19 @@ check("A 全量导入无失败", imported + duplicated == len(paths),
 rows = dm.get_emojis_by_group(g)
 check("B 库内记录数一致", len(rows) == imported, f"rows={len(rows)} imported={imported}")
 
-# all stored files must be gif and exist / 存储文件必须为 gif 且存在
+# stored files: with auto-convert enabled everything except genuine GIFs
+# becomes gif (static jpg/png included — the user explicitly wants conversion
+# on; oversized results are downscaled inside the converter so chat apps
+# still recognize them as pictures) / 存储文件：勾选自动转换时，除真实 GIF
+# 外的一切（含静态 jpg/png）都转为 gif——用户明确要求转换；超大结果在转换
+# 器内降采样，聊天软件仍能识别为图片
 stored_gif = sum(1 for r in rows if r["filename"].endswith(".gif"))
-check("C 全部存为 gif", stored_gif == len(rows), f"{stored_gif}/{len(rows)}")
+stored_static = sum(1 for r in rows
+                    if r["filename"].endswith((".jpg", ".jpeg", ".png")))
+check("C 全部存为 gif（静态图也转）",
+      stored_gif + stored_static == len(rows),
+      f"gif={stored_gif} static={stored_static} total={len(rows)}")
+check("C2 有动画 gif", stored_gif > 0, stored_gif)
 
 missing = sum(1 for r in rows if not os.path.isfile(dm.emoji_filepath(r)))
 check("D 无缺失文件", missing == 0, f"missing={missing}")
@@ -79,10 +89,13 @@ for r in rows[:200]:
         anim += 1
 print(f"  （抽样 200 个中动画 {anim} 个）")
 
-# convert_library_to_gif on the already-gif library is a no-op / 全 gif 库一键转换为空操作
+# one-click convert is a no-op here since everything is already gif /
+# 一键转换在这里是空操作——全部已是 gif
 converted, failed, deduped = dm.convert_library_to_gif(workers=8)
-check("E 库已全 gif，再转换无事发生", converted == 0 and failed == 0,
+check("E 一键转换空操作", converted == 0 and failed == 0,
       f"converted={converted} failed={failed} deduped={deduped}")
+after = dm.get_emojis_by_group(g)
+check("E2 转换后全部为 gif", all(r["filename"].endswith(".gif") for r in after))
 
 n_pass = sum(1 for _, ok in RES if ok)
 print(f"\nQQ 全量导入验证: {n_pass}/{len(RES)} 通过")

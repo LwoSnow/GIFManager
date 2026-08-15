@@ -20,3 +20,12 @@ logs/
 
 # 测试输出
 tests/output/
+
+# QQ 表情测试源（用户数据，不入库）
+Ori/
+
+# 内置二进制（体积大，不入库）
+ffmpeg/
+
+# 其他本地配置
+.reasonix/
