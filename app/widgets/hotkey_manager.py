@@ -9,6 +9,22 @@ from app.models.lang_manager import tr
 
 # Win32 API constants / Win32 API 常量
 user32 = ctypes.windll.user32
+
+# Declare argtypes so pointer-sized handles/pointers are not truncated on
+# 64-bit (truncation previously made SetWindowsHookExW/CallNextHookEx throw
+# OverflowError, which slowed the system mouse). / 声明 argtypes，避免 64 位
+# 下指针尺寸句柄/指针被截断（截断曾让 SetWindowsHookExW/CallNextHookEx 抛
+# OverflowError，拖慢系统鼠标）。
+if hasattr(user32, "SetWindowsHookExW"):
+    user32.SetWindowsHookExW.restype = ctypes.c_void_p
+    user32.SetWindowsHookExW.argtypes = [
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
+if hasattr(user32, "UnhookWindowsHookEx"):
+    user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+if hasattr(user32, "CallNextHookEx"):
+    user32.CallNextHookEx.restype = ctypes.c_ssize_t
+    user32.CallNextHookEx.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t, ctypes.c_size_t]
 WM_HOTKEY = 0x0312
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
@@ -170,3 +186,130 @@ class HotkeyManager(QAbstractNativeEventFilter):
         mods = d.get("mods", 0)
         vk = d.get("vk", 0)
         return int(mods), int(vk)
+
+
+# Win32 constants for Alt+scroll detection /
+# Alt+滚轮检测的 Win32 常量
+WH_MOUSE_LL = 14
+WM_MOUSEWHEEL = 0x020A
+VK_MENU = 0x12  # Alt key / Alt 键
+
+
+# Global Alt+scroll watcher: low-level mouse hook + QTimer fallback /
+# 全局 Alt+滚轮监听器：低级鼠标钩子 + QTimer 兜底
+class GlobalScrollWatcher:
+    # Uses a Win32 WH_MOUSE_LL hook to capture scroll wheel events globally.
+    # Alt state is checked via GetAsyncKeyState. A QTimer polls as fallback
+    # in case the hook is not installed (e.g. restricted environment).
+    # 使用 Win32 WH_MOUSE_LL 钩子全局捕获滚轮事件。
+    # 通过 GetAsyncKeyState 检查 Alt 状态。QTimer 作为兜底轮询。
+
+    def __init__(self):
+        self._callback = None
+        self._hook = None
+        self._last_delta = 0
+        # Keep the C callback alive. LPARAM carries a POINTER-sized value
+        # (MSLLHOOKSTRUCT*) — on 64-bit it is 8 bytes, so the callback must
+        # use c_ssize_t, not wintypes.LPARAM (which is 32-bit c_ulong).
+        # Passing a truncated 32-bit LPARAM made every mouse event throw an
+        # OverflowError inside the hook (silently caught), which slowed the
+        # system mouse (felt like DPI dropping to 1/4 inside the window).
+        # 保持 C 回调存活。LPARAM 携带指针宽度值（MSLLHOOKSTRUCT*）——64 位
+        # 下为 8 字节，回调必须用 c_ssize_t，而非 wintypes.LPARAM（32 位
+        # c_ulong）。传截断的 32 位 LPARAM 会让每次鼠标事件在钩子内抛
+        # OverflowError（被静默捕获），拖慢系统鼠标（感觉像窗口内 DPI 降
+        # 到 1/4）。
+        self._hook_proc = ctypes.WINFUNCTYPE(
+            ctypes.c_int, ctypes.c_int, ctypes.c_size_t, ctypes.c_size_t
+        )(self._mouse_proc)
+        # QTimer fallback: poll every 50 ms when hook is unavailable /
+        # QTimer 兜底：钩子不可用时每 50ms 轮询
+        self._timer = None
+
+    # Install the hook and start the timer fallback /
+    # 安装钩子并启动定时器兜底
+    def start(self, callback):
+        self._callback = callback
+        if self._hook is None:
+            try:
+                # WH_MOUSE_LL is a low-level hook: the callback runs in THIS
+                # process, so hMod must be NULL. Passing GetModuleHandleW(None)
+                # made SetWindowsHookExW fail with ERROR_MOD_NOT_FOUND (126).
+                # / WH_MOUSE_LL 是低级钩子：回调在本进程内执行，hMod 必须传
+                # NULL。此前传 GetModuleHandleW(None) 会让 SetWindowsHookExW
+                # 以 ERROR_MOD_NOT_FOUND(126) 失败。
+                self._hook = user32.SetWindowsHookExW(
+                    WH_MOUSE_LL, self._hook_proc, None, 0,
+                )
+            except Exception:
+                self._hook = None
+            if not self._hook:
+                try:
+                    from app.models.logger import get_logger
+                    get_logger().warning(
+                        "GlobalScrollWatcher: mouse hook failed (err=%s), "
+                        "fall back to timer only",
+                        ctypes.get_last_error())
+                except Exception:
+                    pass
+        # Always start timer as fallback (or primary if hook failed) /
+        # 始终启动定时器作为兜底（钩子失败时作为主方案）
+        if self._timer is None:
+            from PySide6.QtCore import QTimer
+            self._timer = QTimer()
+            self._timer.setInterval(50)
+            self._timer.timeout.connect(self._poll)
+        self._timer.start()
+
+    # Remove hook and timer / 移除钩子和定时器
+    def stop(self):
+        if self._hook is not None:
+            try:
+                user32.UnhookWindowsHookEx(self._hook)
+            except Exception:
+                pass
+            self._hook = None
+        if self._timer is not None:
+            self._timer.stop()
+        self._callback = None
+
+    # Timer fallback: check Alt state + accumulated scroll delta /
+    # 定时器兜底：检查 Alt 状态 + 累积的滚轮增量
+    def _poll(self):
+        if self._callback is None:
+            return
+        if user32.GetAsyncKeyState(VK_MENU) & 0x8000:
+            if self._last_delta != 0:
+                d = self._last_delta
+                self._last_delta = 0
+                self._callback(d)
+
+    # Hook callback: capture WM_MOUSEWHEEL and store delta /
+    # 钩子回调：捕获 WM_MOUSEWHEEL 并存储增量
+    def _mouse_proc(self, nCode, wParam, lParam):
+        if nCode >= 0 and wParam == WM_MOUSEWHEEL:
+            try:
+                class _MSLLHOOKSTRUCT(ctypes.Structure):
+                    _fields_ = [
+                        ("pt", wintypes.POINT),
+                        ("mouseData", wintypes.DWORD),
+                        ("flags", wintypes.DWORD),
+                        ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ctypes.c_void_p),
+                    ]
+                data = ctypes.cast(
+                    ctypes.c_void_p(lParam),
+                    ctypes.POINTER(_MSLLHOOKSTRUCT),
+                ).contents
+                delta = ctypes.c_short(data.mouseData >> 16).value
+                if delta != 0:
+                    self._last_delta = delta
+                    # If Alt is held, fire immediately via hook /
+                    # Alt 按住时通过钩子立即触发
+                    if (user32.GetAsyncKeyState(VK_MENU) & 0x8000
+                            and self._callback):
+                        self._callback(delta)
+                        self._last_delta = 0
+            except Exception:
+                pass
+        return user32.CallNextHookEx(self._hook, nCode, wParam, lParam)

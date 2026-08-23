@@ -62,6 +62,10 @@ QScrollArea {
 QScrollBar:horizontal {
     background: transparent;
     height: 6px;
+    margin: 0 4px 0 4px;
+}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+    background: transparent;
 }
 QScrollBar::handle:horizontal {
     background: #C8C8C8;
@@ -77,6 +81,10 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
 QScrollBar:vertical {
     background: transparent;
     width: 6px;
+    margin: 4px 0 4px 0;
+}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: transparent;
 }
 QScrollBar::handle:vertical {
     background: #C8C8C8;
@@ -154,8 +162,17 @@ QFrame#emojiCard[selected="true"] {
     background-color: #E6F0FF;
 }
 QLabel#thumbLabel {
-    background-color: #EDEDED;
+    /* Transparent: avoids an extra box frame around aspect-fit images
+       / 透明：避免在等比图片周围出现多余方框 */
+    background: transparent;
     border-radius: 6px;
+}
+QLabel#hoverZoom {
+    /* Transparent: the global QWidget background would paint a dark box
+       behind transparent emoji pixels on hover. / 透明：全局 QWidget 背景
+       会在悬停时给透明像素垫出方块。 */
+    background: transparent;
+    border: none;
 }
 QLabel#nameLabel {
     color: #888888;

@@ -296,10 +296,16 @@ class GroupListWidget(QWidget):
         g = self._dm.get_group(group_id)
         if not g:
             return
-        new_name, ok = QInputDialog.getText(
-            self, tr("rename_group_dialog"), tr("new_name"), text=g["name"]
-        )
-        if ok and new_name.strip():
+        # Use the localised RenameDialog so OK/Cancel match the app language
+        # (the default QInputDialog shows English OK/Cancel). /
+        # 使用本地化 RenameDialog，使确定/取消与应用语言一致
+        # （默认 QInputDialog 显示英文 OK/Cancel）。
+        from app.widgets.rename_dialog import RenameDialog
+        dlg = RenameDialog(g["name"], self, title=tr("rename_group_dialog"))
+        if dlg.exec() != RenameDialog.DialogCode.Accepted:
+            return
+        new_name = dlg.new_name()
+        if new_name:
             # Detach QMovie file handles first: Windows cannot rename the
             # group folder while a GIF inside it is being played
             # 先分离 QMovie 文件句柄：Windows 上 GIF 播放中无法重命名分组目录

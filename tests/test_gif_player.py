@@ -6,6 +6,7 @@ gif_player 集成测试：原生 GIF 解码 -> QImage 帧。验证 ctypes 封装
 import os
 import sys
 import tempfile
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP = tempfile.mkdtemp(prefix="gifmgr_player_")
@@ -104,6 +105,34 @@ gif_player.shutdown()
 gif_player.request_decode(gifp, 80)  # recreates the worker thread / 重建工作线程
 gif_player.shutdown()
 check("E shutdown 安全", True)
+
+# 6. Priority decoding: a later request with lower priority (0) is decoded
+# BEFORE earlier requests with higher priority (100). / 优先级解码：后请求
+# 的低优先级（0）先于先请求的高优先级（100）解码。
+_worker = gif_player._DecodeWorker()
+_calls = []
+_orig_decode = gif_player.decode_all
+gif_player.decode_all = lambda path, target: (_calls.append(os.path.basename(path)), None)[1]
+try:
+    _p1 = os.path.join(TMP, "prio_a.gif")
+    _p2 = os.path.join(TMP, "prio_b.gif")
+    _p3 = os.path.join(TMP, "prio_c.gif")
+    for p in (_p1, _p2, _p3):
+        with open(p, "wb") as f:
+            f.write(b"GIF89a" + b"\x00" * 30)
+    _worker.on_request(_p1, 80, 100)
+    _worker.on_request(_p2, 80, 100)
+    _worker.on_request(_p3, 80, 0)
+    _deadline = time.time() + 5
+    while len(_calls) < 3 and time.time() < _deadline:
+        app.processEvents()
+        import time as _t
+        _t.sleep(0.01)
+    check("F 优先级 0 最先解码", len(_calls) == 3 and _calls[0] == "prio_c.gif",
+          _calls)
+finally:
+    gif_player.decode_all = _orig_decode
+    _worker._pending = {}
 
 n_pass = sum(1 for _, ok in RES if ok)
 print(f"\ngif_player 验证: {n_pass}/{len(RES)} 通过")

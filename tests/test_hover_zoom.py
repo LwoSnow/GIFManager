@@ -56,11 +56,40 @@ pix = QPixmap.fromImage(img)
 card._thumb_label.setPixmap(pix)
 card._show_hover_zoom()
 check("A 浮层可见", card._hover_layer is not None and card._hover_layer.isVisible())
+# The overlay must not paint a dark background behind transparent emoji
+# pixels (global QWidget bg would show as a black box on hover). The theme
+# QSS gives QLabel#hoverZoom a transparent background.
+# / 浮层不得为透明像素垫出深色背景（全局 QWidget 背景会在悬停时显示为
+# 黑框）。主题 QSS 给 QLabel#hoverZoom 设透明背景。
+from app.theme.dark_theme import QSS as _DARK_QSS
+_i = _DARK_QSS.find("QLabel#hoverZoom")
+_seg = _DARK_QSS[_i:_i + 400] if _i >= 0 else ""
+check("A5 浮层透明背景", _i >= 0 and "background: transparent" in _seg,
+      "hoverZoom transparent bg rule present")
+# zoom-in-place: the enlarged copy covers the thumbnail, which STAYS visible
+# to keep its layout cell (so the name label below does not shift to the
+# center when the layout collapses). / 原位放大：放大副本覆盖缩略图；缩略图
+# 保持可见以占据布局格子（避免下方名称条在布局塌缩时移到中央）。
+check("A1 缩略图保留可见（留位）", card._thumb_label.isVisible())
 w, h = card._hover_layer.width(), card._hover_layer.height()
 # 80*1.15=92, 60*1.15=69 -> 4:3 preserved / 保持 4:3 宽高比
 check("A2 尺寸按图片比例 (92x69)", w == 92 and h == 69, f"{w}x{h}")
 check("A3 宽高比保持", abs(w / h - 80 / 60) < 0.05, f"{w}/{h}")
+# The enlarged overlay must be centred on the CARD's horizontal centre (the
+# thumb label's own centre is off by the card padding, which made the emoji
+# lean right with unequal side gaps). / 放大浮层须以卡片水平中心为锚点
+# （缩略图自身中心受卡片内边距偏移，导致表情偏右、左右间距不等）。
+geo = card._hover_layer.geometry()
+card_cx = card.width() // 2
+overlay_cx = geo.x() + geo.width() // 2
+check("A6 浮层水平居中", overlay_cx == card_cx,
+      f"overlay_cx={overlay_cx} card_cx={card_cx}")
+left_gap = geo.x()
+right_gap = card.width() - (geo.x() + geo.width())
+check("A7 左右间距相等", abs(left_gap - right_gap) <= 1,
+      f"left={left_gap} right={right_gap}")
 card._hide_hover_zoom()
+check("A4 缩略图仍可见", card._thumb_label.isVisible())
 
 # --- 2. master switch disables the preview / 总开关关闭预览
 card_off = EmojiItem(emoji, _DM(), hover_zoom=1.3, hover_enabled=False)

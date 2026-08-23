@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt, QSize, QMimeData, QPoint, QTimer, QSettings, QThreadPool, QStandardPaths,
+    QEvent,
 )
 from PySide6.QtGui import (
     QDragEnterEvent, QDropEvent, QIcon, QAction, QKeyEvent, QKeySequence,
@@ -32,9 +33,10 @@ from app.models.constants import (
 from app.models.logger import init_logger, get_logger, install_excepthook, clear_logs
 from app.widgets.group_list import GroupListWidget
 from app.widgets.emoji_grid import EmojiGridWidget
+from app.widgets.emoji_item import EmojiItem
 from app.widgets.search_bar import SearchBar
 from app.widgets.settings_dialog import SettingsDialog, recommended_thread_count
-from app.widgets.hotkey_manager import HotkeyManager
+from app.widgets.hotkey_manager import HotkeyManager, GlobalScrollWatcher
 from app.utils import gif_converter
 
 
@@ -66,6 +68,89 @@ class _DragToolbar(QWidget):
     def mouseReleaseEvent(self, event: QMouseEvent):
         self._dragging = False
         super().mouseReleaseEvent(event)
+
+
+# Smooth mouse-wheel scrolling: instead of the scrollbar jumping directly to
+# the target, animate it toward the target with an easing QTimer so long
+# scrolls feel continuous rather than teleporting. Dragging the slider keeps
+# its immediate behavior; only mouse-wheel movement is smoothed.
+# 平滑鼠标滚轮滚动：滚动条不再直接跳到目标，而是用缓动 QTimer 向目标动画
+# 靠近，长距离滚动显得连贯而非瞬移。拖拽滑块保持即时；仅滚轮滚动平滑。
+class SmoothScroll:
+    STEPS = 12          # frames per glide / 每次滑动的帧数
+    STEP_MS = 16        # ~60 fps / 约 60 帧每秒
+
+    def __init__(self, scroll_area):
+        self._sa = scroll_area
+        # Parent the timer to the scroll area so it is cleaned up with the
+        # widget (an unparented QTimer is only kept alive by this reference;
+        # if the window is destroyed first, the timer could outlive it).
+        # / 把定时器以滚动区为父对象，随控件一并回收（无父的 QTimer 仅靠本
+        # 引用存活；窗口先销毁时定时器可能残留）。
+        self._timer = QTimer(scroll_area)
+        self._timer.setInterval(self.STEP_MS)
+        self._timer.timeout.connect(self._tick)
+        self._elapsed = 0      # frames completed in the current glide / 本次滑动已完成帧数
+        self._start = 0.0      # value at glide start / 滑动起始值
+        self._target = None    # desired final value / 目标终值
+        self._installed = False
+
+    def _vbar(self):
+        if self._sa is None:
+            return None
+        return self._sa.verticalScrollBar()
+
+    def reset(self):
+        # Stop any in-flight glide (e.g. group/data change) / 停止进行中的
+        # 滑动（如分组/数据变化）
+        self._timer.stop()
+        self._target = None
+
+    def _ease(self, t):
+        # Ease-out cubic: fast at the start, decelerating into the target.
+        # This matches the "缓动分帧推进" described in the changelog (the old
+        # constant-per-frame glide was linear, not eased).
+        # / ease-out 三次曲线：起始快、临近目标减速。符合更新日志"缓动分帧推进"
+        # （旧实现为等步长匀速，非缓动）。
+        return 1.0 - (1.0 - t) ** 3
+
+    def _tick(self):
+        bar = self._vbar()
+        if bar is None or self._target is None:
+            self._timer.stop()
+            return
+        self._elapsed += 1
+        t = min(1.0, self._elapsed / float(self.STEPS))
+        value = self._start + (self._target - self._start) * self._ease(t)
+        if t >= 1.0:
+            bar.setValue(int(self._target))
+            self._timer.stop()
+            self._target = None
+        else:
+            bar.setValue(int(value))
+
+    def handle_wheel(self, delta_y):
+        # Called on a mouse-wheel event over the scroll area: set/continue a
+        # smooth glide. / 在滚动区收到滚轮事件时调用：设置/继续一次平滑滑动。
+        bar = self._vbar()
+        if bar is None or bar.maximum() <= 0:
+            return
+        # Re-anchor the glide from the current value (a wheel event mid-glide
+        # continues from where the bar actually is, not from the stale start).
+        # / 从当前值重新锚定滑动（滑动中途又来滚轮时，从滚动条实际位置继续，
+        # 而非过期的起始值）。
+        if self._target is None:
+            self._elapsed = 0
+            self._start = float(bar.value())
+            self._target = float(bar.value())
+        # Qt angleDelta().y() is POSITIVE when the wheel scrolls UP (content
+        # moves down) => scrollbar value must DECREASE. So subtract the delta.
+        # / Qt angleDelta().y() 在滚轮向上滚时为正值（内容下移）=> 滚动条
+        # value 应减小。故减去 delta（此前加 delta 导致方向反了）。
+        self._target = max(0, min(bar.maximum(), self._target - delta_y))
+        self._start = float(bar.value())
+        self._elapsed = 0
+        self._timer.start()
 
 
 class MainWindow(QMainWindow):
@@ -172,6 +257,19 @@ class MainWindow(QMainWindow):
         # Master switch for the hover preview / 悬停预览总开关
         self._hover_preview_enabled = self._settings.value(
             "hover_preview_enabled", True, type=bool)
+        # Card scale factor / 卡片缩放系数
+        try:
+            self._card_scale = max(
+                0.5, min(2.0, float(self._settings.value("card_scale", 1.0))))
+        except (TypeError, ValueError):
+            self._card_scale = 1.0
+        # Name font size for image cards / 图片卡名字字号
+        try:
+            self._name_font_size = max(
+                1, min(20, int(self._settings.value("name_font_size", 10))))
+        except (TypeError, ValueError):
+            self._name_font_size = 10
+        EmojiItem.set_name_font_size(self._name_font_size)
         # Click an emoji -> auto-type (Ctrl+V) into the focused chat input /
         # 点击表情 → 自动输入（Ctrl+V）到焦点聊天输入框
         self._auto_input = self._settings.value("auto_input", True, type=bool)
@@ -232,6 +330,8 @@ class MainWindow(QMainWindow):
         self._settings.setValue("show_emoji_name", self._show_emoji_name)
         self._settings.setValue("hover_zoom", self._hover_zoom)
         self._settings.setValue("hover_preview_enabled", self._hover_preview_enabled)
+        self._settings.setValue("card_scale", self._card_scale)
+        self._settings.setValue("name_font_size", self._name_font_size)
         self._settings.setValue("auto_input", self._auto_input)
         self._settings.setValue("language", current_language())
 
@@ -305,6 +405,10 @@ class MainWindow(QMainWindow):
         super().showEvent(event)
         self._apply_rounded()
         QTimer.singleShot(200, self._register_hotkey_if_needed)
+        # Start global Alt+scroll watcher for card scaling /
+        # 启动全局 Alt+滚轮监听器（卡片缩放）
+        if hasattr(self, "_scroll_watcher"):
+            self._scroll_watcher.start(self._on_global_scroll)
         # Keep the focus guard's manager handle in sync / 同步焦点守卫的
         # 管理器句柄
         try:
@@ -312,6 +416,11 @@ class MainWindow(QMainWindow):
                 self._focus_guard.set_manager(int(self.winId()))
         except Exception:
             pass
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        if hasattr(self, "_scroll_watcher"):
+            self._scroll_watcher.stop()
 
     def _apply_rounded(self):
         if sys.platform != "win32":
@@ -372,6 +481,8 @@ class MainWindow(QMainWindow):
         self._scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.emoji_grid = EmojiGridWidget()
         self.emoji_grid._show_emoji_name = self._show_emoji_name
+        self.emoji_grid._card_scale = self._card_scale
+        EmojiItem._card_scale = self._card_scale
         self.emoji_grid._hover_zoom = self._hover_zoom
         self.emoji_grid._hover_preview_enabled = self._hover_preview_enabled
         self._scroll_area.setWidget(self.emoji_grid)
@@ -379,6 +490,15 @@ class MainWindow(QMainWindow):
 
         self.group_list = GroupListWidget(self.data_manager)
         root.addWidget(self.group_list)
+
+        # Smooth scroll controller: intercept mouse-wheel over the scroll
+        # area and animate the scrollbar toward the target instead of
+        # jumping instantly. Dragging the slider stays immediate.
+        # 平滑滚动控制器：拦截滚动区内的鼠标滚轮，向目标值动画滚动而非瞬移。
+        # 拖拽滑块仍保持即时。
+        self._smooth_scroll = SmoothScroll(self._scroll_area)
+        self._scroll_area.viewport().installEventFilter(self)
+        self.group_list.groups_updated.connect(self._on_smooth_scroll_reset)
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
@@ -705,10 +825,12 @@ class MainWindow(QMainWindow):
     def _toggle_visible(self):
         if self.isVisible():
             self.hide()
+            self._scroll_watcher.stop()
         else:
             self.show()
             self.activateWindow()
             self.raise_()
+            self._scroll_watcher.start(self._on_global_scroll)
 
     def _real_quit(self):
         self._save_geometry()
@@ -716,12 +838,41 @@ class MainWindow(QMainWindow):
         self._save_settings()
         if self._hotkey_mgr:
             self._hotkey_mgr.unregister()
+        self._scroll_watcher.stop()
         # Stop the GIF decode worker thread before the interpreter exits
         # 解释器退出前停止 GIF 解码工作线程
         from app.utils import gif_player
         gif_player.shutdown()
         self._tray.hide()
         QApplication.quit()
+
+    def _on_smooth_scroll_reset(self):
+        # Stop any in-flight smooth scroll when data/group changes /
+        # 数据/分组变化时停止进行中的平滑滚动
+        if getattr(self, "_smooth_scroll", None) is not None:
+            self._smooth_scroll.reset()
+
+    # Global Alt+scroll callback: adjust card scale /
+    # 全局 Alt+滚轮回调：调节卡片缩放
+    def _on_global_scroll(self, delta):
+        step = 0.02  # 2% per step / 每步 2%
+        if delta > 0:
+            new_scale = min(2.0, self._card_scale + step)
+        else:
+            new_scale = max(0.5, self._card_scale - step)
+        if new_scale != self._card_scale:
+            self._card_scale = new_scale
+            self.emoji_grid._set_card_scale(self._card_scale)
+            # Persist the change (Alt+wheel is a live control, not the settings
+            # dialog) and keep an open settings dialog's spin in sync.
+            # / 持久化该变化（Alt+滚轮是实时控件，非设置对话框），并保持打开的
+            # 设置界面输入框同步。
+            self._save_settings()
+            if self._settings_dialog is not None:
+                try:
+                    self._settings_dialog.set_card_scale(self._card_scale)
+                except RuntimeError:
+                    pass  # dialog closed concurrently / 对话框已同时关闭
 
     def closeEvent(self, event):
         self._save_geometry()
@@ -738,6 +889,7 @@ class MainWindow(QMainWindow):
         self._log.info("Window closing -> hide to tray")
         event.ignore()
         self.hide()
+        self._scroll_watcher.stop()
         self._tray.showMessage(
             self.APP_TITLE, tr("tray_hidden"),
             QSystemTrayIcon.MessageIcon.Information, 1500
@@ -807,6 +959,12 @@ class MainWindow(QMainWindow):
             Qt.ScrollBarPolicy.ScrollBarAsNeeded if is_text
             else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
+        # Reset the horizontal scroll position on group switch: the previous
+        # group's horizontal value would otherwise carry over, and in a
+        # narrower/new group the handle sticks to the right edge until the
+        # user drags it. / 切换分组时复位水平滚动位置：否则上一分组的水平
+        # 滚动值会保留，在更窄/新分组中滑块会贴到右侧边缘，直到用户拖拽。
+        self._scroll_area.horizontalScrollBar().setValue(0)
         if group_id is not None:
             g = self.data_manager.get_group(group_id)
             if g and g["type"] == "text":
@@ -822,7 +980,15 @@ class MainWindow(QMainWindow):
         self._refresh_emoji_grid()
         self._refresh_status()
 
-    def _refresh_emoji_grid(self):
+    def _refresh_emoji_grid(self, keep_scroll=False):
+        # keep_scroll=True preserves the vertical scroll position across the
+        # refresh (used by rename — the grid would otherwise jump to the
+        # top). / keep_scroll=True 在刷新后保留垂直滚动位置（重命名使用——
+        # 否则网格会跳回顶部）。
+        scroll_val = None
+        if keep_scroll:
+            sb = self._scroll_area.verticalScrollBar()
+            scroll_val = sb.value()
         keyword = self.search_bar.text().strip()
         if self.current_group_id is None:
             emojis = self.data_manager.get_all_emojis(keyword)
@@ -837,6 +1003,11 @@ class MainWindow(QMainWindow):
             emojis, group_type,
             preview_limits=(self._text_limit_single, self._text_limit_multi),
         )
+        if scroll_val is not None:
+            # Restore the previous position once the new layout is ready /
+            # 新布局就绪后恢复原位置
+            sb = self._scroll_area.verticalScrollBar()
+            QTimer.singleShot(0, lambda s=sb, v=scroll_val: s.setValue(v))
 
     def _refresh_status(self):
         total = self.data_manager.count_all_emojis()
@@ -1133,6 +1304,22 @@ class MainWindow(QMainWindow):
         if files:
             self._do_import(files)
 
+    def eventFilter(self, obj, event):
+        # Route mouse-wheel over the scroll area into the smooth-glide
+        # controller (so long scrolls are continuous, not a jump). Normal
+        # wheel without a scrollable range, and Alt+wheel (card zoom), are
+        # left alone. / 把滚动区内的鼠标滚轮交给平滑滚动控制器（长距离滚动
+        # 连贯而非瞬移）。无可滚动范围或 Alt+滚轮（缩放卡片）不拦截。
+        if obj is getattr(self, "_scroll_area", None).viewport() \
+                and event.type() == QEvent.Type.Wheel:
+            me = event
+            delta_y = me.angleDelta().y()
+            if delta_y != 0 and not (me.modifiers()
+                                     & Qt.KeyboardModifier.AltModifier):
+                self._smooth_scroll.handle_wheel(delta_y)
+                return True
+        return super().eventFilter(obj, event)
+
     def keyPressEvent(self, event: QKeyEvent):
         # Ctrl+A in multi-select edit mode selects all / clears selection /
         # 多选编辑模式下 Ctrl+A 全选/取消全选
@@ -1361,14 +1548,17 @@ class MainWindow(QMainWindow):
 
     def _rename_emoji(self, emoji):
         old_name = emoji.get("original_name") or emoji.get("text_content", "")
-        new_name, ok = QInputDialog.getText(
-            self, tr("rename_dialog"), tr("new_name"), text=old_name
-        )
-        if ok and new_name.strip():
-            self.data_manager.rename_emoji(emoji["id"], new_name.strip())
-            self._log.info("Rename emoji -> id=%s old=%r new=%r",
-                           emoji["id"], old_name, new_name.strip())
-            self._refresh_emoji_grid()
+        from app.widgets.rename_dialog import RenameDialog
+        dlg = RenameDialog(old_name, self)
+        if dlg.exec() == RenameDialog.DialogCode.Accepted:
+            new_name = dlg.new_name()
+            if new_name:
+                self.data_manager.rename_emoji(emoji["id"], new_name)
+                self._log.info("Rename emoji -> id=%s old=%r new=%r",
+                               emoji["id"], old_name, new_name)
+                # Preserve the scroll position: renaming must not jump back to
+                # the top of the page. / 保留滚动位置：重命名不应跳回页面顶部。
+                self._refresh_emoji_grid(keep_scroll=True)
 
     def _edit_text_emoji(self, emoji):
         from app.widgets.edit_text_dialog import EditTextDialog
@@ -1388,7 +1578,8 @@ class MainWindow(QMainWindow):
                     return
             self.data_manager.rename_emoji(emoji["id"], new_text[:20])
             self._conn_update_text(emoji["id"], new_text)
-            self._refresh_emoji_grid()
+            # Keep the scroll position after editing text / 编辑文字后保持滚动位置
+            self._refresh_emoji_grid(keep_scroll=True)
 
     def _conn_update_text(self, emoji_id, text):
         self.data_manager.update_text_content(emoji_id, text)
@@ -1437,6 +1628,8 @@ class MainWindow(QMainWindow):
             hover_zoom=self._hover_zoom,
             hover_preview_enabled=self._hover_preview_enabled,
             auto_input=self._auto_input,
+            card_scale=self._card_scale,
+            name_font_size=self._name_font_size,
             data_manager=self.data_manager,
             hotkey_desc=self._hotkey_desc(),
             parent=self,
@@ -1516,6 +1709,16 @@ class MainWindow(QMainWindow):
             card._hover_zoom = self._hover_zoom
             if not self._hover_preview_enabled:
                 card._hide_hover_zoom()
+        # Card scale factor / 卡片缩放系数
+        new_scale = dlg.card_scale()
+        if new_scale != self._card_scale:
+            self._card_scale = new_scale
+            self.emoji_grid._set_card_scale(self._card_scale)
+        # Name font size / 名字字号
+        new_nf = dlg.name_font_size()
+        if new_nf != self._name_font_size:
+            self._name_font_size = new_nf
+            self.emoji_grid.apply_name_font_size(self._name_font_size)
         theme_changed = (dlg.theme() != self._theme)
         self._theme = dlg.theme()
         self._log.info(
@@ -1566,6 +1769,9 @@ class MainWindow(QMainWindow):
 
     def _init_hotkey_mgr(self):
         self._hotkey_mgr = HotkeyManager(self)
+        # Global Alt+scroll watcher for card scaling /
+        # 全局 Alt+滚轮监听器（卡片缩放）
+        self._scroll_watcher = GlobalScrollWatcher()
         # type=int guards against dirty registry values (startup crash fix) /
         # type=int 防止注册表脏数据导致启动崩溃
         self._hotkey_mods = self._settings.value("hotkey_mods", 0, type=int)

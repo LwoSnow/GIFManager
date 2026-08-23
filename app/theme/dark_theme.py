@@ -88,12 +88,13 @@ QScrollArea {
     border: none;
 }
 QScrollBar:horizontal {
-    background: #252525;
+    background: transparent;
     height: 6px;
     border-radius: 3px;
+    margin: 0 4px 0 4px;
 }
-QScrollBar:horizontal:hover {
-    height: 10px;
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+    background: transparent;
 }
 QScrollBar::handle:horizontal {
     background: #4A4A4A;
@@ -108,12 +109,13 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
 }
 
 QScrollBar:vertical {
-    background: #252525;
+    background: transparent;
     width: 6px;
     border-radius: 3px;
+    margin: 4px 0 4px 0;
 }
-QScrollBar:vertical:hover {
-    width: 10px;
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: transparent;
 }
 QScrollBar::handle:vertical {
     background: #4A4A4A;
@@ -190,8 +192,19 @@ QFrame#emojiCard[selected="true"] {
     background-color: #1A3A5C;
 }
 QLabel#thumbLabel {
-    background-color: #1A1A1A;
+    /* Transparent: the square label box would show as bars around an
+       aspect-fit image, looking like an extra border. The image sits
+       directly on the card. / 透明：方形标签框会在等比图片上下露出，
+       像多余边框；图片直接位于卡片上。 */
+    background: transparent;
     border-radius: 6px;
+}
+QLabel#hoverZoom {
+    /* Transparent: the global QWidget background would paint a dark box
+       behind transparent emoji pixels on hover. / 透明：全局 QWidget 背景
+       会在悬停时给透明像素垫出深色方块。 */
+    background: transparent;
+    border: none;
 }
 QLabel#nameLabel {
     color: #999999;

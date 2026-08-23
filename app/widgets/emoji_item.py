@@ -86,10 +86,47 @@ class EmojiItem(QFrame):
     # Height of the name strip under the thumbnail (image cards)
     # 缩略图下方名称条的高度（图片卡）
     NAME_AREA = 22
+    # Global name font size and name-area height (image cards). Set by the
+    # settings dialog; the name label uses an inline style so it overrides
+    # the global QSS font-size. / 全局名称字号与名称区高度（图片卡）。由设置
+    # 对话框设置；名字标签用内联样式，覆盖全局 QSS 的 font-size。
+    _name_font_size = 10
+    _name_area = NAME_AREA
+    # Name chars shown before "…" when the name is long / 名称过长时截断显示的字符数
+    NAME_CHAR_LIMIT = 12
     # Text card fixed width (masonry column width)
     # 文字卡片统一宽度（masonry 列宽）
     TEXT_WIDTH = 220
     TEXT_MAX_WIDTH = 220
+    # Global card scale factor (set by EmojiGridWidget) /
+    # 全局卡片缩放系数（由 EmojiGridWidget 设置）
+    _card_scale = 1.0
+
+    # Set the global name font size (1–20); the name-area height adapts.
+    # 设置全局名字字号（1–20），名称区高度随之自适应。
+    @classmethod
+    def set_name_font_size(cls, size):
+        size = max(1, min(20, int(size)))
+        cls._name_font_size = size
+        cls._name_area = max(10, size + 8)  # font + padding / 字号 + 内边距
+
+    @classmethod
+    def get_name_font_size(cls):
+        return cls._name_font_size
+
+    @classmethod
+    def get_name_area(cls):
+        return cls._name_area
+
+    # Scaled card size / 缩放后的卡片尺寸
+    @classmethod
+    def card_size(cls):
+        return int(cls.CARD_SIZE * cls._card_scale)
+
+    # Scaled thumbnail size / 缩放后的缩略图尺寸
+    @classmethod
+    def thumb_size(cls):
+        return int(cls.THUMB_SIZE * cls._card_scale)
 
     def __init__(self, emoji: dict, data_manager, parent=None,
                  preview_limits=(100, 200), width=None, show_name=True,
@@ -102,7 +139,7 @@ class EmojiItem(QFrame):
         self._press_pos = None
         self._dragging = False
         self._preview_limits = preview_limits  # (single-line cap, multi-line cap) / (单行上限, 多行上限)
-        self._width = width if width else (self.TEXT_WIDTH if self._is_text else self.CARD_SIZE)
+        self._width = width if width else (self.TEXT_WIDTH if self._is_text else self.card_size())
         # Whether the name label under the thumbnail is shown (settings) /
         # 是否在缩略图下方显示名称（设置项）
         self._show_name = show_name
@@ -111,10 +148,21 @@ class EmojiItem(QFrame):
         self._hover_enabled = bool(hover_enabled)
         self._hover_layer = None
         self._hidden_neighbors = []  # sibling cards hidden by the overlay / 被浮层隐藏的相邻卡
+        self._hover_timer = None  # debounce before showing the overlay / 浮层显示去抖定时器
         # Native GIF playback state (gifdec.dll) / 原生 GIF 播放状态（gifdec.dll）
         self._frames = None
         self._delays = None
         self._frame_idx = 0
+        # Long-name marquee: the full name is scrolled across the label while
+        # hovering; otherwise it shows elided text with an ellipsis.
+        # 长名称跑马灯：悬停时在标签内横向滚动完整名称；否则显示省略号截断。
+        # NOTE: _name_label is created ONLY for image cards with names shown,
+        # so newer methods must access it via getattr(self, "_name_label", None).
+        # / 注意：_name_label 仅图片卡显示名称时创建，故新方法须用
+        # getattr(self, "_name_label", None) 安全访问。
+        self._name_full = ""
+        self._name_scroll_timer = None
+        self._name_scroll_offset = 0
         self._play_timer = None
         self._playing = False
         self._decode_connected = False
@@ -171,17 +219,18 @@ class EmojiItem(QFrame):
     # Image-mode UI / 图片模式 UI
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def card_height(show_name):
+    @classmethod
+    def card_height(cls, show_name):
         # Image card height: thumbnail area plus the name strip when names
         # are shown (settings "show_emoji_name"). Layout code must use this
         # so cards and scroll range stay consistent when names are hidden.
         # 图片卡高度：缩略图区 + 名称条（设置"显示表情包名称"开启时）。
         # 布局代码必须用此方法，隐藏名称时卡片与滚动范围保持一致。
-        return EmojiItem.CARD_SIZE + (EmojiItem.NAME_AREA if show_name else 0)
+        return cls.card_size() + (cls._name_area if show_name else 0)
 
     def _build_image_ui(self):
-        self.setFixedSize(self.CARD_SIZE, self.card_height(self._show_name))
+        cs = self.card_size()
+        self.setFixedSize(cs, self.card_height(self._show_name))
         layout = QVBoxLayout(self)
         if self._show_name:
             layout.setContentsMargins(4, 6, 4, 2)
@@ -195,7 +244,8 @@ class EmojiItem(QFrame):
 
         self._thumb_label = QLabel()
         self._thumb_label.setObjectName("thumbLabel")
-        self._thumb_label.setFixedSize(self.THUMB_SIZE, self.THUMB_SIZE)
+        ts = self.thumb_size()
+        self._thumb_label.setFixedSize(ts, ts)
         self._thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         if self._show_name:
             layout.addWidget(self._thumb_label,
@@ -209,11 +259,19 @@ class EmojiItem(QFrame):
             layout.addStretch(1)
 
         if self._show_name:
-            name = self._emoji.get("original_name", "")[:10]
-            self._name_label = QLabel(name[:10])
+            full_name = self._emoji.get("original_name", "")
+            self._name_full = full_name
+            self._name_label = QLabel()
             self._name_label.setObjectName("nameLabel")
             self._name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._name_label.setFixedHeight(16)
+            # Inline style wins over the global QSS font-size (setFont would
+            # be overridden by the stylesheet). Height adapts to the font.
+            # 内联样式优先级高于全局 QSS font-size（setFont 会被样式表覆盖）。
+            # 高度随字号自适应。
+            self._name_label.setStyleSheet(
+                "font-size: {0}px;".format(max(1, self.get_name_font_size())))
+            self._name_label.setFixedHeight(self._name_area)
+            self._apply_name_display()
             layout.addWidget(self._name_label)
 
         self._setup_image()
@@ -239,11 +297,11 @@ class EmojiItem(QFrame):
         key = _thumb_key(filepath)
         pix = QPixmap()
         if QPixmapCache.find(key, pix):
-            self._thumb_label.setPixmap(pix)
+            self.apply_thumb(pix)
             return
         # 2) Cache miss: blank placeholder + async background decode (dispatched by EmojiGridWidget)
         # 2) 未命中：占位（label 默认空白）+ 后台异步解码（由 EmojiGridWidget 统一接收）
-        _loader.request(filepath, self.THUMB_SIZE - 8)
+        _loader.request(filepath, self.thumb_size() - 8)
 
     # Set thumbnail once the async decode is ready (dispatched centrally by EmojiGridWidget).
     # The C++ widget may already be deleted when the decode finishes (the
@@ -260,10 +318,47 @@ class EmojiItem(QFrame):
         except ImportError:
             pass
         try:
-            self._thumb_label.setPixmap(pix)
-            self._update_hover_layer(pix)
+            self._set_thumb_pixmap(pix, fast=False)
         except RuntimeError:
             pass  # widget destroyed between the check and the call / 检查与调用间已销毁
+
+    # Display a pixmap in the thumbnail label, scaled to fit the CURRENT
+    # thumb size preserving the image's aspect ratio (a 4:3 sticker shows as
+    # a 4:3 picture, not as a square with letterboxing). This is the same
+    # "fit by aspect ratio" look the hover overlay used, so the emoji inside
+    # the card scales together with the card, and hover simply enlarges the
+    # already-fitted picture (no duplicated overlay look). The hover layer
+    # is kept in sync so the hovered GIF frame matches.
+    # 在缩略图 label 中显示 pixmap：按当前缩略图尺寸等比缩放（保持图片宽高
+    # 比——4:3 的表情包显示为 4:3 图片，而非带黑边的方形）。这与悬停浮层
+    # 的"按宽高比适配"是同一套，因此卡片内表情随卡片一起缩放，悬停只是在
+    # 已适配的图上再放大（不再有浮层叠加的视觉问题）。悬停浮层同步更新，
+    # 使悬停中的 GIF 帧保持一致。
+    def _set_thumb_pixmap(self, pix, fast=True):
+        if pix is None or pix.isNull():
+            return
+        ts = self.thumb_size()
+        # Fast path (GIF frames only): frames are decoded slightly smaller
+        # than the box (thumb_size()-4). If already inside, show directly —
+        # this skips a costly per-frame resample during playback (the main
+        # cause of jank with many animated stickers). Static thumbnails pass
+        # fast=False and always scale to fill the box.
+        # / 快速路径（仅 GIF 帧）：帧比框略小解码（thumb_size()-4）。已适配
+        # 框内则直接显示——播放时跳过每帧昂贵重采样（多动图卡顿主因）。
+        # 静态缩略图传 fast=False，始终缩放填充框。
+        if fast and pix.width() <= ts and pix.height() <= ts:
+            self._thumb_label.setPixmap(pix)
+            self._update_hover_layer(pix)
+            return
+        # Fit inside the thumb box preserving aspect ratio; center via the
+        # label alignment / 等比适配缩略图框内；由 label 对齐居中
+        pix = pix.scaled(
+            ts, ts,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self._thumb_label.setPixmap(pix)
+        self._update_hover_layer(pix)
 
     def refresh_display(self):
         # Refresh name/text label after rename or text edit
@@ -273,8 +368,13 @@ class EmojiItem(QFrame):
             display, _t = self._display_text()
             self._text_label.setText(display)
         elif self._show_name:
-            name = self._emoji.get("original_name", "")[:10]
-            self._name_label.setText(name)
+            self._name_full = self._emoji.get("original_name", "")
+            # Re-apply the font size/height in case they changed (settings) /
+            # 重新套用字号/高度（设置可能已变更）
+            self._name_label.setStyleSheet(
+                "font-size: {0}px;".format(max(1, self.get_name_font_size())))
+            self._name_label.setFixedHeight(self._name_area)
+            self._apply_name_display()
 
     # ------------------------------------------------------------------
     # Text-mode UI (adaptive height + preview limits + dynamic column reflow)
@@ -533,7 +633,7 @@ class EmojiItem(QFrame):
         # Preview box: same-size white dashed border, no content / 预览框：与卡片同尺寸的白色虚线边框，不显示内容
         w, h = self.width(), self.height()
         if w <= 0 or h <= 0:
-            w, h = self.CARD_SIZE, self.card_height(self._show_name)
+            w, h = self.card_size(), self.card_height(self._show_name)
         pix = QPixmap(w, h)
         pix.fill(Qt.GlobalColor.transparent)
         painter = QPainter(pix)
@@ -559,19 +659,171 @@ class EmojiItem(QFrame):
                 "#4A4A4A; border-radius: 6px; }"
             )
         else:
-            self._show_hover_zoom()
+            # Long-name marquee: start scrolling the name as soon as the mouse
+            # enters the card, regardless of whether hover preview is on. /
+            # 长名称跑马灯：鼠标进入卡片即开始滚动名称，无论悬停预览是否开启。
+            self._start_name_scroll()
+            # Debounce hover: show the enlarged overlay only after the mouse
+            # rests ~90 ms. Rapidly sweeping across cards no longer toggles
+            # the overlay (and its neighbor hide/show) on every card, which
+            # used to make mouse movement feel sluggish inside the window.
+            # 悬停去抖：鼠标停留约 90ms 后才显示放大浮层。快速划过卡片不再
+            # 每张卡都切换浮层（及其邻居显隐），此前这会让窗口内鼠标移动
+            # 感觉迟滞。
+            self._schedule_hover_zoom()
         super().enterEvent(event)
 
     def leaveEvent(self, event):
+        self._cancel_hover_zoom()
         self._hide_hover_zoom()
         if self._is_text:
             self.setStyleSheet("")
         super().leaveEvent(event)
 
+    def _schedule_hover_zoom(self):
+        # Near-instant debounce: the overlay appears almost immediately, but
+        # an extremely fast sweep across cards still does not toggle it on
+        # every single card. / 近即时去抖：浮层几乎立即出现，但极快的划过
+        # 仍不会每张卡都切换。
+        if self._hover_timer is None:
+            self._hover_timer = QTimer(self)
+            self._hover_timer.setSingleShot(True)
+            self._hover_timer.setInterval(10)
+            self._hover_timer.timeout.connect(self._show_hover_zoom)
+        self._hover_timer.start()
+
+    def _cancel_hover_zoom(self):
+        if self._hover_timer is not None:
+            self._hover_timer.stop()
+
     # ------------------------------------------------------------------
     # Hover zoom: an enlarged overlay shown over the card while hovering /
     # 悬停放大：悬停时在卡片上方显示放大浮层
     # ------------------------------------------------------------------
+
+    # Apply the name label text: elide (scroll text + "…") unless the full
+    # name fits; while hovering a long name scrolls across (marquee).
+    # 应用名字标签文本：完整名称放不下时截断加省略号；悬停时长名称横向
+    # 滚动（跑马灯）。
+    def _apply_name_display(self):
+        lbl = getattr(self, "_name_label", None)
+        if lbl is None:
+            return
+        if self._name_full:
+            # Static (not hovering): elide with "…" when the name is long.
+            # Hovering restores the full name for the marquee scroll.
+            # 静态（非悬停）：名称过长时截断加省略号；悬停时恢复完整名供跑马灯。
+            lbl.setText(self._elide_name(self._name_full))
+        else:
+            lbl.setText("")
+
+    # Return a name clause: up to NAME_CHAR_LIMIT chars, then "…" when longer.
+    # / 返回名称子串：最多 NAME_CHAR_LIMIT 字符，更长则加省略号。
+    def _elide_name(self, name):
+        if name and len(name) > self.NAME_CHAR_LIMIT:
+            return name[:self.NAME_CHAR_LIMIT] + "…"
+        return name
+
+    # Start the long-name marquee on hover (if the name overflows the label
+    # width). / 悬停时启动长名称跑马灯（若名称超出标签宽度）。
+    def _start_name_scroll(self):
+        lbl = getattr(self, "_name_label", None)
+        if lbl is None or not self._name_full:
+            return
+        if self._name_scroll_timer is not None:
+            return
+        try:
+            from PySide6.QtGui import QFontMetrics
+            from PySide6.QtWidgets import QApplication
+        except ImportError:
+            return
+        w = lbl.width()
+        if w <= 0:
+            return
+        fm = QFontMetrics(lbl.font())
+        if fm.horizontalAdvance(self._name_full) <= w:
+            return  # fits — no scroll needed / 放得下——无需滚动
+        self._name_scroll_offset = 0
+        self._name_scroll_timer = QTimer(self)
+        # Slower marquee: advance one char every 80 ms (~12.5 chars/s) so it
+        # reads comfortably rather than zipping by. / 较慢的跑马灯：每 80ms 前进
+        # 一格（约每 12.5 字符/秒），阅读舒适而非快速掠过。
+        self._name_scroll_timer.setInterval(80)
+        self._name_scroll_timer.timeout.connect(self._tick_name_scroll)
+        self._name_scroll_timer.start()
+
+    def _stop_name_scroll(self):
+        if self._name_scroll_timer is not None:
+            self._name_scroll_timer.stop()
+            self._name_scroll_timer.deleteLater()
+            self._name_scroll_timer = None
+        self._name_scroll_offset = 0
+        self._scroll_char_widths = {}
+        lbl = getattr(self, "_name_label", None)
+        if lbl is not None:
+            # Restore the static (non-hover) elided text / 恢复静态截断文本
+            lbl.setText(self._elide_name(self._name_full))
+
+    def _tick_name_scroll(self):
+        # Marquee: render a looping window of the name. The window advances
+        # one character per tick and wraps around, so the text keeps cycling
+        # (shows the head, then the tail, then loops back to the head)
+        # instead of just truncating. / 跑马灯：渲染循环窗口。窗口每 tick 前进
+        # 一格并回绕，文本持续循环（先显示头部、再尾部、再回到头部），而非
+        # 仅截断。
+        lbl = getattr(self, "_name_label", None)
+        if lbl is None or not self._name_full:
+            self._stop_name_scroll()
+            return
+        w = lbl.width()
+        try:
+            from PySide6.QtGui import QFontMetrics
+        except ImportError:
+            self._stop_name_scroll()
+            return
+        fm = QFontMetrics(lbl.font())
+        name = self._name_full
+        text_w = fm.horizontalAdvance(name)
+        if w <= 0:
+            return
+        if text_w <= w:
+            lbl.setText(self._elide_name(name))
+            return
+        # Feed a doubled name so the window can slide seamlessly and loop.
+        # / 使用双倍名称，窗口无缝滑动并循环。
+        doubled = name + "  " + name
+        # Advance the window by one char each tick; wrap when past the name.
+        # / 每 tick 前进一格，超过名称长度后回绕。
+        self._name_scroll_offset += 1
+        if self._name_scroll_offset > len(name):
+            self._name_scroll_offset = 0
+        # Count characters that fit the label width, then slice the doubled
+        # name from the current offset. Per-char widths are cached on the
+        # card (the label width + font are fixed for the hover duration), so
+        # the loop does not re-measure the same characters on every tick.
+        # / 计算标签宽度能容纳的字符数，从当前偏移截取双倍名称。每字符宽度
+        # 缓存在卡片上（标签宽度与字号在悬停期间固定），循环不再每 tick
+        # 重复度量同一批字符。
+        cache = getattr(self, "_scroll_char_widths", {})
+        disp_w = w - 4  # small padding / 少量边距
+        chars = 0
+        acc = 0
+        # advance from the offset into the doubled string's slack so the head
+        # also scrolls in when wrapping / 从偏移取足够字符填满 label
+        i = 0
+        while acc < disp_w and i < len(doubled):
+            ch = doubled[i]
+            cw = cache.get(ch)
+            if cw is None:
+                cw = fm.horizontalAdvance(ch)
+                cache[ch] = cw
+            acc += cw
+            chars += 1
+            i += 1
+        self._scroll_char_widths = cache
+        msg = doubled[self._name_scroll_offset:
+                      self._name_scroll_offset + chars]
+        lbl.setText(msg)
 
     def _ensure_hover_layer(self):
         if self._hover_layer is None:
@@ -591,15 +843,40 @@ class EmojiItem(QFrame):
         pix = self._thumb_label.pixmap()
         if pix is None or pix.isNull():
             return
+        # "Zoom in place": keep the original thumbnail occupying its layout
+        # cell (so the name label below does NOT shift to the center when the
+        # layout collapses), and show an enlarged copy on top of it. The
+        # overlay is positioned around the thumbnail area.
+        # "原位放大"：保留原缩略图占用布局格子（避免下方名字因布局塌缩而
+        # 移到中央），在它上方显示放大副本。浮层以缩略图区域为中心定位。
         z = self._hover_zoom
         # Scale by the IMAGE's aspect ratio, not the card shape (a 4:3
         # sticker grows as a 4:3 rectangle, not as the square card)
         # 按图片自身的宽高比放大（4:3 的表情包放大为 4:3 矩形，而非方形卡片）
         w = max(10, int(round(pix.width() * z)))
         h = max(10, int(round(pix.height() * z)))
-        # center the enlarged overlay on the card / 放大浮层以卡片为中心
-        x = (self.width() - w) // 2
-        y = (self.height() - h) // 2
+        # Do not let the overlay cover the name strip below / 不让浮层盖住下方名称条
+        ny = self.height() - self._name_area - 2 if self._show_name else self.height()
+        # Fit the scale within the space above the name strip so the emoji
+        # stays inside the card (height then re-proportions the width so the
+        # image keeps its aspect ratio instead of letterboxing off-centre).
+        # / 在名称条以上的空间内适配缩放，使表情保持在卡片内；高度受限时同步
+        # 等比调整宽度，避免图片在非等比框内被左右偏移。
+        max_h = max(10, ny)
+        if h > max_h:
+            s = max_h / h
+            w = max(10, int(round(w * s)))
+            h = max_h
+        # Centre the overlay on the CARD's horizontal centre (the thumbnail's
+        # own centre is off by the card padding, which made the enlarged
+        # emoji lean right), and vertically on the thumb area.
+        # 浮层以卡片水平中心为锚点（缩略图自身中心受卡片内边距偏移，导致
+        # 放大表情偏右），垂直方向居中于缩略图区域。
+        cxp = self.width() // 2
+        pg = self._thumb_label.geometry()
+        cyp = pg.y() + pg.height() // 2
+        x = cxp - w // 2
+        y = cyp - h // 2
         self._hover_layer.setGeometry(x, y, w, h)
         self._hover_layer.raise_()
         self._hover_layer.show()
@@ -607,11 +884,17 @@ class EmojiItem(QFrame):
         # Hide sibling cards overlapped by the enlarged overlay so it is not
         # partly covered / 隐藏被放大浮层覆盖的相邻卡片，避免浮层被部分遮挡
         self._hide_neighbor_cards()
+        # Start the long-name marquee while hovering / 悬停时启动长名称跑马灯
+        self._start_name_scroll()
 
     def _hide_hover_zoom(self):
         if self._hover_layer is not None:
             self._hover_layer.hide()
+        # The original thumbnail stays visible (it keeps its layout cell);
+        # no show() needed here. / 原缩略图保持可见（占据布局格子），无需恢复。
         self._restore_neighbor_cards()
+        # Stop the long-name marquee when leaving hover / 离开悬停停止跑马灯
+        self._stop_name_scroll()
 
     def _find_grid(self):
         p = self.parent()
@@ -686,9 +969,13 @@ class EmojiItem(QFrame):
     # Play GIF animation (called by the grid visibility driver; idempotent).
     # Prefers the native gifdec.dll decoder (frames decode off the GUI
     # thread); falls back to QMovie when the DLL is unavailable.
+    # priority: lower decodes sooner (the visible band passes ~0-9, so a GIF
+    # scrolled into view decodes before older off-screen requests).
     # 播放 GIF 动画（由网格可见性驱动调用，幂等）。优先使用原生 gifdec.dll
     # 解码器（帧在 GUI 线程外解码）；DLL 不可用时回退 QMovie。
-    def play_animation(self):
+    # priority：越小越先解码（视野内传 ~0-9，滚动进视野的 GIF 优先于旧的
+    # 视野外请求）。
+    def play_animation(self, priority=100, allow_decode=True):
         if self._is_text or self._playing:
             return
         if not self.is_gif():
@@ -707,14 +994,20 @@ class EmojiItem(QFrame):
             self._start_play_timer()
             return
         # Frames not decoded yet: mark playing and start playback when the
-        # background decode finishes / 帧尚未解码：标记播放中，后台解码完成后开始播放
+        # background decode finishes. While scrolling (allow_decode=False)
+        # the decode request is skipped — the static thumbnail stays until
+        # the scroll settles, then decoding resumes center-outward. / 帧尚未
+        # 解码：标记播放中，后台解码完成后开始播放。滚动中（allow_decode=
+        # False）跳过解码请求——保持静态缩略图，停下后再从中心向两边解码。
+        if not allow_decode:
+            return
         self._playing = True
         if not self._decode_connected:
             gif_player.connect_decoded(self._on_frames_ready)
             self._decode_connected = True
         if not self._decode_req:
             self._decode_req = True
-            gif_player.request_decode(fp, self.THUMB_SIZE - 4)
+            gif_player.request_decode(fp, self.thumb_size() - 4, priority)
 
     # Native frames are ready (path only; frames live in the cache)
     # 原生帧已就绪（仅传路径；帧在缓存中）
@@ -760,8 +1053,7 @@ class EmojiItem(QFrame):
     def _show_frame(self, idx):
         if self._thumb_label is not None and 0 <= idx < len(self._frames):
             pix = QPixmap.fromImage(self._frames[idx])
-            self._thumb_label.setPixmap(pix)
-            self._update_hover_layer(pix)
+            self._set_thumb_pixmap(pix)
 
     # Stop GIF animation and restore the static thumbnail (idempotent)
     # 停止 GIF 动画并恢复静态缩略图（幂等）
@@ -789,7 +1081,7 @@ class EmojiItem(QFrame):
         self._movie.start()
 
     def _gif_scaled_size(self, filepath):
-        target = self.THUMB_SIZE - 4
+        target = self.thumb_size() - 4
         reader = QImageReader(filepath)
         size = reader.size()
         if size.isValid() and size.width() > 0 and size.height() > 0:
@@ -797,6 +1089,8 @@ class EmojiItem(QFrame):
         return QSize(target, target)
 
     def _stop_gif(self):
+        self._cancel_hover_zoom()
+        self._hide_hover_zoom()
         if self._movie:
             self._movie.stop()
             # Release the file handle synchronously: QMovie keeps the file
@@ -814,5 +1108,4 @@ class EmojiItem(QFrame):
     def _on_frame(self, _frame):
         if self._movie and not self._is_text:
             pix = self._movie.currentPixmap()
-            self._thumb_label.setPixmap(pix)
-            self._update_hover_layer(pix)
+            self._set_thumb_pixmap(pix)

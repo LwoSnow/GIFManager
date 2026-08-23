@@ -142,6 +142,7 @@ class SettingsDialog(QDialog):
                  global_sort_enabled=False, global_sort_by="time", global_sort_desc=False,
                  auto_convert_gif=True, auto_update=False, show_emoji_name=True,
                  hover_zoom=1.15, hover_preview_enabled=True, auto_input=True,
+                 card_scale=1.0, name_font_size=10,
                  data_manager=None, hotkey_desc="", parent=None):
         super().__init__(parent)
         self.setWindowTitle(tr("settings"))
@@ -178,6 +179,10 @@ class SettingsDialog(QDialog):
         self._hover_preview_enabled = hover_preview_enabled
         # Click emoji -> auto-type into the focused chat input / 点击表情自动输入
         self._auto_input = auto_input
+        # Card scale factor / 卡片缩放系数
+        self._card_scale = max(0.5, min(2.0, float(card_scale)))
+        # Global name font size for image cards / 图片卡全局名字字号
+        self._name_font_size = max(1, min(20, int(name_font_size)))
         self._dm = data_manager
         self._hotkey_mods = 0
         self._hotkey_vk = 0
@@ -401,6 +406,41 @@ class SettingsDialog(QDialog):
         self._cb_hover_preview.toggled.connect(self._spin_zoom.setEnabled)
         self._spin_zoom.setEnabled(self._hover_preview_enabled)
         self._page_layout.addWidget(self._zoom_group)
+
+        # Card size scale / 卡片尺寸缩放
+        self._card_size_group = QGroupBox(tr("card_size_group"))
+        card_size_layout = QHBoxLayout(self._card_size_group)
+        self._label_card_size = QLabel(tr("card_size"))
+        card_size_layout.addWidget(self._label_card_size)
+        self._spin_card_size = QSpinBox()
+        self._spin_card_size.setRange(50, 200)
+        self._spin_card_size.setButtonSymbols(
+            QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self._spin_card_size.setFixedWidth(64)
+        self._spin_card_size.setValue(
+            int(round(self._card_scale * 100)))
+        card_size_layout.addWidget(self._spin_card_size)
+        self._label_card_size_pct = QLabel("%")
+        card_size_layout.addWidget(self._label_card_size_pct)
+        card_size_layout.addStretch()
+        self._page_layout.addWidget(self._card_size_group)
+
+        # Name font size group / 名字字号分组
+        self._name_font_group = QGroupBox(tr("name_font_size_group"))
+        nf_layout = QHBoxLayout(self._name_font_group)
+        self._label_name_font = QLabel(tr("name_font_size"))
+        nf_layout.addWidget(self._label_name_font)
+        self._spin_name_font = QSpinBox()
+        self._spin_name_font.setRange(1, 20)
+        self._spin_name_font.setButtonSymbols(
+            QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self._spin_name_font.setFixedWidth(64)
+        self._spin_name_font.setValue(self._name_font_size)
+        nf_layout.addWidget(self._spin_name_font)
+        self._label_name_font_pt = QLabel("pt")
+        nf_layout.addWidget(self._label_name_font_pt)
+        nf_layout.addStretch()
+        self._page_layout.addWidget(self._name_font_group)
 
         self._lang_group = QGroupBox(tr("language_group"))
         lang_layout = QHBoxLayout(self._lang_group)
@@ -952,6 +992,10 @@ class SettingsDialog(QDialog):
         self._zoom_group.setTitle(tr("hover_zoom_group"))
         self._cb_hover_preview.setText(tr("hover_preview_enable"))
         self._label_zoom.setText(tr("hover_zoom"))
+        self._card_size_group.setTitle(tr("card_size_group"))
+        self._label_card_size.setText(tr("card_size"))
+        self._name_font_group.setTitle(tr("name_font_size_group"))
+        self._label_name_font.setText(tr("name_font_size"))
         self._lang_group.setTitle(tr("language_group"))
         self._other_group.setTitle(tr("other_group"))
         self._cb_remember.setText(tr("remember_group"))
@@ -1073,6 +1117,21 @@ class SettingsDialog(QDialog):
 
     def hover_zoom(self):
         return self._spin_zoom.value() / 100.0
+
+    def card_scale(self):
+        return self._spin_card_size.value() / 100.0
+
+    def set_card_scale(self, scale):
+        # Sync the spinbox when the scale changes elsewhere (e.g. Alt+wheel)
+        # so the settings dialog matches the live value. / 当缩放倍数在别处
+        # 变化（如 Alt+滚轮）时同步输入框，保证设置界面与实时值一致。
+        scale = max(0.5, min(2.0, float(scale)))
+        self._spin_card_size.blockSignals(True)
+        self._spin_card_size.setValue(int(round(scale * 100)))
+        self._spin_card_size.blockSignals(False)
+
+    def name_font_size(self):
+        return self._spin_name_font.value()
 
     def hover_preview_enabled(self):
         return self._cb_hover_preview.isChecked()

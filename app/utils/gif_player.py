@@ -148,26 +148,56 @@ def _cache_put(path, frames, delays):
 # ---- background decode worker / 后台解码工作线程 --------------------------
 
 class _DecodeWorker(QObject):
-    request = Signal(str, int)   # path, target size / 路径、目标尺寸
-    decoded = Signal(str)        # path (frames are in the cache) / 路径（帧已入缓存）
+    # Priority decoding: requests carry a priority (lower = sooner); the
+    # worker processes the highest-priority pending request first, so a GIF
+    # scrolled into view decodes before older off-screen ones. Without this,
+    # a long scroll through an all-animated group queued every visible GIF
+    # behind all previously requested ones and playback lagged badly.
+    # 优先级解码：请求带优先级（越小越先处理）；worker 每次取最高优先级的
+    # 待处理请求，滚动进视野的 GIF 会排在旧的视野外请求之前。此前长跨度
+    # 滚动全动图分组时，每个新可见 GIF 都排在所有旧请求之后，播放严重滞后。
+    request = Signal(str, int, int)   # path, target size, priority / 路径、目标尺寸、优先级
+    decoded = Signal(str)             # path (frames are in the cache) / 路径（帧已入缓存）
 
     def __init__(self):
         super().__init__()
-        self._pending = set()
+        # pending: path -> (priority, target). A QTimer pumps one decode per
+        # tick so the worker never blocks new requests; each tick decodes the
+        # current highest-priority entry.
+        # pending：path -> (priority, target)。QTimer 每个 tick 解码一个，
+        # worker 不会阻塞新请求；每个 tick 解码当前最高优先级项。
+        self._pending = {}
+        self._processing = False
         self.request.connect(self.on_request)
 
-    @Slot(str, int)
-    def on_request(self, path, target):
-        if path in self._pending:
-            return  # one in-flight decode per path / 同一路径只解码一次
-        self._pending.add(path)
+    @Slot(str, int, int)
+    def on_request(self, path, target, priority):
+        self._pending[path] = (priority, target)
+        if not self._processing:
+            self._processing = True
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, self._pump_once)
+
+    def _pump_once(self):
+        # Decode exactly one highest-priority request, then schedule the
+        # next tick if more remain. / 解码一个最高优先级请求，若还有剩余则
+        # 安排下一个 tick。
+        if not self._pending:
+            self._processing = False
+            return
+        path = min(self._pending, key=lambda p: self._pending[p][0])
+        _prio, target = self._pending.pop(path)
         try:
             result = decode_all(path, target)
             if result is not None:
                 _cache_put(path, result[0], result[1])
         finally:
-            self._pending.discard(path)
-        self.decoded.emit(path)
+            self.decoded.emit(path)
+        if self._pending:
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, self._pump_once)
+        else:
+            self._processing = False
 
 
 _worker = None
@@ -185,12 +215,14 @@ def _ensure_worker():
     return _worker
 
 
-def request_decode(path, target):
-    # Ask the worker to decode a GIF; skip when it is already cached
-    # 请求后台解码 GIF；已缓存时直接跳过
+def request_decode(path, target, priority=100):
+    # Ask the worker to decode a GIF; skip when it is already cached. Lower
+    # priority numbers are decoded first (the visible band uses ~0-9, older
+    # requests fall back to 100). / 请求后台解码 GIF；已缓存时直接跳过。
+    # 优先级数字越小越先解码（视野内用 ~0-9，旧请求默认 100）。
     if _dll() is None or _frames_cache.get(path) is not None:
         return
-    _ensure_worker().request.emit(path, target)
+    _ensure_worker().request.emit(path, target, int(priority))
 
 
 def connect_decoded(handler):
