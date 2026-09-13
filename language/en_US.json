@@ -209,8 +209,6 @@
     "gif_render_manual": "Custom simultaneous count",
     "gif_render_count_unit": "GIFs",
     "gif_render_hint": "Rendering more animated GIFs at once is smoother but uses more CPU; too many can make scrolling stutter.",
-    "gif_render_gpu": "Use GPU rendering (experimental)",
-    "gif_render_gpu_hint": "Accelerates grid painting with the GPU, lowering CPU usage. May not work or may misbehave on some GPUs/drivers — turn it off if you see problems.",
     "gpu_pref": "Preferred GPU",
     "gpu_pref_system": "System default",
     "gpu_pref_high": "High performance",
@@ -222,6 +220,13 @@
     "gpu_detecting": "Detecting…",
     "ffmpeg_testing": "Testing…",
     "gpu_adapters_none": "No GPU information detected.",
-    "gpu_pref_target": "Written for this program: {exe} (takes effect on the next launch)",
-    "gpu_accel_enable": "Use GPU-accelerated rendering (experimental)"
+    "gpu_pref_target": "Written for this program: {exe} (currently recorded: {state}; takes effect on the next launch)",
+    "gpu_stored_none": "not set",
+    "gpu_usage_unknown": "This program's GPU usage: press \"Detect GPUs\" to check",
+    "gpu_usage_none": "This program's GPU usage: none. Qt paints widgets with the CPU raster engine, so the interface itself never runs on the GPU — this switch only parallelises thumbnail decoding and asks Windows for the chosen adapter. To get interface painting onto the GPU, tick the experimental GPU viewport below and restart.",
+    "gpu_usage_active": "This program is using a GPU (LUID: {luids})",
+    "gpu_viewport_enable": "Experimental: render the interface on the GPU (needs a restart)",
+    "gpu_viewport_hint": "When on, the sticker grid is composited through an OpenGL surface, so this process really uses the chosen GPU (you can see the activity in Task Manager). It needs a restart and is deliberately never switched at runtime — doing that used to crash the renderer. If the system has no usable OpenGL, it falls back to the CPU viewport.",
+    "settings_restart_required": "This setting takes effect after restarting the program",
+    "gpu_accel_enable": "Use GPU-accelerated rendering"
 }
