@@ -305,7 +305,14 @@ QGroupBox::title {
 }
 QCheckBox, QRadioButton {
     color: #333333;
-    spacing: 6px;
+    spacing: 8px;
+}
+/* Same as the dark theme: the indicator stays native so it keeps its tick, and
+   only the row height is pinned so the box can never be clipped by DPI scaling. /
+   与深色主题同理：指示器保持原生风格以保留打钩，只钉住行高，方框不会因 DPI 缩放
+   被裁掉。 */
+QCheckBox {
+    min-height: 18px;
 }
 QRadioButton::indicator {
     width: 12px;

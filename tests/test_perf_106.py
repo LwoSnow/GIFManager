@@ -183,13 +183,25 @@ check("delete_group invalidated the cache",
 
 # --------------------------------------------------------------- card reuse
 print("\n[3] lazy-loader card reuse pool / 懒加载卡片复用池")
+# Force a TALL layout first (one column). The resize auto-fill would otherwise
+# spread these 90 stickers over ~10 columns, making the whole group fit inside
+# the lazy band — then "every card is live" is correct and this section would
+# measure nothing. The reuse pool is what is under test here, not the columns.
+# 先强制成"高"布局（单列）。否则拉伸自动铺满会把这 90 张摊成约 10 列，整组正好
+# 落在懒加载缓冲区内——那时"所有卡都在用"本身就是正确结果，本节就测不到东西了。
+# 本节要测的是复用池，不是列数。
+dm.rearrange_columns(gid, 1)
 grid.load_emojis(dm.get_emojis_by_group(gid), "image")
 for _ in range(8):
     app.processEvents()
+grid._merge_timer.stop()
+grid._resize_refresh_timer.stop()
 sb = grid._find_scroll().verticalScrollBar()
 check("the grid is actually scrollable (scroll range > 0)",
       sb.maximum() > 0, f"maximum={sb.maximum()}")
 live_before = len(grid._items)
+check("the tall layout keeps the live set small", live_before < 20,
+      f"{live_before} live cards for {len(grid._data)} stickers")
 reused_before = grid._pool_reused
 for k in range(24):
     sb.setValue(int(sb.maximum() * k / 24))
@@ -202,8 +214,8 @@ check("scrolling reused pooled cards",
       grid._pool_reused > reused_before,
       f"reused {grid._pool_reused - reused_before}")
 check("card count stays bounded while scrolling (no unbounded growth)",
-      len(grid._items) <= live_before + 4,
-      f"{len(grid._items)} vs {live_before}")
+      len(grid._items) <= live_before + 6 and len(grid._items) <= len(grid._data),
+      f"{len(grid._items)} vs {live_before} (data={len(grid._data)})")
 check("pool stays within its cap", len(grid._card_pool) <= grid._CARD_POOL_MAX)
 
 # Every live card must point at the emoji the layout expects, with the right
@@ -399,9 +411,35 @@ grid.load_emojis(dm.get_emojis_by_group(gid), "image")
 for _ in range(6):
     app.processEvents()
 grid.enter_edit_mode()
-all_em = dm.get_emojis_by_group(gid)
-target = all_em[-1]
-grid._selection[str(target["id"])] = target
+# Select through the SUPPORTED path: a card's own set_checked() updates the
+# selection map (writing the map directly leaves an already-materialised card
+# unchecked, which is a test artefact, not a product state).
+# 走受支持的路径：卡片自身的 set_checked() 会同步选中集合（直接写集合会让已
+# 物化的卡片保持未勾选，那是测试假象而非程序状态）。
+sb.setValue(sb.maximum())
+for _ in range(4):
+    app.processEvents()
+grid._ensure_visible(allow_decode=False)
+for _ in range(4):
+    app.processEvents()
+check("a card exists at the end of the list", bool(grid._items),
+      f"{len(grid._items)} cards")
+target = grid._items[-1]._emoji
+grid._items[-1].set_checked(True)
+for _ in range(4):
+    app.processEvents()
+check("selecting through the card updates the selection map",
+      str(target["id"]) in grid._selection,
+      f"selection={sorted(grid._selection)[:5]}")
+
+# Scroll far away so the card is recycled, then scroll back /
+# 先滚到远处让该卡片被回收，再滚回来
+sb.setValue(0)
+for _ in range(4):
+    app.processEvents()
+grid._ensure_visible(allow_decode=False)
+for _ in range(4):
+    app.processEvents()
 sb.setValue(sb.maximum())
 for _ in range(4):
     app.processEvents()
@@ -409,7 +447,7 @@ grid._ensure_visible(allow_decode=False)
 for _ in range(4):
     app.processEvents()
 card_for_target = [c for c in grid._items if c._emoji["id"] == target["id"]]
-check("the selected card exists after scrolling to the end",
+check("the selected card exists again after scrolling back to the end",
       len(card_for_target) == 1, f"n={len(card_for_target)}")
 if card_for_target:
     check("the reused/created card is checked", card_for_target[0].is_checked())

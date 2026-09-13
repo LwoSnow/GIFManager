@@ -216,9 +216,12 @@ check("B8 list_adapters is off the GUI thread in the dialog",
       "QThreadPool" in inspect.getsource(_sd.SettingsDialog._refresh_gpu_adapters))
 check("B8 the ffmpeg test is off the GUI thread",
       "QThreadPool" in inspect.getsource(_sd.SettingsDialog._check_ffmpeg))
-check("B8 list_adapters uses a short timeout and forces UTF-8",
-      "timeout=5" in inspect.getsource(gpu_pref.list_adapters)
-      and "Text.Encoding" in inspect.getsource(gpu_pref.list_adapters))
+check("B8 list_adapters uses the registry (no subprocess, works packaged)",
+      "_adapters_from_registry()" in inspect.getsource(gpu_pref.list_adapters))
+check("B8 the PowerShell fallback keeps a short timeout and UTF-8 output",
+      "timeout=5" in inspect.getsource(gpu_pref._adapters_from_powershell)
+      and "Text.Encoding" in inspect.getsource(
+          gpu_pref._adapters_from_powershell))
 
 # ---------------------------------------------------------------- B13
 print("\n[B13] animation survives with ffmpeg disabled / 停用 ffmpeg 不丢动画")

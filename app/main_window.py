@@ -346,6 +346,14 @@ class MainWindow(QMainWindow):
         # GPU/加速渲染总开关：开启时并行渲染缩略图并写入所选显卡偏好；关闭时清除。
         self._gpu_accel = self._settings.value(
             "gpu_accel", self._gpu_render, type=bool)
+        # Experimental GPU (OpenGL) viewport. Opt-in and applied at STARTUP only
+        # (see _apply_gpu_viewport), so changing it needs a restart.
+        # 实验性 GPU（OpenGL）视口。可选，且仅在启动时安装（见
+        # _apply_gpu_viewport），因此修改后需重启生效。
+        self._gpu_viewport = self._settings.value(
+            "gpu_viewport", False, type=bool)
+        self._gpu_viewport_installed = False
+        self._gpu_viewport_widget = None
         # Windows per-app GPU preference (0 system / 1 power / 2 high perf) /
         # Windows 按应用 GPU 首选项（0 系统 / 1 省电 / 2 高性能）
         self._gpu_pref = self._settings.value("gpu_pref", 0, type=int)
@@ -415,20 +423,27 @@ class MainWindow(QMainWindow):
             from app.utils import gpu_pref
             accel = bool(getattr(self, "_gpu_accel", False))
             pref = int(getattr(self, "_gpu_pref", 0) or 0)
-            if not explicit:
-                if not accel or not pref:
+            if not accel:
+                if not explicit:
                     self._log.info(
                         "GPU preference -> startup, left untouched / 未改动")
                     return
-            else:
-                # Explicit OK: the UI state IS the desired state — turning
-                # acceleration off (or picking "system default") clears the
-                # override. Always applied, never gated on a value change, so
-                # the registry can never drift away from what the dialog shows.
-                # 显式确定：界面状态即目标状态——关闭加速（或选"系统默认"）即清除
-                # 覆盖项。始终执行、不以"值是否变化"为条件，注册表因此不可能与
-                # 对话框显示的状态不一致。
-                pref = pref if accel else 0
+                # The user turned the switch OFF: clear our request /
+                # 用户关闭了开关：清除本程序的请求
+                pref = 0
+            elif not pref:
+                # Acceleration is ON but the adapter is "system default": the
+                # user asked for NO specific GPU. Deleting the entry here would
+                # be exactly backwards — it used to REMOVE the discrete-GPU
+                # request the moment the switch was turned on, which is why
+                # enabling "GPU acceleration" appeared to STOP using the GPU.
+                # 加速开启但显卡为"系统默认"：用户并未指定任何显卡。此时删除该项
+                # 恰好相反——此前正是在打开开关的一刻把独显请求删掉，于是"开启
+                # GPU 加速"看起来反而不用独显了。
+                self._log.info(
+                    "GPU preference -> accel on, adapter unset, left "
+                    "untouched / 未指定显卡，未改动")
+                return
             exe = gpu_pref.current_exe()
             ok = gpu_pref.apply_preference(exe, pref)
             self._log.info(
@@ -489,7 +504,148 @@ class MainWindow(QMainWindow):
         #   - 而且它并不决定程序实际使用哪块显卡，所以"关闭"后 GPU 偏好依然
         #     生效（独显仍被调用）。
         # Qt 也无法把进程绑定到指定显卡；操作系统级首选项才是受支持的机制。
+        # NOTE: the OpenGL viewport is back as an OPT-IN experiment
+        # (_apply_gpu_viewport, default off, startup only) because users asked for
+        # the process to really touch the GPU — see that method for how the two
+        # field problems (black first paint, crashes on toggling) are avoided.
+        # 注意：OpenGL 视口已作为"可选实验"重新加入（_apply_gpu_viewport，默认
+        # 关闭、仅启动时安装），因为用户希望进程真正用到 GPU——两个实测问题
+        # （首帧全黑、切换崩溃）的规避方式见该方法。
         self._apply_viewport_background()
+
+    def _apply_gpu_viewport(self):
+        # Install the experimental GPU (OpenGL) viewport — STARTUP ONLY.
+        #
+        # Qt paints widget hierarchies with the CPU raster engine, so the app's
+        # own GPU usage is zero and the Windows per-app preference has nothing to
+        # route. Compositing the grid through an OpenGL surface makes the process
+        # really use the GPU. It stays opt-in (default off) and is applied once
+        # at startup, because the two problems reported for the earlier attempt
+        # both came from runtime swapping:
+        #   * re-creating the viewport while toggling crashed the renderer,
+        #   * a freshly created surface could present one black frame (an empty
+        #     group looked pure black) — mitigated by keeping the theme colour in
+        #     the viewport's palette and by NoPartialUpdate (see gl_viewport.py),
+        #     plus a queued update so the colour lands immediately.
+        # It also does not pick an adapter — that is what the Windows preference
+        # is for. / 安装实验性 GPU（OpenGL）视口——仅在启动时。
+        # Qt 用 CPU 光栅引擎绘制控件层级，因此程序自身 GPU 占用为零，Windows 的
+        # 按应用偏好没有可调度的任务。把网格通过 OpenGL 表面合成可让进程真正使用
+        # GPU。它保持可选（默认关闭）且只在启动时应用一次，因为此前那次尝试的两个
+        # 问题都源于运行时替换：切换时重建视口会让渲染器崩溃；刚创建的表面会出现
+        # 一帧全黑（空分组看起来纯黑）——后者通过把主题色放进视口调色板、使用
+        # NoPartialUpdate（见 gl_viewport.py）以及排队一次 update 立即铺色来规避。
+        # 它同样不决定使用哪块显卡——那是 Windows 首选项的职责。
+        if not getattr(self, "_gpu_viewport", False):
+            return
+        # The master switch is authoritative: no GPU acceleration, no GPU surface /
+        # 总开关优先：未开启加速就不安装 GPU 表面
+        if not getattr(self, "_gpu_accel", False):
+            self._log.info(
+                "GPU viewport requested but acceleration is off / 已请求 GPU 视口"
+                "但加速未开启，跳过")
+            return
+        if getattr(self, "_gpu_viewport_installed", False):
+            return
+        if not self._gpu_viewport_supported():
+            self._log.info(
+                "Platform has no OpenGL (%s); keeping the CPU viewport / "
+                "当前平台无 OpenGL，继续使用 CPU 视口", self._platform_name())
+            return
+        try:
+            from app.widgets.gl_viewport import GridGlViewport
+            # IMPORTANT: setViewport() takes ownership of the new widget and
+            # DELETES the old viewport — and the scroll area's widget (our grid)
+            # is a child of that viewport, so a naive swap destroys the grid
+            # (symptom: "Signal source has been deleted" on the next line).
+            # takeWidget() first detaches the grid so it survives the swap.
+            # 关键：setViewport() 会接管新控件并**删除旧视口**——而滚动区的
+            # widget（我们的网格）正是旧视口的子控件，因此直接替换会把网格一起
+            # 销毁（症状：下一行就报 "Signal source has been deleted"）。先
+            # takeWidget() 把网格摘出来，它才能挺过这次替换。
+            grid = self._scroll_area.takeWidget()
+            gl = GridGlViewport(self._scroll_area)
+            self._scroll_area.setViewport(gl)
+            if grid is not None:
+                self._scroll_area.setWidget(grid)
+            self._gpu_viewport_installed = True
+            self._gpu_viewport_widget = gl
+            # Re-apply the theme palette to the NEW viewport /
+            # 给新视口重新套用主题调色板
+            self._apply_viewport_background()
+            QTimer.singleShot(0, gl.update)
+            # Verify the context really came up; if it did not (driver refuses,
+            # remote session, ...) fall back so the grid stays usable.
+            # 核实上下文是否真的建立；若没有（驱动拒绝、远程会话等）则回退，
+            # 保证网格仍可用。
+            QTimer.singleShot(1200, self._verify_gpu_viewport)
+            self._log.info(
+                "Experimental GPU viewport installed / 实验性 GPU 视口已安装")
+        except Exception:
+            self._gpu_viewport_installed = False
+            self._gpu_viewport_widget = None
+            self._log.exception(
+                "GPU viewport install failed; keeping the CPU viewport / "
+                "GPU 视口安装失败，继续使用 CPU 视口")
+
+    @staticmethod
+    def _platform_name():
+        try:
+            from PySide6.QtGui import QGuiApplication
+            return (QGuiApplication.platformName() or "").lower()
+        except Exception:
+            return ""
+
+    def _gpu_viewport_supported(self):
+        # Qt's offscreen/minimal platforms have no OpenGL at all: QOpenGLWidget
+        # there logs "not supported on this platform" and never obtains a
+        # context, so installing one would only cost a repaint path.
+        # Qt 的 offscreen/minimal 平台完全没有 OpenGL：那里的 QOpenGLWidget 会打印
+        # "not supported on this platform" 且永远拿不到上下文，装上去只会白搭一条
+        # 绘制路径。
+        return self._platform_name() not in ("offscreen", "minimal", "minimalegl")
+
+    def _verify_gpu_viewport(self):
+        # Deferred check: a QOpenGLWidget is only valid once it has been shown
+        # and initialised. If it still is not, swap back to a plain viewport.
+        # 延迟核实：QOpenGLWidget 只有在显示并初始化后才有效。若仍无效，则换回
+        # 普通视口。
+        if not getattr(self, "_gpu_viewport_installed", False):
+            return
+        gl = getattr(self, "_gpu_viewport_widget", None)
+        try:
+            valid = gl is not None and gl.isValid()
+        except RuntimeError:
+            valid = False
+        if valid:
+            self._log.info("GPU viewport context is valid / GPU 视口上下文有效")
+            return
+        self._log.warning(
+            "GPU viewport has no usable context; falling back to the CPU "
+            "viewport / GPU 视口没有可用上下文，回退到 CPU 视口")
+        try:
+            grid = self._scroll_area.takeWidget()
+            self._scroll_area.setViewport(QWidget())
+            if grid is not None:
+                self._scroll_area.setWidget(grid)
+        except Exception:
+            self._log.exception("GPU viewport rollback failed / GPU 视口回退失败")
+        self._gpu_viewport_installed = False
+        self._gpu_viewport_widget = None
+        self._apply_viewport_background()
+
+    def _gpu_viewport_valid(self):
+        # True once the GL context really exists (None until the widget has been
+        # shown and initialised, and on platforms without OpenGL).
+        # GL 上下文真正存在时为 True（控件显示并初始化前为 None；无 OpenGL 的平台
+        # 同样为 None）。
+        gl = getattr(self, "_gpu_viewport_widget", None)
+        if gl is None:
+            return None
+        try:
+            return gl.context() is not None
+        except RuntimeError:
+            return None
 
     def _apply_viewport_background(self):
         # Paint the scroll viewport (and the grid) with the theme surface colour
@@ -543,6 +699,7 @@ class MainWindow(QMainWindow):
         self._settings.setValue("gif_render_count", self._gif_render_count)
         self._settings.setValue("gpu_render", self._gpu_render)
         self._settings.setValue("gpu_accel", self._gpu_accel)
+        self._settings.setValue("gpu_viewport", self._gpu_viewport)
         self._settings.setValue("gpu_pref", self._gpu_pref)
         self._settings.setValue("gpu_adapters", "|".join(self._gpu_adapters))
         self._settings.setValue("text_preview_limit_single", self._text_limit_single)
@@ -718,8 +875,9 @@ class MainWindow(QMainWindow):
         EmojiItem._card_scale = self._card_scale
         self.emoji_grid._hover_zoom = self._hover_zoom
         self.emoji_grid._hover_preview_enabled = self._hover_preview_enabled
-        # Resize auto-fill only applies while a global sort is active /
-        # 仅当启用全局排序时，拉伸窗口才自动铺满
+        # Global sort only picks the ordering kind (name/time/frequency); the
+        # resize auto-fill is independent of it now.
+        # 全局排序只决定排序依据（名称/时间/频率）；拉伸自动铺满已与它无关。
         self.emoji_grid._global_sort_enabled = self._gs_enabled
         # Concurrent animated-GIF render cap (Settings -> Performance) /
         # 动态 GIF 同时渲染上限（设置 → 性能）
@@ -737,6 +895,15 @@ class MainWindow(QMainWindow):
         self._start_gpu_adapter_probe()
         self._scroll_area.setWidget(self.emoji_grid)
         root.addWidget(self._scroll_area, 1)
+        # Experimental GPU viewport: install it HERE, before anything captures a
+        # reference to the current (CPU) viewport — the event filter below is
+        # installed on the viewport, and setViewport() replaces and destroys the
+        # old one. Startup only: the surface is never swapped at runtime, which
+        # is what used to crash the renderer when the switch was toggled.
+        # 实验性 GPU 视口：必须在"任何地方持有当前（CPU）视口引用"之前安装——
+        # 下面的事件过滤器装在视口上，而 setViewport() 会替换并销毁旧视口。仅启动
+        # 时安装：运行时绝不替换表面，此前反复切换正是因此让渲染器崩溃。
+        self._apply_gpu_viewport()
 
         self.group_list = GroupListWidget(self.data_manager)
         root.addWidget(self.group_list)
@@ -2028,6 +2195,7 @@ class MainWindow(QMainWindow):
             gif_render_count=self._gif_render_count,
             gpu_render=self._gpu_render,
             gpu_accel=self._gpu_accel,
+            gpu_viewport=self._gpu_viewport,
             gpu_pref=self._gpu_pref,
             gpu_adapters=self._gpu_adapters,
             data_manager=self.data_manager,
@@ -2082,8 +2250,8 @@ class MainWindow(QMainWindow):
         self._gs_enabled = dlg.global_sort_enabled()
         self._gs_by = dlg.global_sort_by()
         self._gs_desc = dlg.global_sort_desc()
-        # Gate the resize auto-fill on the (possibly changed) sort setting /
-        # 依据（可能已变化的）排序设置开关"拉伸自动铺满"
+        # Keep the grid's copy in step; the resize auto-fill no longer depends
+        # on it / 同步网格里的副本；拉伸自动铺满已不再依赖它
         self.emoji_grid._global_sort_enabled = self._gs_enabled
         if gs_changed and self._gs_enabled:
             self._apply_global_sort_all()
@@ -2156,6 +2324,16 @@ class MainWindow(QMainWindow):
         # 的判定会在注册表已经跑偏时（例如被程序外部重置、或上一次"关闭"没能清除）
         # 留下过期状态，使界面与实际 Windows 设置不一致。该写入是幂等的。
         self._apply_gpu_preference(explicit=True)
+        # Experimental GPU viewport: stored here, APPLIED at the next launch —
+        # the surface is deliberately never swapped at runtime (doing that used
+        # to crash the renderer), so tell the user a restart is needed.
+        # 实验性 GPU 视口：此处只保存，下次启动时安装——表面刻意不在运行时替换
+        # （那样做此前会让渲染器崩溃），因此提示用户需重启。
+        vp_needs_restart = False
+        new_vp = dlg.gpu_viewport()
+        if new_vp != self._gpu_viewport:
+            self._gpu_viewport = new_vp
+            vp_needs_restart = True
         theme_changed = (dlg.theme() != self._theme)
         self._theme = dlg.theme()
         self._log.info(
@@ -2184,6 +2362,11 @@ class MainWindow(QMainWindow):
         self._apply_autostart()
         self._apply_thread_count()
         self._refresh_emoji_grid()
+        if vp_needs_restart:
+            # Say it explicitly: the GPU surface is created at startup only /
+            # 明确提示：GPU 表面只在启动时创建
+            self.status_bar.showMessage(
+                f"  {tr('settings_restart_required')}", 5000)
         if new_lang != old_lang:
             self._reload_language()
             if self._settings_dialog is not None:

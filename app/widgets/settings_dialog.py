@@ -31,7 +31,7 @@ from app import __version__
 # 并可能阻塞 12-15 秒，绝不能跑在 GUI 线程上：此前点"检测显卡"最多冻结窗口
 # 12 秒，点"启动 FFmpeg（测试）"最多 15 秒。
 class _ProbeSignals(QObject):
-    adapters_done = Signal(list)
+    adapters_done = Signal(list, list)
     ffmpeg_done = Signal(bool, str)
 
 
@@ -47,7 +47,15 @@ class _AdapterProbeTask(QRunnable):
             names = gpu_pref.list_adapters()
         except Exception:
             names = []
-        _emit_if_alive(self._signals, "adapters_done", names)
+        # The GPU-usage query is a second Windows call, so it runs HERE, off the
+        # GUI thread, together with the enumeration. / GPU 使用情况是另一次
+        # Windows 调用，因此也在这里（GUI 线程外）与枚举一起执行。
+        try:
+            from app.utils import gpu_pref as gp2
+            luids = gp2.process_gpu_luids()
+        except Exception:
+            luids = []
+        _emit_if_alive(self._signals, "adapters_done", names, luids)
 
 
 class _FfmpegProbeTask(QRunnable):
@@ -209,6 +217,7 @@ class SettingsDialog(QDialog):
                  ffmpeg_enabled=True, ffmpeg_path="",
                  gif_render_mode="auto", gif_render_count=0, gpu_render=False,
                  gpu_pref=0, gpu_adapters=None, gpu_accel=None,
+                 gpu_viewport=False,
                  data_manager=None, hotkey_desc="", parent=None):
         super().__init__(parent)
         self.setWindowTitle(tr("settings"))
@@ -284,6 +293,9 @@ class SettingsDialog(QDialog):
         if gpu_accel is None:
             gpu_accel = bool(gpu_render)
         self._gpu_accel = bool(gpu_accel)
+        # Experimental GPU (OpenGL) viewport: default off, needs a restart /
+        # 实验性 GPU（OpenGL）视口：默认关闭，需重启生效
+        self._gpu_viewport = bool(gpu_viewport)
         try:
             from app.utils import gpu_pref as _gp
             self._gpu_target = _gp.preferred_exe_display()
@@ -341,9 +353,15 @@ class SettingsDialog(QDialog):
         # 布局会把提示压扁并切掉最后一行（即"文字上下挤压、显示不全"）。这里按
         # 当前宽度算出实际所需高度并设为最小高度；页面随之变高，由滚动区滚动。
         page = self._stack.currentWidget()
-        if not isinstance(page, QScrollArea):
-            return
-        inner = page.widget()
+        if isinstance(page, QScrollArea):
+            inner = page.widget()
+        else:
+            # A page that is not wrapped in a scroll area still needs its hints
+            # measured — otherwise it is silently skipped (which is how the
+            # About page's licence label ended up clipped).
+            # 没有套滚动区的页面同样需要测量其提示文本——否则会被静默跳过
+            # （关于页的许可标签就是这样被裁掉的）。
+            inner = page
         if inner is None:
             return
         for lab in inner.findChildren(QLabel):
@@ -931,7 +949,7 @@ class SettingsDialog(QDialog):
         else:
             self._lbl_ffmpeg_status.setText(tr("ffmpeg_fail", info=info))
 
-    def _on_adapters_done(self, names):
+    def _on_adapters_done(self, names, luids=None):
         names = [str(n) for n in (names or []) if str(n).strip()]
         self._btn_gpu_probe.setEnabled(True)
         self._btn_gpu_probe.setText(tr("gpu_detect"))
@@ -942,6 +960,22 @@ class SettingsDialog(QDialog):
                 tr("gpu_adapters_found", list=" / ".join(names)))
         else:
             self._lbl_gpu_adapters.setText(tr("gpu_adapters_none"))
+        # Report what THIS process is really doing on the GPU. Qt paints widgets
+        # with the CPU raster engine, so "no GPU activity" is the honest and
+        # expected answer — and it is the only way for the user to tell that
+        # turning the switch on did not silently do nothing.
+        # 报告本进程在 GPU 上到底做了什么。Qt 用 CPU 光栅引擎绘制控件，因此"无
+        # GPU 活动"就是诚实且符合预期的答案——这也是用户唯一能判断"打开开关是否
+        # 什么都没发生"的依据。
+        luids = [str(x) for x in (luids or []) if str(x).strip()]
+        if luids:
+            self._lbl_gpu_usage.setText(
+                tr("gpu_usage_active", luids=" / ".join(luids)))
+        else:
+            self._lbl_gpu_usage.setText(tr("gpu_usage_none"))
+        # Refresh the stored-value line so the user sees the registry state /
+        # 刷新"当前记录"一行，使用户看到注册表的实际状态
+        self._lbl_gpu_target.setText(self._gpu_target_text())
 
     # Hotkey page
     # 快捷键
@@ -1202,17 +1236,14 @@ class SettingsDialog(QDialog):
         line.setStyleSheet("color: #555555;")
         layout.addWidget(line)
 
-        # MIT license text (full, scrollable) / MIT 许可声明（完整文本，可滚动查看）
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        # Hide the horizontal scrollbar: long English words must wrap, not
-        # stretch the page sideways (the bar appears in the English UI)
-        # 隐藏横向滚动条：长英文应换行而非横向撑开页面（英文界面下会出现横条）
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        mit_container = QWidget()
-        mit_layout = QVBoxLayout(mit_container)
-        mit_layout.setContentsMargins(4, 4, 4, 4)
+        # MIT licence text — rendered directly in the page, NOT in a nested
+        # scroll area. The nested box was only as tall as the page viewport
+        # (~263 px) while the wrapped text needs ~492 px, so the licence looked
+        # cut off at the top and bottom; the page's own scroll area already
+        # scrolls, so the inner one only hid text.
+        # MIT 许可声明——直接放在页面里，不再套一层滚动区。内层小框只有页面视口
+        # 那么高（约 263px），而换行后文本需要约 492px，于是许可看起来上下都被截断；
+        # 页面本身已可滚动，内层滚动区只是把文字藏了起来。
         mit = QLabel(
             "MIT License\n"
             "Copyright (c) 2026 LwoSnow\n\n"
@@ -1237,13 +1268,24 @@ class SettingsDialog(QDialog):
             "OTHER DEALINGS IN THE SOFTWARE."
         )
         mit.setWordWrap(True)
-        mit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Left/top aligned: a centred multi-line licence reads badly /
+        # 左对齐并顶部对齐：多行法律文本居中排版很难读
+        mit.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         mit.setStyleSheet("color: #888888; font-size: 11px;")
-        mit_layout.addWidget(mit)
-        mit_layout.addStretch()
-        scroll.setWidget(mit_container)
-        layout.addWidget(scroll, 1)
-        return w
+        mit.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(mit)
+        # Wrap the page in its own scroll area like every other page. It used to
+        # be returned bare, which had two consequences: the page could not
+        # scroll (so anything past the dialog's 520 px was simply cut off) and
+        # _fit_wrapped_labels() skipped it entirely (it only handles
+        # QScrollArea pages), so the licence label kept its one-line-ish
+        # sizeHint height and the text was clipped top and bottom.
+        # 与本对话框其他页面一样，把该页包进自己的滚动区。此前它直接返回裸控件，
+        # 带来两个后果：页面无法滚动（超过对话框 520px 的内容直接被切掉），且
+        # _fit_wrapped_labels() 会整页跳过（它只处理 QScrollArea 页面），于是许可
+        # 标签一直用着"近似一行"的 sizeHint 高度，文字上下被裁。
+        return self._wrap_scroll(w)
 
     # Performance page: worker thread count
     # 性能：多线程核心数
@@ -1334,7 +1376,13 @@ class SettingsDialog(QDialog):
         self._lbl_gpu_adapters.setStyleSheet("color: #888; font-size: 11px;")
         self._lbl_gpu_adapters.setWordWrap(True)
         gr_layout.addWidget(self._lbl_gpu_adapters)
-        self._lbl_gpu_target = QLabel(tr("gpu_pref_target", exe=self._gpu_target))
+        # What this process actually uses the GPU for (see _on_adapters_done) /
+        # 本进程实际把 GPU 用在何处（见 _on_adapters_done）
+        self._lbl_gpu_usage = QLabel("")
+        self._lbl_gpu_usage.setStyleSheet("color: #888; font-size: 11px;")
+        self._lbl_gpu_usage.setWordWrap(True)
+        gr_layout.addWidget(self._lbl_gpu_usage)
+        self._lbl_gpu_target = QLabel(self._gpu_target_text())
         self._lbl_gpu_target.setStyleSheet("color: #888; font-size: 11px;")
         self._lbl_gpu_target.setWordWrap(True)
         gr_layout.addWidget(self._lbl_gpu_target)
@@ -1342,18 +1390,49 @@ class SettingsDialog(QDialog):
         self._lbl_gpu_hint.setStyleSheet("color: #888; font-size: 11px;")
         self._lbl_gpu_hint.setWordWrap(True)
         gr_layout.addWidget(self._lbl_gpu_hint)
+        # Experimental GPU viewport: the only option that makes THIS process use
+        # the GPU for rendering. Off by default and applied at startup only, so
+        # the note about restarting is part of the label, not a surprise later.
+        # 实验性 GPU 视口：唯一能让"本进程"真正用 GPU 渲染的选项。默认关闭且仅在
+        # 启动时安装，因此"需重启"写在标签里，而不是事后才让人发现。
+        self._cb_gpu_viewport = QCheckBox(tr("gpu_viewport_enable"))
+        self._cb_gpu_viewport.setChecked(self._gpu_viewport)
+        gr_layout.addWidget(self._cb_gpu_viewport)
+        self._lbl_gpu_viewport_hint = QLabel(tr("gpu_viewport_hint"))
+        self._lbl_gpu_viewport_hint.setStyleSheet("color: #888; font-size: 11px;")
+        self._lbl_gpu_viewport_hint.setWordWrap(True)
+        gr_layout.addWidget(self._lbl_gpu_viewport_hint)
         self._on_gpu_accel_toggled(self._gpu_accel)
         perf_layout.addWidget(self._gif_render_group)
         self._page_layout.addWidget(self._perf_group)
         self._page_layout.addStretch()
         return self._wrap_scroll(w)
 
+    def _gpu_target_text(self):
+        # The program the preference is written for, plus what is actually
+        # stored right now — so "I turned it on but nothing happened" becomes
+        # checkable instead of a guess.
+        # 首选项写入的目标程序，以及注册表当前实际存放的值——使"我打开了但没生效"
+        # 变成可核对的事实，而非猜测。
+        from app.utils import gpu_pref
+        stored = gpu_pref.get_preference(self._gpu_target or "")
+        if stored is None:
+            state = tr("gpu_stored_none")
+        elif stored == gpu_pref.PREF_HIGH:
+            state = tr("gpu_pref_high")
+        elif stored == gpu_pref.PREF_POWER:
+            state = tr("gpu_pref_power")
+        else:
+            state = tr("gpu_pref_system")
+        return tr("gpu_pref_target", exe=self._gpu_target, state=state)
+
     def _on_gpu_accel_toggled(self, enabled):
         # The adapter choice only matters while acceleration is enabled /
         # 仅在启用加速时，显卡选择才有意义
         for wdg in (self._combo_gpu_pref, self._btn_gpu_probe,
                     self._label_gpu_pref, self._lbl_gpu_target,
-                    self._lbl_gpu_hint):
+                    self._lbl_gpu_usage, self._lbl_gpu_hint,
+                    self._cb_gpu_viewport, self._lbl_gpu_viewport_hint):
             wdg.setEnabled(bool(enabled))
 
     def _on_gif_render_mode_toggled(self, auto_checked):
@@ -1481,14 +1560,17 @@ class SettingsDialog(QDialog):
         self._label_gif_count_unit.setText(tr("gif_render_count_unit"))
         self._gif_render_hint.setText(tr("gif_render_hint"))
         self._cb_gpu_accel.setText(tr("gpu_accel_enable"))
+        self._cb_gpu_viewport.setText(tr("gpu_viewport_enable"))
+        self._lbl_gpu_viewport_hint.setText(tr("gpu_viewport_hint"))
         self._label_gpu_pref.setText(tr("gpu_pref"))
         if self._btn_gpu_probe.isEnabled():
             # Do not overwrite the "detecting…" label while a probe is in
             # flight / 探测进行中不要覆盖"检测中…"文案
             self._btn_gpu_probe.setText(tr("gpu_detect"))
-        self._lbl_gpu_target.setText(
-            tr("gpu_pref_target", exe=self._gpu_target))
+        self._lbl_gpu_target.setText(self._gpu_target_text())
         self._lbl_gpu_hint.setText(tr("gpu_pref_hint"))
+        if not self._lbl_gpu_usage.text():
+            self._lbl_gpu_usage.setText(tr("gpu_usage_unknown"))
         # Refresh the adapter entry wording (adapter names stay as detected) /
         # 刷新适配器项文案（显卡名保持检测到的原名）
         self._fill_gpu_combo(self._gpu_adapters,
@@ -1577,6 +1659,11 @@ class SettingsDialog(QDialog):
 
     def gpu_accel(self):
         return self._cb_gpu_accel.isChecked()
+
+    def gpu_viewport(self):
+        # Experimental GPU (OpenGL) viewport; applied at the next launch /
+        # 实验性 GPU（OpenGL）视口；下次启动时安装
+        return self._cb_gpu_viewport.isChecked()
 
     def gpu_preference(self):
         # 0 = system default, 1 = power saving, 2 = high performance /

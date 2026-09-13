@@ -1,8 +1,13 @@
-"""Verify resize auto-fill: with a GLOBAL SORT ACTIVE, widening the window
-opens as many columns as fit and re-distributes the cards; with global
-sorting OFF the layout is left alone.
-验证拉伸自动铺满：启用全局排序时，加宽窗口会按可容纳列数增列并重新分配卡片；
-未启用全局排序时不改变布局。
+"""Verify resize auto-fill in a NORMAL group (not just the All view).
+
+Widening a group opens as many columns as fit and re-distributes the cards
+row-first; narrowing merges the overflowing columns back. The behaviour must NOT
+depend on the "global sort" setting (it used to, which made the feature look
+broken in every group), but it must still be skipped while a search filter is
+active.
+验证普通分组（而非仅"全部"视图）的拉伸自动铺满：拉宽按可容纳列数增列并
+行优先重排，拉窄融合溢出列。该行为不得依赖"全局排序"设置（此前依赖，导致
+所有普通分组看起来该功能失效），但搜索过滤生效时仍必须跳过。
 """
 import os
 import sys
@@ -64,6 +69,11 @@ def col_count():
                 for e in dm.get_emojis_by_group(gid)}) or 1
 
 
+def flat_order():
+    # (sort_order, id) is the row-major reading order / 行优先阅读顺序
+    return [e["id"] for e in dm.get_emojis_by_group(gid)]
+
+
 def usable():
     return grid._usable_width()
 
@@ -71,28 +81,25 @@ def usable():
 narrow_cols = col_count()
 card_w = EmojiItem.card_size()
 sp = grid._flow.spacing()
+order_before = flat_order()
 print(f"card_w={card_w} spacing={sp} usable={usable()} cols={narrow_cols}")
 
-# --- 1. global sort OFF: widening must NOT auto-fill ---------------------
+# --- 1. widening auto-fills even with global sort OFF --------------------
 grid._global_sort_enabled = False
 sa.resize(900, 500)
 app.processEvents()
-changed_off = grid.auto_fill_columns()
-check("未启用全局排序时不自动铺满", changed_off is False and col_count() == narrow_cols,
-      f"cols={col_count()}")
-
-# --- 2. global sort ON: widening opens more columns ---------------------
-grid._global_sort_enabled = True
 expect = max(1, (usable() + sp) // (card_w + sp))
-changed_on = grid.auto_fill_columns()
+changed = grid.auto_fill_columns()
 app.processEvents()
-check("启用全局排序时自动铺满", changed_on is True, f"changed={changed_on}")
+check("未启用全局排序时也会自动铺满", changed is True, f"changed={changed}")
 check("列数等于可容纳列数", col_count() == expect,
       f"cols={col_count()} expected={expect}")
 check("列数确实增加", col_count() > narrow_cols,
       f"{narrow_cols} -> {col_count()}")
+check("铺满不影响卡片全局顺序", flat_order() == order_before,
+      f"{len(flat_order())} vs {len(order_before)}")
 
-# --- 3. row-first distribution fills the window (no blank column) -------
+# --- 2. row-first distribution fills the window (no blank column) -------
 widths = {}
 for e in dm.get_emojis_by_group(gid):
     ci = int(e.get("col_index", 0))
@@ -101,23 +108,40 @@ total = sum(widths.values()) + sp * max(0, len(widths) - 1)
 check("各列总宽不超过可用宽度", total <= usable() + 1,
       f"total={total} usable={usable()}")
 check("至少两列（铺满而非单列）", col_count() >= 2, col_count())
-# every column holds cards (no empty column left behind) / 每列都有卡片
 per_col = {}
 for e in dm.get_emojis_by_group(gid):
-    per_col[int(e.get("col_index", 0))] = per_col.get(int(e.get("col_index", 0)), 0) + 1
+    ci = int(e.get("col_index", 0))
+    per_col[ci] = per_col.get(ci, 0) + 1
 check("所有列都非空", all(v > 0 for v in per_col.values()), per_col)
 
-# --- 4. re-running with the same width is a no-op ------------------------
+# --- 3. re-running with the same width is a no-op ------------------------
 again = grid.auto_fill_columns()
 check("同宽度重复调用不再改动", again is False, again)
 
-# --- 5. narrowing shrinks again (merge path still works) ----------------
+# --- 4. a search filter still blocks the layout write-back (B10) --------
+grid._filter_keyword = "zzz"
+sa.resize(1400, 500)
+app.processEvents()
+blocked = grid.auto_fill_columns()
+check("过滤态下不自动铺满", blocked is False, blocked)
+check("过滤态下列数不变", col_count() == expect, col_count())
+grid._filter_keyword = ""
+
+# --- 5. widening again opens even more columns --------------------------
+sa.resize(1400, 500)
+app.processEvents()
+more = grid.auto_fill_columns()
+app.processEvents()
+check("继续拉宽会继续增列", more is True and col_count() > expect,
+      f"{expect} -> {col_count()}")
+
+# --- 6. narrowing shrinks again (merge path still works) ----------------
+keep = col_count()
 sa.resize(260, 500)
 app.processEvents()
 grid._check_column_merge()
 app.processEvents()
-check("缩窄窗口后列数减少", col_count() < expect,
-      f"cols={col_count()} was {expect}")
+check("缩窄窗口后列数减少", col_count() < keep, f"cols={col_count()} was {keep}")
 
 n_pass = sum(1 for _, ok in RES if ok)
 print(f"\n拉伸自动铺满验证: {n_pass}/{len(RES)} 通过")

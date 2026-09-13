@@ -19,6 +19,7 @@ GPU 首选项辅助（Windows）。Qt 无法为进程指定某块显卡，但 Wi
 可以请求 Windows 优先使用核显或独显。适配器列表仅用于展示。
 """
 import os
+import re
 import subprocess
 import sys
 
@@ -108,11 +109,56 @@ def get_preference(exe_path):
     return None
 
 
-def list_adapters():
-    # Best-effort list of installed display adapters (informational only).
-    # 尽力列出已安装的显示适配器（仅供参考）。
-    if os.name != "nt":
+# Display-adapter class key: one numbered subkey per installed display driver,
+# each holding DriverDesc (the exact name Device Manager shows).
+# 显示适配器类键：每个已安装的显示驱动一个编号子键，其中 DriverDesc 即设备管理器
+# 显示的名称。
+_DISPLAY_CLASS = (r"SYSTEM\CurrentControlSet\Control\Class"
+                  r"\{4d36e968-e325-11ce-bfc1-08002be10318}")
+
+
+def _adapters_from_registry():
+    # Read the adapter names straight from the registry.
+    # 直接从注册表读取显卡名称。
+    reg = _winreg()
+    if reg is None:
         return []
+    names = []
+    try:
+        key = reg.OpenKey(reg.HKEY_LOCAL_MACHINE, _DISPLAY_CLASS, 0,
+                          reg.KEY_READ)
+    except OSError:
+        return []
+    try:
+        index = 0
+        while True:
+            try:
+                sub = reg.EnumKey(key, index)
+            except OSError:
+                break
+            index += 1
+            if len(sub) != 4 or not sub.isdigit():
+                continue
+            try:
+                with reg.OpenKey(key, sub, 0, reg.KEY_READ) as sk:
+                    try:
+                        name = reg.QueryValueEx(sk, "DriverDesc")[0]
+                    except FileNotFoundError:
+                        continue
+            except OSError:
+                continue
+            name = str(name).strip()
+            if name and name not in names:
+                names.append(name)
+    finally:
+        reg.CloseKey(key)
+    return names
+
+
+def _adapters_from_powershell():
+    # Fallback only: shell out to Windows. Kept for the (unlikely) case where
+    # the class key is unreadable.
+    # 仅作回退：调用 Windows 接口。仅在类键不可读（很少见）时使用。
     try:
         kwargs = {}
         si = subprocess.STARTUPINFO()
@@ -140,6 +186,65 @@ def list_adapters():
         names = [ln.strip().replace("\ufffd", "").strip()
                  for ln in text.splitlines()]
         return [n for n in names if n]
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+
+def list_adapters():
+    # Installed display adapters, REGISTRY FIRST.
+    #
+    # The registry read gives exactly the names Device Manager shows, costs
+    # microseconds and needs no subprocess. The PowerShell route it used to take
+    # cost ~2 s, mangled non-ASCII names on a Chinese system (CP936 pipe vs
+    # UTF-8 decode) and is the first thing to break in a frozen (PyInstaller)
+    # build — where it left the adapter list EMPTY, so the packaged app could
+    # not offer the discrete GPU at all.
+    # 已安装的显示适配器，优先读注册表。
+    #
+    # 注册表读到的名字与设备管理器完全一致，耗时微秒级且无需子进程。此前走的
+    # PowerShell 路线约需 2 秒、在中文系统上还会把非 ASCII 名称弄乱（管道 CP936
+    # 对 UTF-8 解码），并且在打包（PyInstaller）后最先失效——那时适配器列表为空，
+    # 打包程序因此根本无法提供独显选项。
+    if os.name != "nt":
+        return []
+    names = _adapters_from_registry()
+    if names:
+        return names
+    return _adapters_from_powershell()
+
+
+def process_gpu_luids():
+    # Which GPU adapters THIS process has been using, from the per-process GPU
+    # performance counters. An empty result is the honest answer for a
+    # Qt-Widgets app: its interface is painted by the CPU raster engine, so the
+    # Windows per-app preference has no GPU work of ours to route.
+    # 本进程实际用过的显卡（取自按进程的 GPU 性能计数器）。对 Qt Widgets 程序
+    # 而言"空"就是诚实答案：界面由 CPU 光栅引擎绘制，Windows 的按应用首选项
+    # 没有属于本进程的 GPU 工作可分派。
+    if os.name != "nt":
+        return []
+    try:
+        kwargs = {}
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        kwargs["startupinfo"] = si
+        kwargs["creationflags"] = 0x08000000
+        script = (
+            "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+            "Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_"
+            "GPUEngine | Where-Object { $_.Name -like 'pid_%d_*' } | "
+            "ForEach-Object { $_.Name }" % os.getpid())
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                             capture_output=True, timeout=8, **kwargs)
+        text = (out.stdout or b"").decode("utf-8", "replace")
+        luids = []
+        for line in text.splitlines():
+            m = re.search(r"luid_0x[0-9a-fA-F]+_0x([0-9a-fA-F]+)", line)
+            if m:
+                luid = "0x" + m.group(1).upper()
+                if luid not in luids:
+                    luids.append(luid)
+        return luids
     except (OSError, subprocess.SubprocessError):
         return []
 

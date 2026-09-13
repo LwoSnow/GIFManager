@@ -309,10 +309,11 @@ class EmojiGridWidget(QWidget):
         # 当前数据集的搜索关键词（保存下来，使轻量刷新——如拖拽排序后——重载
         # 同一份过滤结果，而非整组数据；此前会丢失搜索过滤）。
         self._filter_keyword = ""
-        # Whether a global sort is active (set from settings). Gates the
-        # resize auto-fill so columns are only opened automatically when the
-        # user asked for global ordering. / 是否启用全局排序（由设置写入）。
-        # 用于限制"拉伸自动铺满"，仅在用户启用全局排序时才自动增列。
+        # Whether a global sort is active (set from settings). It only selects
+        # the group-wide sorting order (name / time / frequency); the resize
+        # auto-fill deliberately does NOT depend on it any more.
+        # 是否启用全局排序（由设置写入）。它只决定全组排序依据（名称/时间/频率）；
+        # 拉伸自动铺满已刻意不再依赖它。
         self._global_sort_enabled = False
         # Last sampled cursor position of a drag-selection sweep (container
         # coordinates), used to interpolate the path / 拖动选择扫过的上一个采样
@@ -1096,12 +1097,24 @@ class EmojiGridWidget(QWidget):
             return self._merge_overflow_columns()
         return False
 
-    # Auto-fill on resize (only while a global sort is active): when the window
-    # is widened, open as many columns as the usable width can hold and
-    # re-distribute the cards row-first, so the stickers fill the window
-    # instead of leaving blank space to the right.
-    # 拉伸窗口时自动铺满（仅在启用全局排序时）：按可用宽度能容纳的列数开新列，
-    # 并以行优先重新分配卡片，使表情铺满窗口而非右侧留白。
+    # Auto-fill on resize: when the window is widened, open as many columns as
+    # the usable width can hold and re-distribute the cards row-first, so the
+    # stickers fill the window instead of leaving blank space on the right.
+    #
+    # Deliberately NOT gated on "global sort" any more. It used to be, which
+    # made the feature look broken in every normal group: the All view always
+    # fills (its layout is computed from the width) while a group view kept its
+    # stored columns, so widening a group left a blank strip on the right and
+    # only "stretched" after ticking a setting that has nothing to do with
+    # resizing. Widening now behaves symmetrically with narrowing (which has
+    # always merged overflowing columns without any such setting).
+    # 拉伸窗口时自动铺满：按可用宽度能容纳的列数开新列，并以行优先重新分配卡片，
+    # 使表情铺满窗口而非右侧留白。
+    #
+    # 不再以"全局排序"为前置条件。此前那样做会让该功能在所有普通分组里看起来是
+    # 坏的：All 视图始终会铺满（其布局按宽度算出），而分组视图保留数据库里存的列，
+    # 于是拉宽分组只在右侧多出空白，必须先勾选一个与"缩放窗口"无关的设置才会铺满。
+    # 现在拉宽与拉窄行为对称（拉窄一直是直接融合溢出列的，也不需要任何设置）。
     def auto_fill_columns(self):
         if self.current_group_id is None or not self._data:
             return False
@@ -1109,8 +1122,6 @@ class EmojiGridWidget(QWidget):
         # the (possibly filtered) data but written to the whole group.
         # 同 _check_column_merge：列数由（可能被过滤的）数据推导，却写回整组。
         if self._filter_keyword:
-            return False
-        if not getattr(self, "_global_sort_enabled", False):
             return False
         dm = self._find_data_manager()
         if dm is None:

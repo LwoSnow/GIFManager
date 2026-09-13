@@ -335,7 +335,21 @@ QGroupBox::title {
 }
 QCheckBox, QRadioButton {
     color: #DDDDDD;
-    spacing: 6px;
+    spacing: 8px;
+}
+/* The checkbox indicator is deliberately left to the NATIVE style so it keeps
+   its tick mark. Only the row height is pinned: the row used to come out exactly
+   as tall as the indicator with no breathing room, so at any DPI scaling other
+   than 100% the top and bottom of the box were clipped. `min-height` is in
+   logical pixels, so the row can never be shorter than the box. Styling
+   `QCheckBox::indicator` itself would replace the native painting and lose the
+   tick, which is why it is not styled here. /
+   复选框指示器刻意交回原生风格，以保留那个打钩。这里只钉住行高：此前行高恰好等于
+   指示器高度、毫无余量，只要 DPI 缩放不是 100%，方框上下就会被裁掉。`min-height`
+   用逻辑像素，行高永远不会小于方框。给 `QCheckBox::indicator` 设样式会顶掉原生
+   绘制、打钩也会消失，因此这里不设。 */
+QCheckBox {
+    min-height: 18px;
 }
 QRadioButton::indicator {
     width: 12px;

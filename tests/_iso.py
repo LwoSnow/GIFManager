@@ -110,7 +110,14 @@ def drain_and_exit(code=0):
             pass
         pool = QThreadPool.globalInstance()
         pool.clear()
-        pool.waitForDone(3000)
+        # The budget must exceed the GPU probe's PowerShell timeout (5 s):
+        # a run that opened Settings can still be inside that call, and
+        # os._exit() while it is reading the pipe is a real crash. Waiting
+        # longer costs nothing when the pool is already idle.
+        # 该预算必须大于 GPU 探测任务的 PowerShell 超时（5s）：打开过设置的那一轮
+        # 可能仍在这次调用里，此时 os._exit() 会在它读管道时崩溃。池已空闲时多等
+        # 不会有任何代价。
+        pool.waitForDone(7000)
         app = QApplication.instance()
         if app is not None:
             app.processEvents()
