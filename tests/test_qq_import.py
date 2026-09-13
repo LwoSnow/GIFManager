@@ -13,6 +13,7 @@ ORI = os.path.join(ROOT, "Ori")
 TMP = tempfile.mkdtemp(prefix="gifmgr_qq_")
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 sys.path.insert(0, ROOT)
+from tests._iso import drain_and_exit  # noqa: E402
 
 import app.models.data_manager as dm_mod
 dm_mod._app_data_dir = lambda: os.path.join(TMP, "data")
@@ -104,4 +105,4 @@ try:
 except Exception:
     pass
 import os as _os
-_os._exit(0 if n_pass == len(RES) else 1)
+drain_and_exit(0 if n_pass == len(RES) else 1)

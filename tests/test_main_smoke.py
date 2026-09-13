@@ -20,6 +20,15 @@ from PySide6.QtWidgets import QApplication
 from app.main_window import MainWindow
 from app.utils import gif_player
 
+# Never touch the real user preferences or the real per-app GPU preference:
+# _real_quit() below saves the whole settings block, which used to overwrite the
+# user's real registry key (resetting 窗口置顶, the chosen GPU, ...).
+# 绝不触碰用户真实偏好与真实按应用 GPU 首选项：下面的 _real_quit() 会保存整块
+# 设置，以前会覆盖用户真实注册表键（重置"窗口置顶"、已选显卡等）。
+from tests._iso import isolate_all, drain_and_exit  # noqa: E402
+
+isolate_all()
+
 app = QApplication(sys.argv)
 w = MainWindow()
 w.show()
@@ -96,4 +105,4 @@ n_pass = sum(1 for _, ok in RES if ok)
 print(f"\n冒烟验证: {n_pass}/{len(RES)} 通过")
 gif_player.shutdown()
 import os as _os
-_os._exit(0 if n_pass == len(RES) else 1)
+drain_and_exit(0 if n_pass == len(RES) else 1)

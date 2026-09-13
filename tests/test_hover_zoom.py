@@ -14,6 +14,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP = tempfile.mkdtemp(prefix="gifmgr_zoom2_")
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 sys.path.insert(0, ROOT)
+from tests._iso import drain_and_exit  # noqa: E402
 
 from PIL import Image
 
@@ -168,4 +169,4 @@ check("F2 关闭后立即不显示", cardA._hover_layer is None
 n_pass = sum(1 for _, ok in RES if ok)
 print(f"\n悬停放大改进验证: {n_pass}/{len(RES)} 通过")
 import os as _os
-_os._exit(0 if n_pass == len(RES) else 1)
+drain_and_exit(0 if n_pass == len(RES) else 1)

@@ -88,11 +88,34 @@ class DataManager:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._last_group_error = ""  # last rename_group failure reason / 上次重命名失败原因
         self._pending_send_temps = set()  # temp send copies awaiting cleanup / 待清理的发送临时副本
+        # group_id -> name cache. emoji_filepath() is called for EVERY card on
+        # every lazy-load recycle, and each call used to hit SQLite (a profile
+        # of a 40-step scroll showed 1531 get_group() queries, ~15% of the
+        # whole scroll cost). Cleared by every group mutation.
+        # group_id -> 名称缓存。懒加载回收时每张卡都会调用 emoji_filepath()，
+        # 而它以前每次都查 SQLite（40 步滚动剖析显示 1531 次 get_group()，
+        # 约占整体滚动开销的 15%）。任何分组变更都会清空该缓存。
+        self._group_name_cache = {}
         self._init_tables()
         # Speed up GROUP BY content_hash in get_all_emojis for large libraries
         # 为 get_all_emojis 的 GROUP BY content_hash 建索引（大图库提速）
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_emojis_hash ON emojis(content_hash)"
+        )
+        # Per-group duplicate lookups: known_hashes()/filter_already_imported()
+        # filter on group_id, and the batch duplicate check matches
+        # `content_hash` or `src_hash`. Without these, group_id had no index at
+        # all and the OR-predicate forced a full table scan on every import.
+        # 分组内查重：known_hashes()/filter_already_imported() 按 group_id 过滤，
+        # 批量查重还要匹配 content_hash 或 src_hash。缺少索引时 group_id 完全
+        # 没有索引，且 OR 条件会让每次导入都退化为全表扫描。
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_emojis_group_hash"
+            " ON emojis(group_id, content_hash)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_emojis_group_src"
+            " ON emojis(group_id, src_hash)"
         )
 
     # Initialization / 初始化
@@ -204,6 +227,7 @@ class DataManager:
                     )
                 self._conn.execute("DELETE FROM groups WHERE id=?", (dup["id"],))
             self._conn.commit()
+            self._invalidate_group_cache()
             self._renormalize_columns(keep["id"])
 
     def _renormalize_columns(self, group_id):
@@ -233,6 +257,7 @@ class DataManager:
                 (name, grp_type, role)
             )
             self._conn.commit()
+            self._invalidate_group_cache()
 
     @property
     def data_dir(self):
@@ -283,6 +308,29 @@ class DataManager:
         r = cur.fetchone()
         return dict(r) if r else None
 
+    # Cached group name lookup / 带缓存的分组名查询
+    def group_name(self, group_id):
+        # Returns the group name only (the sole field emoji_filepath needs).
+        # Returns None when the group does not exist.
+        # 只返回分组名（emoji_filepath 唯一需要的字段）。分组不存在时返回 None。
+        try:
+            hit = self._group_name_cache.get(group_id)
+        except TypeError:
+            # Unhashable id (defensive): fall through to the plain query /
+            # 不可哈希的 id（防御性处理）：回退到普通查询
+            hit = None
+        if hit is not None:
+            return hit or None
+        grp = self.get_group(group_id)
+        name = grp["name"] if grp else ""
+        self._group_name_cache[group_id] = name
+        return name or None
+
+    # Drop the cached group names after any group mutation /
+    # 任何分组变更后清空缓存的分组名
+    def _invalidate_group_cache(self):
+        self._group_name_cache.clear()
+
     def get_group_by_name(self, name):
         cur = self._conn.execute("SELECT * FROM groups WHERE name=?", (name,))
         r = cur.fetchone()
@@ -302,6 +350,7 @@ class DataManager:
             (name, grp_type, max_ord + 1)
         )
         self._conn.commit()
+        self._invalidate_group_cache()
         if grp_type == "image":
             os.makedirs(os.path.join(self._emojis_dir, name), exist_ok=True)
         return self._conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -323,6 +372,7 @@ class DataManager:
             return False
         self._conn.execute("UPDATE groups SET name=? WHERE id=?", (new_name, group_id))
         self._conn.commit()
+        self._invalidate_group_cache()
         old_dir = os.path.join(self._emojis_dir, old["name"])
         new_dir = os.path.join(self._emojis_dir, new_name)
         if old["type"] == "image" and os.path.isdir(old_dir):
@@ -348,6 +398,7 @@ class DataManager:
                             (old["name"], group_id),
                         )
                         self._conn.commit()
+                        self._invalidate_group_cache()
                         self._last_group_error = "dir"
                         return False
         self._last_group_error = ""
@@ -369,6 +420,7 @@ class DataManager:
         self._conn.execute("DELETE FROM emojis WHERE group_id=?", (group_id,))
         self._conn.execute("DELETE FROM groups WHERE id=?", (group_id,))
         self._conn.commit()
+        self._invalidate_group_cache()
         return True
 
     # Emoji CRUD / 表情包 CRUD
@@ -476,6 +528,60 @@ class DataManager:
             (group_id,),
         ).fetchone()[0]
 
+    def known_hashes(self, group_id):
+        # Every hash already stored for a group: the stored-file hash AND the
+        # original (pre-conversion) source hash. An index of "what has been
+        # imported" used to skip duplicates before doing any work.
+        # 某分组已存储的全部哈希：实际存储文件哈希与原始（转换前）源哈希。
+        # 即"已导入记录"索引，用于在工作开始前跳过重复项。
+        known = set()
+        for row in self._conn.execute(
+                "SELECT content_hash, src_hash FROM emojis WHERE group_id=?",
+                (group_id,)).fetchall():
+            if row[0]:
+                known.add(row[0])
+            if row[1]:
+                known.add(row[1])
+        return known
+
+    def filter_already_imported(self, group_id, filepaths, hash_out=None):
+        # Split filepaths into (new_files, skipped_count) by hashing the SOURCE
+        # file and comparing against the group's known hashes. Hashing a file
+        # is far cheaper than decoding + re-encoding it (and writing a temp
+        # gif), so large imports — e.g. a 400+ file QQ emoji pack — skip the
+        # expensive conversion step entirely for files already in the library.
+        # 通过计算源文件哈希并与该分组的已知哈希比对，把文件分为
+        # （新文件, 跳过数）。哈希远比"解码+重编码（并写临时 gif）"便宜，
+        # 因此大批量导入（如 400+ 个 QQ 表情包文件）可对已入库文件完全跳过
+        # 昂贵的转换步骤。
+        #
+        # hash_out (optional): filled with {source path: md5} for every file
+        # examined. The caller can hand these through to the batch importer so
+        # the same file is never hashed twice — previously ≤100-file imports
+        # hashed each source twice and >100-file imports up to three times,
+        # which cancelled out much of the "skip early" optimisation.
+        # hash_out（可选）：填入 {源路径: md5}。调用方可把它传给批量导入，
+        # 避免同一文件被重复哈希——此前 ≤100 文件路径每个源文件哈希 2 次、
+        # >100 文件路径最多 3 次，把"提前跳过"的收益抵消了大半。
+        known = self.known_hashes(group_id)
+        new_files = []
+        skipped = 0
+        for p in filepaths:
+            try:
+                h = self._file_md5(p)
+            except OSError:
+                # Unreadable now: let the normal path report it /
+                # 当前不可读：交给正常路径处理
+                new_files.append(p)
+                continue
+            if hash_out is not None:
+                hash_out[p] = h
+            if known and h in known:
+                skipped += 1
+            else:
+                new_files.append(p)
+        return new_files, skipped
+
     def import_emoji(self, group_id, filepath, auto_convert=True):
         group = self.get_group(group_id)
         if not group or group["type"] != "image":
@@ -484,6 +590,15 @@ class DataManager:
         ext = os.path.splitext(filepath)[1].lower()
         if ext not in gif_converter.IMPORT_EXTS:
             return "error"
+        # Fast duplicate pre-check on the SOURCE bytes, before decoding or
+        # copying anything: an already-imported file is rejected immediately.
+        # / 在解码或复制之前先用源文件字节做快速查重：已导入的文件立即拒绝。
+        try:
+            raw_hash = self._file_md5(filepath)
+        except OSError:
+            raw_hash = ""
+        if raw_hash and raw_hash in self.known_hashes(group_id):
+            return "duplicate"
         # Store-format decision by CONTENT: with auto-convert enabled every
         # non-GIF file (animated webp/apng/mjpeg, static jpg/png) converts to
         # gif — the user explicitly wants conversion on, and oversized
@@ -497,11 +612,9 @@ class DataManager:
         # 超大结果在转换器内降采样，聊天软件仍能识别为图片。真实 GIF
         # 内容（即使伪装 .jpg）存 .gif；超大 gif（如 1920x1920、2MB）在
         # 导入时同样降采样——聊天软件会把这类文件当附件粘贴而非图片。
-        src_hash = ""
         src = filepath
         store_ext = ext or ".gif"
         if auto_convert and gif_converter.needs_gif_conversion(filepath):
-            src_hash = self._file_md5(filepath)
             tmp_gif = os.path.join(
                 tempfile.gettempdir(), f"gm_conv_{uuid.uuid4().hex}.gif")
             if gif_converter.convert_to_gif(filepath, tmp_gif):
@@ -520,7 +633,6 @@ class DataManager:
             if auto_convert:
                 dims = gif_converter._image_dimensions(filepath)
                 if dims and max(dims) > gif_converter.MAX_GIF_DIM:
-                    src_hash = self._file_md5(filepath)
                     tmp_gif = os.path.join(
                         tempfile.gettempdir(), f"gm_conv_{uuid.uuid4().hex}.gif")
                     if gif_converter.downscale_gif_if_needed(filepath, tmp_gif):
@@ -577,11 +689,28 @@ class DataManager:
                 except OSError:
                     pass
             return "error"
-        dup = self._conn.execute(
-            "SELECT id, original_name FROM emojis "
-            "WHERE content_hash=? AND group_id=? LIMIT 1",
-            (content_hash, group_id),
-        ).fetchone()
+        # Duplicate check: compare the incoming stored hash AND the original
+        # (pre-conversion) hash against BOTH hash columns of the existing
+        # rows. The same picture may be stored as a converted gif or as its
+        # raw source depending on the "auto-convert" switch, so comparing only
+        # the stored hash let the same file be imported twice with different
+        # settings (converted gif hash != raw png hash).
+        # 查重：把本次的实际存储哈希与原始（转换前）哈希，同时对已有行的两个
+        # 哈希列比对。同一张图可能因"自动转换"开关被存为转换后的 gif 或原始
+        # 文件，只比对存储哈希会导致同一文件在开关不同的情况下被重复导入
+        # （转换后 gif 哈希 ≠ 原始 png 哈希）。
+        incoming = {content_hash}
+        if raw_hash:
+            incoming.add(raw_hash)
+        dup = None
+        for _h in incoming:
+            dup = self._conn.execute(
+                "SELECT id, original_name FROM emojis WHERE group_id=? AND "
+                "(content_hash=? OR (src_hash != '' AND src_hash=?)) LIMIT 1",
+                (group_id, _h, _h),
+            ).fetchone()
+            if dup:
+                break
         if dup:
             try:
                 os.remove(dest)
@@ -595,6 +724,12 @@ class DataManager:
             return "duplicate"
 
         original_name = os.path.splitext(os.path.basename(filepath))[0]
+        # Record the ORIGINAL source hash whenever the stored bytes differ from
+        # the source (conversion, downscale, or GIF87a->GIF89a upgrade), which
+        # makes the "already imported" index complete for future imports.
+        # 当存储字节与源文件不同时（转换、降采样或 GIF87a→GIF89a 升级）
+        # 记录原始源哈希，使"已导入"索引对后续导入完整可用。
+        src_hash = raw_hash if (raw_hash and raw_hash != content_hash) else ""
         self._conn.execute(
             "INSERT INTO emojis (group_id, filename, original_name, content_hash, src_hash)"
             " VALUES (?,?,?,?,?)",
@@ -608,8 +743,23 @@ class DataManager:
                 pass
         return "ok"
 
-    def import_emojis_batch(self, group_id, filepaths, workers=None, auto_convert=True):
+    def import_emojis_batch(self, group_id, filepaths, workers=None,
+                            auto_convert=True, src_hash_map=None):
         # Multi-threaded import / 多线程导入
+        #
+        # src_hash_map (optional): {path being imported: md5 of the ORIGINAL
+        # source file}. Required when the caller already converted the file
+        # elsewhere (the >100-file progress path converts into %TEMP% first and
+        # then imports with auto_convert=False): hashing the temp gif as if it
+        # were the source records a hash that can never match the user's file,
+        # so the "already imported" pre-skip silently stops working for that
+        # whole batch and a differently-converted duplicate can slip in.
+        # src_hash_map（可选）：{正在导入的路径: 原始源文件 md5}。当调用方已在
+        # 别处转换过文件时（>100 文件的进度路径会先转到 %TEMP% 再以
+        # auto_convert=False 导入）必须提供：把临时 gif 当源文件哈希会记下一个
+        # 永远匹配不上用户文件的哈希，于是整批的"已导入跳过"静默失效，且转换
+        # 路线不同时可能放进真重复。
+        src_hash_map = src_hash_map or {}
         group = self.get_group(group_id)
         if not group or group["type"] != "image":
             return (0, 0)
@@ -617,6 +767,17 @@ class DataManager:
                  if os.path.splitext(p)[1].lower() in gif_converter.IMPORT_EXTS]
         if not valid:
             return (0, 0)
+        # Skip files already in this group BEFORE converting them. Hashing the
+        # source reads the file once, while conversion decodes and re-encodes
+        # it (often through a spawned ffmpeg process) and writes a temp gif —
+        # orders of magnitude more work. This makes re-importing a large pack
+        # (400+ QQ files) nearly instant instead of re-converting every file.
+        # 在转换之前跳过本组已有文件。哈希源文件只需读一次，而转换要解码、
+        # 重编码（通常还要启动 ffmpeg 进程）并写入临时 gif——开销高几个数量级。
+        # 因此重复导入大表情包（400+ 个 QQ 文件）几乎是瞬时的，而非逐张重转。
+        valid, pre_skipped = self.filter_already_imported(group_id, valid)
+        if not valid:
+            return (0, pre_skipped)
         gdir = os.path.join(self._emojis_dir, group["name"])
         os.makedirs(gdir, exist_ok=True)
 
@@ -625,11 +786,22 @@ class DataManager:
             # -> copy (GIF87a->GIF89a) -> hash / worker 线程：转换非 GIF
             # （含静态图，见 import_emoji）→ 复制（GIF87a 升级 GIF89a）→ 哈希
             try:
-                src_hash = ""
+                # Original source hash, recorded for future duplicate skips.
+                # Prefer the caller-supplied hash: when the file was already
+                # converted for us, hashing it here would record the temp gif's
+                # bytes instead of the user's original file.
+                # 原始源哈希，供后续跳过重复项使用。优先用调用方提供的哈希：当文件
+                # 已被调用方转换过时，此处哈希到的是临时 gif 的字节而非用户原文件。
+                if src in src_hash_map:
+                    src_hash = src_hash_map[src]
+                else:
+                    try:
+                        src_hash = self._file_md5(src)
+                    except OSError:
+                        src_hash = ""
                 store = src
                 store_ext = os.path.splitext(src)[1].lower() or ".gif"
                 if auto_convert and gif_converter.needs_gif_conversion(src):
-                    src_hash = self._file_md5(src)
                     tmp_gif = os.path.join(
                         tempfile.gettempdir(), f"gm_conv_{uuid.uuid4().hex}.gif")
                     if gif_converter.convert_to_gif(src, tmp_gif):
@@ -648,7 +820,6 @@ class DataManager:
                     if auto_convert:
                         dims = gif_converter._image_dimensions(src)
                         if dims and max(dims) > gif_converter.MAX_GIF_DIM:
-                            src_hash = self._file_md5(src)
                             tmp_gif = os.path.join(
                                 tempfile.gettempdir(),
                                 f"gm_conv_{uuid.uuid4().hex}.gif")
@@ -690,7 +861,13 @@ class DataManager:
                             pass
             except OSError:
                 return None
-            return {"dest": dest, "hash": h, "src_hash": src_hash,
+            # Record the original hash only when the stored bytes differ from
+            # the source (conversion/downscale/header upgrade); for a plain
+            # copy the stored hash already identifies the source.
+            # 仅在存储字节与源文件不同（转换/降采样/头升级）时记录原始哈希；
+            # 直接复制时存储哈希本身即可标识源文件。
+            raw = src_hash if (src_hash and src_hash != h) else ""
+            return {"dest": dest, "hash": h, "src_hash": raw,
                     "original_name": os.path.splitext(os.path.basename(src))[0]}
 
         if workers is None or workers <= 1 or len(valid) <= 1:
@@ -704,18 +881,28 @@ class DataManager:
         # 主线程：查重 + 单事务批量 INSERT
         imported = 0
         duplicated = 0
-        existing = set(
-            r[0] for r in self._conn.execute(
-                "SELECT content_hash FROM emojis WHERE group_id=? AND content_hash != ''",
-                (group_id,),
-            ).fetchall()
-        )
+        # Collect BOTH hash columns of the existing rows (and of the files
+        # accepted earlier in this batch): the same picture may be stored as a
+        # converted gif or as its raw source, so matching only the stored hash
+        # let it be imported again when the auto-convert setting differed.
+        # 收集已有行的两个哈希列（以及本批次中先前已接受的文件）：同一张图
+        # 可能被存为转换后的 gif 或原始文件，只比对存储哈希会在自动转换开关
+        # 不同的情况下被重复导入。
+        existing = set()
+        for _row in self._conn.execute(
+                "SELECT content_hash, src_hash FROM emojis WHERE group_id=?",
+                (group_id,)).fetchall():
+            if _row[0]:
+                existing.add(_row[0])
+            if _row[1]:
+                existing.add(_row[1])
         self._conn.execute("BEGIN")
         try:
             for r in results:
                 if r is None:
                     continue
-                if r["hash"] in existing:
+                r_src = r.get("src_hash", "")
+                if r["hash"] in existing or (r_src and r_src in existing):
                     duplicated += 1
                     try:
                         os.remove(r["dest"])
@@ -723,19 +910,26 @@ class DataManager:
                         pass
                     continue
                 existing.add(r["hash"])
+                if r_src:
+                    existing.add(r_src)
                 self._conn.execute(
                     "INSERT INTO emojis (group_id, filename, original_name,"
                     " content_hash, src_hash)"
                     " VALUES (?,?,?,?,?)",
                     (group_id, os.path.basename(r["dest"]), r["original_name"],
-                     r["hash"], r.get("src_hash", "")),
+                     r["hash"], r_src),
                 )
                 imported += 1
             self._conn.commit()
         except Exception:
             self._conn.rollback()
             raise
-        return (imported, duplicated)
+        # Report the pre-skipped files as duplicates too, so the caller's
+        # "skipped duplicates" count reflects everything that was filtered
+        # (both the source-hash pre-skip and the post-conversion check).
+        # 预跳过的文件同样计入重复数，使调用方的"跳过重复"统计完整反映
+        # 被过滤的文件（源哈希预跳过 + 转换后查重）。
+        return (imported, duplicated + pre_skipped)
 
     # Convert every non-gif image in all groups to gif. On success the
     # original file is deleted and the DB record is updated (content_hash
@@ -882,6 +1076,42 @@ class DataManager:
                             os.remove(fp)
                         except OSError:
                             pass
+
+    def ids_sharing_content_hash(self, emoji_ids):
+        # Every row (across all groups) whose content_hash matches one of the
+        # given ids, INCLUDING the ids themselves. The All view folds rows by
+        # content_hash, so deleting only the folded representative left the
+        # other copies in place — the user saw stickers that "would not go
+        # away" after a select-all + delete.
+        # 所有 content_hash 与给定 id 之一相同的行（跨分组），并包含这些 id 本身。
+        # "全部"视图按 content_hash 折叠行，只删除折叠后的代表行会让其余副本残留，
+        # 用户看到的是全选删除后"删不干净"。
+        if not emoji_ids:
+            return []
+        ids = []
+        seen = set()
+        for eid in emoji_ids:
+            key = str(eid)
+            if key in seen:
+                continue
+            seen.add(key)
+            ids.append(eid)
+        hashes = []
+        placeholders = ",".join("?" for _ in ids)
+        for row in self._conn.execute(
+                "SELECT DISTINCT content_hash FROM emojis WHERE id IN (%s)"
+                % placeholders, tuple(ids)).fetchall():
+            if row[0]:
+                hashes.append(row[0])
+        for h in hashes:
+            for row in self._conn.execute(
+                    "SELECT id FROM emojis WHERE content_hash=?", (h,)
+            ).fetchall():
+                key = str(row[0])
+                if key not in seen:
+                    seen.add(key)
+                    ids.append(row[0])
+        return ids
 
     def get_emoji_copies(self, emoji):
         if not emoji.get("content_hash"):
@@ -1219,10 +1449,10 @@ class DataManager:
     def emoji_filepath(self, emoji):
         if not emoji.get("filename"):
             return None
-        group = self.get_group(emoji["group_id"])
-        if not group:
+        name = self.group_name(emoji["group_id"])
+        if not name:
             return None
-        return os.path.join(self._emojis_dir, group["name"], emoji["filename"])
+        return os.path.join(self._emojis_dir, name, emoji["filename"])
 
     def increment_use_count(self, emoji_id):
         # Bump the usage counter when an emoji is sent/copied / 发送/复制表情包时使用次数 +1

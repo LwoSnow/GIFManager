@@ -11,6 +11,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP = tempfile.mkdtemp(prefix="gifmgr_name_")
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 sys.path.insert(0, ROOT)
+from tests._iso import drain_and_exit  # noqa: E402
 
 from PIL import Image
 
@@ -153,4 +154,4 @@ try:
 except Exception:
     pass
 import os as _os
-_os._exit(0 if n_pass == len(RES) else 1)
+drain_and_exit(0 if n_pass == len(RES) else 1)

@@ -87,7 +87,13 @@ class RenameDialog(FramelessDialog):
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setSpacing(10)
+        # Tighter spacing than before: the reclaimed height goes to the input
+        # box, whose text was clipped at the bottom when the editor was only
+        # 28 px tall (5 px vertical padding left a 16 px content area for an
+        # ~18 px line). / 间距比之前紧凑：省下的高度留给输入框——此前编辑框
+        # 仅 28px 高，上下 5px 内边距只剩 16px 内容区，而字体行高约 18px，
+        # 文字底部被裁切。
+        layout.setSpacing(8)
         layout.setContentsMargins(20, 12, 20, 14)
 
         # Pick readable colours per theme / 按主题选择可读颜色
@@ -115,12 +121,17 @@ class RenameDialog(FramelessDialog):
         layout.addWidget(prompt)
 
         # Transparent background so the input does not appear as a dark/black
-        # box / 透明背景，避免输入框显示为深色/黑框
+        # box. The vertical padding is kept small and an explicit min-height
+        # guarantees the content area is taller than the font line, so the
+        # glyphs are no longer clipped / shifted downward.
+        # 透明背景，避免输入框显示为深色/黑框。上下内边距保持较小，并显式设置
+        # min-height 保证内容区高于字体行高，文字不再被裁切或偏下。
         self._editor = QLineEdit(self._current_name)
+        self._editor.setMinimumHeight(32)
         self._editor.setStyleSheet(
             "QLineEdit { background: transparent;"
             " border: 1px solid %s; border-radius: 6px;"
-            " color: %s; padding: 5px;"
+            " color: %s; padding: 0 6px; min-height: 30px;"
             " selection-background-color: #1677FF; }" % (border_color, text_color)
         )
         self._editor.setFocus()
@@ -144,3 +155,14 @@ class RenameDialog(FramelessDialog):
 
     def new_name(self):
         return self._editor.text().strip()
+
+    def showEvent(self, event):
+        # Re-select the whole name once the dialog is actually shown: selecting
+        # in the constructor is normally enough, but showing/focusing the
+        # dialog can clear the selection on some platforms, and rename is
+        # always a full-text edit. / 对话框真正显示后再次全选：构造函数里选中
+        # 通常已足够，但某些平台在显示/获取焦点时会清掉选择，而重命名总是对
+        # 整段文字修改。
+        super().showEvent(event)
+        self._editor.setFocus()
+        self._editor.selectAll()

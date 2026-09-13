@@ -12,6 +12,15 @@ TMP = tempfile.mkdtemp(prefix="gifmgr_autoinput_")
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 sys.path.insert(0, ROOT)
 
+# Isolate QSettings / the per-app GPU preference from the real user state: a
+# test must never rewrite the user's preferences (this used to reset
+# "窗口置顶", the chosen GPU and the window geometry).
+# 隔离 QSettings 与按应用 GPU 首选项：测试绝不重写用户真实设置（以前会重置
+# "窗口置顶"、已选显卡与窗口几何）。
+from tests._iso import isolate_all, drain_and_exit  # noqa: E402
+
+isolate_all()
+
 import logging
 logging.disable(logging.CRITICAL)
 
@@ -105,4 +114,4 @@ else:
 n_pass = sum(1 for _, ok in RES if ok)
 print(f"\n自动输入验证: {n_pass}/{len(RES)} 通过")
 import os as _os
-_os._exit(0 if n_pass == len(RES) else 1)
+drain_and_exit(0 if n_pass == len(RES) else 1)

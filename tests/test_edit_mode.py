@@ -11,6 +11,12 @@ TMP = tempfile.mkdtemp(prefix="gifmgr_edit_")
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 sys.path.insert(0, ROOT)
 
+# Isolate QSettings / the per-app GPU preference from the real user state /
+# 隔离 QSettings 与按应用 GPU 首选项，避免影响用户真实状态
+from tests._iso import isolate_all, drain_and_exit  # noqa: E402
+
+isolate_all()
+
 import logging
 logging.disable(logging.CRITICAL)
 
@@ -126,4 +132,4 @@ grid.exit_edit_mode()
 n_pass = sum(1 for _, ok in RES if ok)
 print(f"\n多选编辑验证: {n_pass}/{len(RES)} 通过")
 import os as _os
-_os._exit(0 if n_pass == len(RES) else 1)
+drain_and_exit(0 if n_pass == len(RES) else 1)

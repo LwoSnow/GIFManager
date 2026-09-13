@@ -10,6 +10,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP = tempfile.mkdtemp(prefix="gifmgr_thr_")
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 sys.path.insert(0, ROOT)
+from tests._iso import drain_and_exit  # noqa: E402
 
 import logging
 logging.disable(logging.CRITICAL)
@@ -80,4 +81,4 @@ check("C 停稳后恢复解码", grid._scrolling is False)
 n_pass = sum(1 for _, ok in RES if ok)
 print(f"\n滚动节流验证: {n_pass}/{len(RES)} 通过")
 import os as _os
-_os._exit(0 if n_pass == len(RES) else 1)
+drain_and_exit(0 if n_pass == len(RES) else 1)

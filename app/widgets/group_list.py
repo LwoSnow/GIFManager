@@ -1,7 +1,7 @@
 """Bottom group tab bar — horizontal scrollable button bar with drag reorder
 底部分组标签栏 — 水平可滚动按钮组，支持拖拽排序"""
 from PySide6.QtWidgets import (
-    QWidget, QHBoxLayout, QPushButton, QScrollArea, QMenu, QInputDialog, QMessageBox,
+    QWidget, QHBoxLayout, QPushButton, QScrollArea, QMenu, QMessageBox,
     QApplication,
 )
 from PySide6.QtCore import Qt, Signal, QMimeData, QEvent, QRect
@@ -367,9 +367,17 @@ class GroupListWidget(QWidget):
 
         grp_type = "image" if action == act_image else "text"
         title = tr("new_image_group_title") if grp_type == "image" else tr("new_text_group_title")
-        name, ok = QInputDialog.getText(self, title, tr("group_name"))
-        if ok and name.strip():
-            if self._dm.create_group(name.strip(), grp_type) is None:
+        # Use the localised RenameDialog (Chinese OK/Cancel + full-text
+        # selection) instead of the default QInputDialog, whose buttons are
+        # English. / 使用本地化 RenameDialog（中文确定/取消 + 全选文字），
+        # 替代默认英文按钮的 QInputDialog。
+        from app.widgets.rename_dialog import RenameDialog
+        dlg = RenameDialog("", self, title=title)
+        if dlg.exec() != RenameDialog.DialogCode.Accepted:
+            return
+        name = dlg.new_name()
+        if name:
+            if self._dm.create_group(name, grp_type) is None:
                 QMessageBox.warning(self, tr("create_group_failed"), tr("create_group_failed_msg"))
                 return
             self._rebuild()

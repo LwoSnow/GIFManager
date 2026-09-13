@@ -119,6 +119,13 @@ check("F Bug13 全部并入目标列 0", cols13 == {0}, cols13)
 
 # --- Bug2: language switch rebuilds menu with connected actions / 语言切换后菜单连接
 from app.main_window import MainWindow
+
+# _real_quit() at the end saves the whole settings block; isolate it so the real
+# user key is never overwritten / 末尾的 _real_quit() 会保存整块设置，先做隔离，
+# 避免覆盖用户真实注册表键
+from tests._iso import isolate_all, drain_and_exit  # noqa: E402
+
+isolate_all()
 w = MainWindow()
 w.show()
 app.processEvents()
@@ -149,4 +156,4 @@ try:
 except Exception:
     pass
 import os as _os
-_os._exit(0 if n_pass == len(RES) else 1)
+drain_and_exit(0 if n_pass == len(RES) else 1)

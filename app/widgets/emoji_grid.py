@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QSize, QRect, Signal, QPoint, QTimer
 from PySide6.QtGui import QContextMenuEvent, QPainter, QColor, QPixmap, QPixmapCache, QPen
 
-from app.widgets.emoji_item import EmojiItem, _loader, _thumb_key
+from app.widgets.emoji_item import EmojiItem, _loader, _thumb_key, clear_file_probe_cache
 from app.models.lang_manager import tr
 from app.models.logger import get_logger
 
@@ -280,7 +280,44 @@ class EmojiGridWidget(QWidget):
         self._dm = None
         self._items = []
         self._thumb_index = {}  # thumb_key -> list of cards / 缩略图 key 到卡片列表
+        # Recycled image cards, kept parented but hidden. Scrolling a large
+        # library destroys and rebuilds a whole row of cards on every step
+        # (~1-2 ms each), which dominated _ensure_visible; re-pointing an
+        # existing widget with EmojiItem.reset_for() instead reuses its
+        # layout/child widgets. Text cards are excluded (their height adapts
+        # to the content, so reuse would need a full rebuild anyway).
+        # 回收的图片卡（保留父级但隐藏）。浏览大库时每滚动一步就要销毁并重建
+        # 一整行卡片（每张约 1-2ms），这是 _ensure_visible 的主要开销；改为用
+        # EmojiItem.reset_for() 让已有控件改指向新表情，从而复用其布局/子控件。
+        # 文本卡不参与（高度随内容自适应，复用时仍需完整重建）。
+        self._card_pool = []
+        self._CARD_POOL_MAX = 48
+        self._pool_reused = 0  # stats for tests/diagnostics / 供测试与诊断统计
         self._data = []
+        # id (str) -> emoji dict for the CURRENT data set: selection toggles
+        # looked this up with a linear scan of _data, so "select all" on a
+        # large library was O(n²). / 当前数据集的 id(str) -> 表情字典：勾选切换
+        # 原来线性扫描 _data，使大图库的"全选"退化为 O(n²)。
+        self._data_index = {}
+        # True while a bulk selection change runs; suppresses the per-card
+        # selection_changed emission / 批量修改选中期间为 True，抑制逐卡
+        # selection_changed 信号
+        self._selection_batch = False
+        # Active search keyword of the current data set (kept so lightweight
+        # refreshes — e.g. after a drag reorder — reload the SAME filtered set
+        # instead of the whole group, which used to drop the search filter).
+        # 当前数据集的搜索关键词（保存下来，使轻量刷新——如拖拽排序后——重载
+        # 同一份过滤结果，而非整组数据；此前会丢失搜索过滤）。
+        self._filter_keyword = ""
+        # Whether a global sort is active (set from settings). Gates the
+        # resize auto-fill so columns are only opened automatically when the
+        # user asked for global ordering. / 是否启用全局排序（由设置写入）。
+        # 用于限制"拉伸自动铺满"，仅在用户启用全局排序时才自动增列。
+        self._global_sort_enabled = False
+        # Last sampled cursor position of a drag-selection sweep (container
+        # coordinates), used to interpolate the path / 拖动选择扫过的上一个采样
+        # 光标位置（容器坐标），用于对路径插值
+        self._drag_select_last = None
         self._preview_limits = (100, 200)
         self._layout_cache = None  # masonry layout cache (width, data id) / masonry 布局缓存
         self._all_cache = None     # All-view grid cache / All 视图网格缓存
@@ -321,7 +358,7 @@ class EmojiGridWidget(QWidget):
         self._merge_timer = QTimer(self)
         self._merge_timer.setSingleShot(True)
         self._merge_timer.setInterval(150)
-        self._merge_timer.timeout.connect(self._check_column_merge)
+        self._merge_timer.timeout.connect(self._on_resize_column_fit)
 
         # Resize refresh (debounced): lazy-create cards and refresh the
         # visible-GIF set after the window size settles
@@ -428,7 +465,19 @@ class EmojiGridWidget(QWidget):
                     card.setGeometry(r[0], r[1], r[2], r[3])
             pw = self._flow.parentWidget()
             if pw is not None:
-                pw.setMinimumWidth(max(usable + m.left() + m.right(), 10))
+                # The All view always reflows to whatever width it is given, so
+                # its minimum width is just ONE column. Pinning it to the
+                # current layout width (which is itself derived from the
+                # container width) stopped the widget from shrinking back:
+                # after enlarging the window the container stayed wide, so
+                # shrinking kept the extra columns and a horizontal scrollbar,
+                # and each further shrink was blocked by the previous minimum.
+                # All 视图总按给定宽度重排，因此最小宽度只需"一列"。此前把它设
+                # 为当前布局总宽（而该宽度又由容器宽度算出），窗口缩小后容器无法
+                # 收窄 → 多出的列与横向滚动条留在原地，且后续每次缩小都被上一次
+                # 的最小宽度挡住（仅 All 分组出现的 bug）。
+                one_col = EmojiItem.card_size() + m.left() + m.right()
+                pw.setMinimumWidth(max(one_col, 10))
                 gp = pw.parentWidget()
                 if gp is not None:
                     gp.updateGeometry()
@@ -537,6 +586,86 @@ class EmojiGridWidget(QWidget):
             return max(cw - 20, self._usable_width())
         return self._usable_width()
 
+    def _pool_take(self, emoji):
+        # Pop a recycled card that can serve this emoji. Cards are mode-fixed
+        # (image vs text) AND name-strip-fixed: _show_name decides the fixed
+        # card height at construction, so a pooled card built for the other
+        # setting must be discarded — reusing it would put min != max heights
+        # into the layout and overlap the cards.
+        # 取出可服务该表情的回收卡。卡片模式在构造时固定（图片/文字），名称条同样
+        # 固定：_show_name 在构造时决定卡片固定高度，因此为另一种设置构建的池卡
+        # 必须销毁——复用会让 min/max 高度不一致的卡片进入布局并互相重叠。
+        while self._card_pool:
+            card = self._card_pool.pop()
+            if card._show_name != self._show_emoji_name:
+                card.deleteLater()
+                continue
+            if card.reset_for(emoji):
+                self._pool_reused += 1
+                return card
+            # Refused (the data set became a text group): discard instead of
+            # dropping on the floor, or it stays parented but hidden forever.
+            # 拒绝的卡（数据集已变为文字分组）：销毁而不是直接丢掉，否则它会一直
+            # 挂在父级上、既隐藏又永不释放。
+            card.deleteLater()
+        return None
+
+    def _pool_put(self, card):
+        # Recycle an image card: unparent it from the flow layout, hide it and
+        # keep it alive for a later reuse. Falls back to deleteLater() when the
+        # pool is full or the card is a text card.
+        # 回收图片卡：从流式布局中摘除、隐藏并保留以备复用。池满或为文本卡时
+        # 退回 deleteLater()。
+        # stop_animation() (not the narrower _stop_gif) so the playback timer and
+        # the decoded frames are released — see EmojiItem._stop_gif.
+        # 用 stop_animation()（而不是更窄的 _stop_gif），确保播放定时器与解码帧
+        # 都被释放——见 EmojiItem._stop_gif。
+        card.stop_animation()
+        # Drop it from the play set as well: the set is keyed by id(), and a
+        # recycled card keeps its identity, so a stale entry would make the
+        # next visible-set diff believe an invisible card is still playing.
+        # 同时从播放集合中移除：该集合以 id() 为键，而回收卡保持同一对象，
+        # 残留项会让下一次可见集比对误以为某张不可见卡仍在播放。
+        self._playing_gifs.discard(id(card))
+        if card._is_text or len(self._card_pool) >= self._CARD_POOL_MAX:
+            card.deleteLater()
+            return
+        self._flow.removeWidget(card)
+        card.hide()
+        self._card_pool.append(card)
+
+    def set_show_emoji_name(self, enabled):
+        # The name strip changes every image card's FIXED height, so the pool
+        # must be dropped: a pooled card carries the old height in its
+        # setFixedSize and would overlap the rebuilt ones.
+        # 名称条会改变每张图片卡的固定高度，因此必须丢弃整个池：池卡在
+        # setFixedSize 里带着旧高度，会与重建的卡片重叠。
+        enabled = bool(enabled)
+        if enabled == self._show_emoji_name:
+            return
+        self._show_emoji_name = enabled
+        self._clear_card_pool()
+        for card in self._items:
+            card._stop_gif()
+            card.deleteLater()
+        self._items = []
+        self._thumb_index = {}
+        self._all_cache = None
+        self._layout_cache = None
+        self._flow.invalidate()
+        self._flow.activate()
+        self._flow.relayout()
+        self._ensure_visible()
+        self._update_visible_gifs()
+
+    def _clear_card_pool(self):
+        # Drop every recycled card (card scale / name font changed, group
+        # switch, full rebuild) so stale sizes and stale emoji never reappear.
+        # 清空回收卡（卡片尺寸/名称字号变更、切换分组、完整重建），避免残留的
+        # 旧尺寸与旧表情再次出现。
+        while self._card_pool:
+            self._card_pool.pop().deleteLater()
+
     def _ensure_visible(self, allow_decode=True):
         # Lazy loading: create only the cards inside the visible band
         # (plus a buffer). Group views use the masonry layout, the All
@@ -568,27 +697,36 @@ class EmojiGridWidget(QWidget):
                 continue
             if r[1] > y1 or r[1] + r[3] < y0:
                 continue
-            card = EmojiItem(em, dm, self._flow_container,
-                             preview_limits=self._preview_limits,
-                             show_name=self._show_emoji_name,
-                             hover_zoom=self._hover_zoom,
-                             # Disable hover zoom while in edit mode: a zoom
-                             # overlay hides neighboring cards and fights the
-                             # selection badges (previously only cards that
-                             # existed when edit mode started had hover
-                             # disabled; newly created ones re-enabled it).
-                             # 编辑模式下禁用悬停放大：放大浮层会隐藏相邻卡、
-                             # 与勾选角标交互冲突（此前只有进入编辑模式时已
-                             # 存在的卡被禁用，新建的卡会重新启用）。
-                             hover_enabled=(self._hover_preview_enabled
-                                            and not self._selection_mode))
-            card.clicked.connect(self._on_card_clicked)
-            card.selection_toggled.connect(self._on_selection_toggled)
+            card = self._pool_take(em)
+            if card is None:
+                card = EmojiItem(em, dm, self._flow_container,
+                                 preview_limits=self._preview_limits,
+                                 show_name=self._show_emoji_name,
+                                 hover_zoom=self._hover_zoom,
+                                 # Disable hover zoom while in edit mode: a zoom
+                                 # overlay hides neighboring cards and fights the
+                                 # selection badges (previously only cards that
+                                 # existed when edit mode started had hover
+                                 # disabled; newly created ones re-enabled it).
+                                 # 编辑模式下禁用悬停放大：放大浮层会隐藏相邻卡、
+                                 # 与勾选角标交互冲突（此前只有进入编辑模式时已
+                                 # 存在的卡被禁用，新建的卡会重新启用）。
+                                 hover_enabled=(self._hover_preview_enabled
+                                                and not self._selection_mode))
+                card.clicked.connect(self._on_card_clicked)
+                card.selection_toggled.connect(self._on_selection_toggled)
+            else:
+                # Reused card: no duplicate signal connections, but the
+                # settings-driven hover behaviour must be re-applied.
+                # 复用卡：不重复连接信号，但需重新套用设置驱动的悬停行为。
+                card.retune(self._hover_zoom, self._hover_preview_enabled
+                            and not self._selection_mode)
             card.set_selection_mode(self._selection_mode)
             if self._selection_mode and str(em.get("id", "")) in self._selection:
                 card.set_checked(True)
             self._items.append(card)
             self._flow.addWidget(card)
+            card.show()
             self._index_add(card)
             created = True
         if created:
@@ -607,8 +745,7 @@ class EmojiGridWidget(QWidget):
         for c in far:
             self._items.remove(c)
             self._index_remove(c)
-            c._stop_gif()
-            c.deleteLater()
+            self._pool_put(c)
 
     def _index_add(self, card):
         # A file may appear in multiple cards (All view folds duplicates by
@@ -713,8 +850,30 @@ class EmojiGridWidget(QWidget):
             visible.append((abs(cy - center), r.y(), card))
         visible.sort(key=lambda e: e[0])
         limit = max(1, getattr(self, "_gif_limit", 8))
+        # Playing a cached frame is only a pixmap swap, so capping playback
+        # below the number of VISIBLE GIFs left the cards farthest from the
+        # viewport centre static — typically the topmost rows, which read as
+        # "the first few GIFs never animate". With GPU/parallel rendering on,
+        # play every visible GIF; in serial mode keep the safety cap.
+        # 播放已缓存的帧只是切换 pixmap，因此把播放数限制到低于"可见动图数"会让
+        # 离视口中心最远的卡片（通常是最上面几行）一直静止，看起来就是"最靠前的
+        # 动图不动画"。开启 GPU/并行渲染时让所有可见动图都播放；串行模式保留上限。
+        try:
+            if EmojiItem.parallel_render_enabled():
+                # Still bounded: an unbounded play set gives every visible GIF
+                # its own QTimer, and peak memory grows with
+                # visible-GIFs x frames. A real window shows far fewer than
+                # this ceiling, so in practice "all visible GIFs play" while a
+                # pathological viewport cannot run away.
+                # 仍然设有上限：无上限会让每个可见动图各持一个 QTimer，内存峰值随
+                # "可见动图数 × 帧数"增长。真实窗口的可见数远低于此上限，因此实际
+                # 效果仍是"所有可见动图都播放"，而病态视口不会失控。
+                limit = min(len(visible), max(self._gif_limit, 64))
+        except Exception:
+            pass
         wanted = {id(card) for _d, _y, card in visible[:limit]}
         playing = getattr(self, "_playing_gifs", set())
+        by_id = {id(card): card for card in self._items}
         new_playing = set()
         for idx, (_d, _y, card) in enumerate(visible):
             if id(card) in wanted:
@@ -727,14 +886,22 @@ class EmojiGridWidget(QWidget):
             elif id(card) in playing:
                 card.stop_animation()
         for cid in playing - new_playing:
-            for card in self._items:
-                if id(card) == cid:
-                    card.stop_animation()
-                    break
+            card = by_id.get(cid)
+            if card is not None:
+                card.stop_animation()
         self._playing_gifs = new_playing
 
-    def load_emojis(self, emojis, group_type="image", preview_limits=(100, 200)):
+    def load_emojis(self, emojis, group_type="image", preview_limits=(100, 200),
+                    keyword=""):
         self._is_text_group = (group_type == "text")
+        # A fresh data set means files may have been converted/imported/
+        # deleted since the last probe, so drop the cached file probes /
+        # 重新载入数据集意味着文件可能已被转换/导入/删除，因此清空文件探测缓存
+        clear_file_probe_cache()
+        # Remember the filter so a later lightweight refresh (drag reorder,
+        # swap) reloads the same filtered data set / 记住过滤条件，使后续的
+        # 轻量刷新（拖拽排序、交换）重载同一份过滤数据。
+        self._filter_keyword = keyword or ""
         self._flow._suppress_invalidate = True
         try:
             while self._flow.count() > 0:
@@ -743,10 +910,24 @@ class EmojiGridWidget(QWidget):
             if not emojis:
                 self._flow_container.hide()
                 self._data = []
+                self._data_index = {}
+                # Nothing visible: drop the selection so an empty search
+                # result cannot leave a hidden selection behind.
+                # 无可显示项：清空选中，避免空搜索结果残留隐藏选中项。
+                if self._selection_mode and self._selection:
+                    self._selection.clear()
+                    self.selection_changed.emit(0)
                 for card in self._items:
                     card._stop_gif()
                     card.deleteLater()
                 self._items = []
+                # The index and the playing set reference the cards that were
+                # just deleted; leaving them behind kept dead wrappers alive
+                # and made the GIF play-set diff compare ids of vanished cards.
+                # 索引与播放集合仍引用刚被删除的卡片；留着会保住已死 wrapper，
+                # 并让动图播放集比对已消失卡片的 id。
+                self._thumb_index = {}
+                self._playing_gifs = set()
                 if group_type == "text":
                     msg = tr("paste_text_placeholder")
                 else:
@@ -767,7 +948,23 @@ class EmojiGridWidget(QWidget):
             # 正确比较新旧（赋值后再比较恒为"无变化"）。
             _old_ids = {em.get("id") for em in self._data}
             self._data = list(emojis)
+            # O(1) id lookup for selection toggles / 供勾选切换做 O(1) 查表
+            self._data_index = {str(em.get("id", "")): em for em in emojis}
             self._preview_limits = preview_limits
+            # Prune selections that are no longer part of the visible data
+            # set (e.g. after a search or group switch). Keeping hidden ids in
+            # the selection made the count exceed the shown items, which broke
+            # the select-all toggle and made deletes act on invisible rows.
+            # 修剪已不在可见数据集中的选中项（如搜索或切换分组后）。保留隐藏
+            # id 会使选中数超过可见项，导致全选切换失效、删除作用于不可见行。
+            if self._selection_mode and self._selection:
+                valid_ids = {str(em.get("id", "")) for em in emojis}
+                stale = [k for k in list(self._selection)
+                         if k not in valid_ids]
+                for k in stale:
+                    self._selection.pop(k, None)
+                if stale:
+                    self.selection_changed.emit(len(self._selection))
 
             dm = self._find_data_manager()
 
@@ -885,8 +1082,68 @@ class EmojiGridWidget(QWidget):
     # into the front ones (lightweight internal refresh, no rebuild)
     # 加载/调整后检查：无法完整显示的列融合进前列（内部轻量刷新，不重建）
     def _check_column_merge(self):
+        # Never re-layout the GROUP while a search filter is active: this
+        # decision is made from self._data (the filtered subset) but
+        # merge_columns_into() reads and REWRITES the whole group and marks it
+        # user_sorted=1 — so merely typing a search term and then resizing the
+        # window would permanently overwrite the user's own column layout.
+        # 搜索过滤生效时绝不重排"整个分组"：判定依据是 self._data（过滤后的子集），
+        # 而 merge_columns_into() 读取并改写整组且置 user_sorted=1——因此仅输入一个
+        # 搜索词再缩放窗口，就会永久覆盖用户自己排好的列布局。
+        if self._filter_keyword:
+            return False
         if self.current_group_id is not None and self._data:
-            self._merge_overflow_columns()
+            return self._merge_overflow_columns()
+        return False
+
+    # Auto-fill on resize (only while a global sort is active): when the window
+    # is widened, open as many columns as the usable width can hold and
+    # re-distribute the cards row-first, so the stickers fill the window
+    # instead of leaving blank space to the right.
+    # 拉伸窗口时自动铺满（仅在启用全局排序时）：按可用宽度能容纳的列数开新列，
+    # 并以行优先重新分配卡片，使表情铺满窗口而非右侧留白。
+    def auto_fill_columns(self):
+        if self.current_group_id is None or not self._data:
+            return False
+        # Same reason as _check_column_merge: the column count is derived from
+        # the (possibly filtered) data but written to the whole group.
+        # 同 _check_column_merge：列数由（可能被过滤的）数据推导，却写回整组。
+        if self._filter_keyword:
+            return False
+        if not getattr(self, "_global_sort_enabled", False):
+            return False
+        dm = self._find_data_manager()
+        if dm is None:
+            return False
+        usable = self._usable_width()
+        spacing = self._flow.spacing()
+        # Column-width baseline: the widest natural width in the group, so
+        # every column is fully displayed / 列宽基准：组内最大自然宽，保证每列
+        # 完整显示
+        base_w = EmojiItem.card_size()
+        for em in self._data:
+            if em.get("text_content"):
+                base_w = max(base_w, EmojiItem.text_natural_width(
+                    em.get("text_content", "")))
+        k = max(1, (usable + spacing) // (base_w + spacing))
+        current = len({int(em.get("col_index", 0)) for em in self._data}) or 1
+        if k <= current:
+            return False
+        dm.rearrange_columns(self.current_group_id, k)
+        _grid_log().info(
+            "Auto-fill columns -> group=%s cols=%d (was %d) cards=%d",
+            self.current_group_id, k, current, len(self._data))
+        self._refresh_cards_after_merge()
+        QTimer.singleShot(0, self._check_column_merge)
+        return True
+
+    def _on_resize_column_fit(self):
+        # Shrink first (merge what no longer fits); only grow when nothing had
+        # to be merged, so the two passes never fight each other.
+        # 先收缩（融合放不下的列）；仅在无需融合时才增列，避免两次处理互相冲突。
+        if self._check_column_merge():
+            return
+        self.auto_fill_columns()
 
     # Lightweight refresh after merge / drag reorder (write-back to DB): update all data and
     # already-created cards, then relayout; avoids jank from a full rebuild (QPixmap re-decoding)
@@ -896,7 +1153,12 @@ class EmojiGridWidget(QWidget):
         dm = self._find_data_manager()
         if dm is None:
             return
-        fresh = dm.get_emojis_by_group(self.current_group_id)
+        # Reload with the active search filter, otherwise dragging inside a
+        # search result would silently restore the full group and the search
+        # would appear to stop working. / 带上当前搜索关键词重载；否则在搜索
+        # 结果中拖拽会静默恢复整组数据，表现为搜索失效。
+        fresh = dm.get_emojis_by_group(self.current_group_id,
+                                       self._filter_keyword)
         emap = {e["id"]: e for e in fresh}
         self._data = fresh
         for card in self._items:
@@ -969,31 +1231,134 @@ class EmojiGridWidget(QWidget):
     def selection_count(self):
         return len(self._selection)
 
+    def reset_drag_selection(self):
+        # Forget the sweep path (called when a drag-selection gesture starts or
+        # ends). / 清除扫过路径（拖动选择手势开始或结束时调用）。
+        self._drag_select_last = None
+
+    def apply_drag_selection(self, anchor_item, global_pos, state):
+        # Path-based sweep: every card the cursor PASSES OVER while the button
+        # is held is painted with `state` — this is a "paint what I swept"
+        # gesture, not a rectangle between the start and end points. The
+        # segment from the previous sample to the current one is interpolated
+        # so a fast drag does not skip cards.
+        # 路径式扫过：按住拖动时鼠标"经过"的每张卡片都被涂成 `state`——
+        # 这是"扫到即选"，而不是起点与终点之间的矩形框选。上一次采样点到当前
+        # 点的线段会做插值，避免快速拖动跳过卡片。
+        if not self._selection_mode or anchor_item is None or state is None:
+            return
+        try:
+            container = anchor_item.parentWidget()
+        except RuntimeError:
+            return
+        if container is None:
+            return
+        # Card geometries live in the flow container's coordinate system, so the
+        # cursor must be mapped there too. / 卡片几何位于流容器坐标系，光标也
+        # 必须换算到该坐标系。
+        cur = container.mapFromGlobal(global_pos)
+        prev = self._drag_select_last
+        if prev is None:
+            prev = anchor_item.geometry().center()
+        # Sample the segment at a small step so no card is skipped /
+        # 以很小步长对线段采样，确保不跳过任何卡片
+        step = 4
+        dx = cur.x() - prev.x()
+        dy = cur.y() - prev.y()
+        dist = max(abs(dx), abs(dy))
+        samples = max(1, int(dist // step) + 1)
+        points = []
+        for i in range(samples + 1):
+            t = i / float(samples)
+            points.append(QPoint(int(prev.x() + dx * t), int(prev.y() + dy * t)))
+        self._drag_select_last = cur
+        changed = False
+        for card in list(self._items):
+            try:
+                if card.parentWidget() is not container:
+                    continue
+                geom = card.geometry()
+                hit = any(geom.contains(p) for p in points)
+                if hit and card.is_checked() != state:
+                    card.set_checked(state)
+                    changed = True
+            except RuntimeError:
+                continue  # card deleted during iteration / 迭代中卡片被删除
+        if changed:
+            self.selection_changed.emit(len(self._selection))
+
     def _on_selection_toggled(self, emoji_id, checked):
         # Update the selection map from a card's toggle signal / 由卡片信号
         # 更新选中集合
         if not self._selection_mode:
             return
         if checked:
-            # Store the emoji dict from the current data / 从当前数据取表情
-            for em in self._data:
-                if str(em.get("id", "")) == emoji_id:
-                    self._selection[emoji_id] = em
-                    break
+            # Store the emoji dict from the current data set; if the id is not
+            # in _data (e.g. a stale/recycled card), fall back to the card's
+            # own emoji so a visible checked card is never silently dropped
+            # from the selection — that drop made "select all then delete"
+            # leave items behind. / 从当前数据集取表情字典；若 id 不在 _data
+            # （如回收/过期卡片），回退用卡片自身的表情，避免可见的已勾选
+            # 卡片被静默丢出选中集合——这会导致"全选后删除"漏删。
+            found = self._data_index.get(emoji_id)
+            if found is None:
+                for card in self._items:
+                    if str(card._emoji.get("id", "")) == emoji_id:
+                        found = card._emoji
+                        break
+            if found is not None:
+                self._selection[emoji_id] = found
         else:
             self._selection.pop(emoji_id, None)
+        if self._selection_batch:
+            # Bulk operation in progress (select-all): the caller emits
+            # selection_changed once when it finishes. Emitting per card used to
+            # rebuild the move menu — a fresh QMenu plus a get_all_groups()
+            # query — for EVERY card in a large library.
+            # 批量操作中（全选）：调用方结束时统一发一次 selection_changed。
+            # 每张卡都发一次会重建移动菜单——新建一个 QMenu 外加一次
+            # get_all_groups() 查询——大图库里每张卡都来一遍。
+            return
         self.selection_changed.emit(len(self._selection))
+
+    def set_all_selection(self, enabled):
+        # Batch select/clear over the whole DATA set (not just the lazily
+        # created visible cards) in a single pass: materialized cards get their
+        # badge updated, unmaterialized ids update the selection map only (the
+        # card applies its state when it is created later).
+        # 一次遍历完成对整份数据集的批量勾选/清空（而非仅懒加载出的可见卡）：
+        # 已物化卡片更新角标，未物化的 id 只更新选中集合（卡片稍后创建时套用）。
+        if not self._selection_mode:
+            return 0
+        self._selection_batch = True
+        try:
+            if enabled:
+                for em in self._data:
+                    self._selection[str(em.get("id", ""))] = em
+            else:
+                self._selection.clear()
+            for card in self._items:
+                card.set_checked(bool(enabled))
+        finally:
+            self._selection_batch = False
+        self.selection_changed.emit(len(self._selection))
+        return len(self._selection)
 
     def _sync_selection_mode_on_rebuild(self):
         # Re-apply selection mode to cards after a rebuild (recycled cards
-        # are recreated without the flag) / 重建后重新应用多选模式（回收重
-        # 建的卡片不带该标志）
+        # are recreated without the flag). The checked state is forced from
+        # the selection map in BOTH directions: a recycled card may still
+        # carry a stale checked flag from its previous emoji, which showed a
+        # badge that was not in the selection and made deletes miss items.
+        # 重建后重新应用多选模式（回收卡重建后不带该标志）。勾选状态按选中
+        # 集合双向强制同步：回收卡可能残留上一张表情的勾选标志，显示出不在
+        # 选中集合里的角标，导致删除漏项。
         if self._selection_mode:
             for card in self._items:
                 card.set_selection_mode(True)
                 card._hover_enabled = False
-                if str(card._emoji.get("id", "")) in self._selection:
-                    card.set_checked(True)
+                eid = str(card._emoji.get("id", ""))
+                card.set_checked(eid in self._selection)
 
     def contextMenuEvent(self, event):
         pos = event.globalPos()
@@ -1063,6 +1428,9 @@ class EmojiGridWidget(QWidget):
             card.deleteLater()
         self._items = []
         self._thumb_index = {}
+        # Pooled cards carry the OLD fixed size, so they cannot be reused /
+        # 回收卡仍是旧尺寸，不能复用
+        self._clear_card_pool()
         self._flow.invalidate()
         self._flow.activate()
         self._flow.relayout()
@@ -1081,6 +1449,9 @@ class EmojiGridWidget(QWidget):
             card.deleteLater()
         self._items = []
         self._thumb_index = {}
+        # Pooled cards carry the OLD name-strip height, so they cannot be reused /
+        # 回收卡的名称条仍是旧高度，不能复用
+        self._clear_card_pool()
         self._flow.invalidate()
         self._flow.activate()
         self._flow.relayout()

@@ -53,9 +53,45 @@ def _root_dir():
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+# User-configured ffmpeg settings (set from the settings dialog at startup):
+# `_ffmpeg_enabled` turns ffmpeg off entirely (Pillow-only fallback), and
+# `_ffmpeg_override` points at a user-chosen ffmpeg binary that wins over the
+# bundled one. / 用户配置的 ffmpeg 设置（启动时由设置对话框写入）：
+# `_ffmpeg_enabled` 可完全关闭 ffmpeg（只用 Pillow 回退），
+# `_ffmpeg_override` 指向用户选择的 ffmpeg 可执行文件，优先于内置版本。
+_ffmpeg_enabled = True
+_ffmpeg_override = ""
+
+
+def set_ffmpeg_config(path=None, enabled=None):
+    # Update the ffmpeg configuration; None leaves a value unchanged.
+    # 更新 ffmpeg 配置；传 None 表示不改动该项。
+    global _ffmpeg_enabled, _ffmpeg_override
+    if enabled is not None:
+        _ffmpeg_enabled = bool(enabled)
+    if path is not None:
+        _ffmpeg_override = str(path or "")
+
+
+def ffmpeg_enabled():
+    return _ffmpeg_enabled
+
+
+def ffmpeg_configured_path():
+    return _ffmpeg_override
+
+
 def ffmpeg_path():
-    # Locate the bundled ffmpeg binary (works for both .py source and
-    # packaged exe layouts). / 定位内置 ffmpeg（.py 源码与打包 exe 布局都适用）
+    # Locate the ffmpeg binary: a user-chosen path wins, otherwise the bundled
+    # binary is auto-detected (works for both .py source and packaged exe
+    # layouts). Returns None when ffmpeg is disabled or not found, which makes
+    # every caller fall back to Pillow. / 定位 ffmpeg：用户指定路径优先，否则
+    # 自动检测内置二进制（.py 源码与打包 exe 布局都适用）。关闭或未找到时返回
+    # None，使各调用方回退到 Pillow。
+    if not _ffmpeg_enabled:
+        return None
+    if _ffmpeg_override and os.path.isfile(_ffmpeg_override):
+        return _ffmpeg_override
     candidates = [
         os.path.join(_root_dir(), "ffmpeg", "ffmpeg.exe"),
         os.path.join(_root_dir(), "ffmpeg.exe"),
@@ -64,6 +100,36 @@ def ffmpeg_path():
         if os.path.isfile(p):
             return p
     return None
+
+
+def ffmpeg_probe(path=None):
+    # Run `ffmpeg -version` for the given binary (or the effective one) and
+    # return (ok, first_line_or_error). Used by the settings dialog's
+    # "test / launch ffmpeg" button. / 对指定（或当前生效的）ffmpeg 运行
+    # `ffmpeg -version`，返回 (是否成功, 首行或错误信息)。供设置对话框的
+    # "启动/测试 ffmpeg" 按钮使用。
+    exe = path or ffmpeg_path()
+    if not exe:
+        return False, "ffmpeg not found / 未找到 ffmpeg"
+    if not os.path.isfile(exe):
+        return False, f"not a file / 不是文件: {exe}"
+    try:
+        kwargs = {}
+        if os.name == "nt":
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            kwargs["startupinfo"] = si
+            kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+        out = subprocess.run([exe, "-version"], capture_output=True,
+                             timeout=15, **kwargs)
+        text = (out.stdout or b"").decode("utf-8", "replace").strip()
+        if out.returncode == 0 and text:
+            return True, text.splitlines()[0]
+        err = (out.stderr or b"").decode("utf-8", "replace").strip()
+        return False, (err.splitlines()[0] if err else
+                       f"exit code {out.returncode}")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
 
 
 def needs_conversion(path):
@@ -248,7 +314,13 @@ def _copy_as_gif(src, dst):
 def _ffmpeg_convert_to_gif(src, dst):
     ff = ffmpeg_path()
     if not ff:
-        _log_warn("ffmpeg_convert: ffmpeg binary not found (src=%s)", src)
+        # ffmpeg is switched off (or missing): this is an expected state, not a
+        # failure — do not log a warning per file (a 400-file import used to
+        # emit 400 lines) and do not leave a half-written output behind.
+        # ffmpeg 被关闭（或缺失）属预期状态而非失败——不要每个文件都记一条警告
+        # （400 个文件的导入以前会打印 400 行），也不要留下半成品输出。
+        if ffmpeg_enabled():
+            _log_warn("ffmpeg_convert: ffmpeg binary not found (src=%s)", src)
         return False
     kwargs = {}
     if os.name == "nt":
@@ -436,12 +508,18 @@ def _ffmpeg_scale(src, dst, max_dim):
 
 
 # Convert with Pillow: load the image and re-save as a single-frame gif.
-# Oversized images are downscaled to MAX_GIF_DIM (aspect ratio kept) so the
-# resulting gif stays small enough for chat apps to paste it as a picture.
-# Animated webp/apng fall back to their first frame.
-# 用 Pillow 转换：加载图片并以单帧 gif 重新保存。超大图等比缩放到
-# MAX_GIF_DIM 内（保持比例），保证聊天软件能粘贴为图片。
-# 动画 webp/apng 只取第一帧。
+# Convert with Pillow: load the image and re-save it as a gif. Oversized
+# images are downscaled to MAX_GIF_DIM (aspect ratio kept) so the resulting gif
+# stays small enough for chat apps to paste it as a picture.
+#
+# ANIMATED sources (webp/apng) keep ALL of their frames. The old version saved a
+# single frame, so disabling ffmpeg silently turned every animated sticker into
+# a still image — the user saw "the animation just vanished" with no error.
+# 用 Pillow 转换：加载图片并以 gif 重新保存。超大图等比缩放到 MAX_GIF_DIM 内
+# （保持比例），保证聊天软件能粘贴为图片。
+#
+# 动画源（webp/apng）保留全部帧。旧实现只保存单帧，因此停用 ffmpeg 会静默把每
+# 个动态表情变成静态图——用户看到的是"动画直接没了"且没有任何报错。
 def _pillow_convert_to_gif(src, dst):
     try:
         from PIL import Image
@@ -450,13 +528,35 @@ def _pillow_convert_to_gif(src, dst):
         return False
     try:
         with Image.open(src) as im:
-            im.load()
-            if im.mode not in ("P", "L", "RGB", "RGBA"):
-                im = im.convert("RGB")
-            # Downscale oversized images (thumbnail never upscales) /
-            # 超大图等比缩小（thumbnail 不会放大）
-            im.thumbnail((MAX_GIF_DIM, MAX_GIF_DIM))
-            im.save(dst, "GIF", optimize=True)
+            try:
+                n_frames = max(1, int(getattr(im, "n_frames", 1)))
+            except Exception:
+                n_frames = 1
+            if n_frames > 1:
+                frames = []
+                durations = []
+                for idx in range(n_frames):
+                    im.seek(idx)
+                    frame = im.convert("RGBA")
+                    frame.thumbnail((MAX_GIF_DIM, MAX_GIF_DIM))
+                    # GIF is palette-based: quantize each frame separately /
+                    # GIF 基于调色板：逐帧量化
+                    frames.append(frame.convert(
+                        "P", palette=Image.Palette.ADAPTIVE))
+                    durations.append(int(im.info.get("duration", 100) or 100))
+                frames[0].save(
+                    dst, "GIF", save_all=True, append_images=frames[1:],
+                    duration=durations, loop=int(im.info.get("loop", 0) or 0),
+                    optimize=True, disposal=2,
+                )
+            else:
+                im.load()
+                if im.mode not in ("P", "L", "RGB", "RGBA"):
+                    im = im.convert("RGB")
+                # Downscale oversized images (thumbnail never upscales) /
+                # 超大图等比缩小（thumbnail 不会放大）
+                im.thumbnail((MAX_GIF_DIM, MAX_GIF_DIM))
+                im.save(dst, "GIF", optimize=True)
     except Exception as exc:
         _log_warn("pillow_convert: failed for %s -> %s (%s)", src, dst, exc)
         return False

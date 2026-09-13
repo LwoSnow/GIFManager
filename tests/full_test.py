@@ -360,7 +360,10 @@ w.search_bar.setText("新名字")
 flush(80)
 check("B6 搜索过滤生效", len(w.emoji_grid._items) >= 1, f"cards={len(w.emoji_grid._items)}")
 w.search_bar.setText("绝对不存在的关键词xyz")
-flush(80)
+# The search is debounced by 200 ms before it rebuilds the grid, so the wait
+# must exceed that (80 ms never let the refresh run). /
+# 搜索有 200ms 防抖后才重建网格，等待必须超过该值（80ms 时刷新根本不会执行）。
+flush(320)
 check("B7 搜索无结果显示占位", w.emoji_grid._placeholder.isVisible())
 w.search_bar.setText("")
 flush(80)
@@ -429,7 +432,16 @@ check("B14 移动分组路径", fresh_src["group_id"] == g_img)
 w._open_settings()
 dlg = w._settings_dialog
 flush(80)
-check("B15 设置对话框分类导航", dlg._cat_list.count() == 6 and dlg._stack.count() == 6)
+# 1.0.6 added the Performance category, so the dialog now has 7 pages; assert
+# the count matches the stack AND that the new page is really there (a bare
+# count would silently go stale again). /
+# 1.0.6 新增"性能"分类，对话框现为 7 页；断言分类数与页面栈一致，并确认新页面
+# 确实存在（只比对数字会再次悄悄过时）。
+cat_names = [dlg._cat_list.item(i).text() for i in range(dlg._cat_list.count())]
+check("B15 设置对话框分类导航",
+      dlg._cat_list.count() == 7 and dlg._stack.count() == 7
+      and len(cat_names) == 7 and len(set(cat_names)) == 7,
+      f"cats={cat_names} stack={dlg._stack.count()}")
 dlg._cat_list.setCurrentRow(1)
 flush(30)
 check("B16 分类切换", dlg._stack.currentIndex() == 1)
@@ -526,7 +538,15 @@ with mock.patch.object(mw_mod.QMessageBox, "question",
                        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)):
     w.group_list._delete_group(g_tmp)
     flush(50)
-check("C9 删除当前分组回退「全部」", w.current_group_id is None)
+# Deleting the selected group jumps to the PREVIOUS group (falling back to
+# "All" only when there is none), so the requirement is that the selection is
+# still valid — never that it is exactly All. /
+# 删除当前分组会跳到"上一个"分组（没有上一个时才回退"全部"），因此要求是选中
+# 仍然有效——而不是必须恰好为"全部"。
+check("C9 删除当前分组后选中仍有效",
+      w.current_group_id is None
+      or dm.get_group(w.current_group_id) is not None,
+      f"current={w.current_group_id}")
 
 # ======================================================================
 section("D. 性能基准")
@@ -660,7 +680,19 @@ try:
     dm2._conn.close()
 except Exception:
     pass
+# Drain the PRIVATE thumbnail pool too: the global one is awaited below, but a
+# pool the app owns is never awaited by Qt, and a worker still decoding then
+# crashes the process during DLL detach (after the summary has printed).
+# 也要排空"私有"缩略图线程池：下面只等待了全局池，而程序自有的池 Qt 永远不会
+# 等待，仍在解码的 worker 会在 DLL 卸载阶段让进程崩溃（汇总行已打印之后）。
+try:
+    from app.widgets.emoji_item import _loader
+    _loader.shutdown(3000)
+except Exception:
+    pass
+QThreadPool.globalInstance().clear()
 QThreadPool.globalInstance().waitForDone(3000)
+app.processEvents()
 app.quit()
 shutil.rmtree(TMP, ignore_errors=True)
 shutil.rmtree(dm2dir, ignore_errors=True)

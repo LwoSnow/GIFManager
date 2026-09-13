@@ -7,9 +7,12 @@ from PySide6.QtWidgets import (
     QPushButton, QGroupBox, QButtonGroup, QDialogButtonBox,
     QCheckBox, QComboBox, QLineEdit, QSpinBox, QListWidget,
     QStackedWidget, QWidget, QFrame, QScrollArea, QProgressBar,
-    QAbstractSpinBox,
+    QAbstractSpinBox, QFileDialog, QSizePolicy,
 )
-from PySide6.QtCore import Qt, QPoint, Signal, QStandardPaths
+from PySide6.QtCore import (
+    Qt, QPoint, Signal, QStandardPaths, QTimer, QObject, QRunnable,
+    QThreadPool,
+)
 from PySide6.QtGui import QPixmap, QPainter, QColor, QFont
 from PySide6.QtGui import QKeyEvent, QKeySequence, QMouseEvent
 
@@ -18,6 +21,66 @@ from app.models.update_manager import UpdateManager
 from app.widgets.hotkey_manager import key_event_to_hotkey_desc
 from app.utils.version import cmp_version, parse_version
 from app import __version__
+
+
+# Background probe results for this dialog (adapter enumeration / ffmpeg test).
+# Both shell out to Windows and can block for 12-15 s, so they must never run
+# on the GUI thread: clicking "Detect GPUs" used to freeze the window for up to
+# 12 s and "Launch FFmpeg (test)" for up to 15 s.
+# 本对话框的后台探测结果（显卡枚举 / ffmpeg 测试）。两者都会调用 Windows 接口
+# 并可能阻塞 12-15 秒，绝不能跑在 GUI 线程上：此前点"检测显卡"最多冻结窗口
+# 12 秒，点"启动 FFmpeg（测试）"最多 15 秒。
+class _ProbeSignals(QObject):
+    adapters_done = Signal(list)
+    ffmpeg_done = Signal(bool, str)
+
+
+class _AdapterProbeTask(QRunnable):
+    # Enumerate the installed adapters off the GUI thread / 在 GUI 线程外枚举显卡
+    def __init__(self, signals):
+        super().__init__()
+        self._signals = signals
+
+    def run(self):
+        try:
+            from app.utils import gpu_pref
+            names = gpu_pref.list_adapters()
+        except Exception:
+            names = []
+        _emit_if_alive(self._signals, "adapters_done", names)
+
+
+class _FfmpegProbeTask(QRunnable):
+    # Run the ffmpeg test off the GUI thread / 在 GUI 线程外执行 ffmpeg 测试
+    def __init__(self, signals, path):
+        super().__init__()
+        self._signals = signals
+        self._path = path
+
+    def run(self):
+        try:
+            from app.utils import gif_converter
+            ok, info = gif_converter.ffmpeg_probe(self._path or None)
+        except Exception as exc:  # pragma: no cover - defensive
+            ok, info = False, str(exc)
+        _emit_if_alive(self._signals, "ffmpeg_done", bool(ok), str(info))
+
+
+def _emit_if_alive(signals, name, *args):
+    # The dialog may be destroyed while a probe is in flight; emitting into a
+    # half-torn-down QObject is a native crash, so check both sides first.
+    # 探测进行中对话框可能已销毁；向半销毁的 QObject 发信号会造成原生崩溃，
+    # 因此先校验两侧存活。
+    try:
+        from shiboken6 import isValid
+        if not isValid(signals):
+            return
+    except ImportError:
+        pass
+    try:
+        getattr(signals, name).emit(*args)
+    except RuntimeError:
+        pass
 
 
 def _download_dir():
@@ -143,13 +206,19 @@ class SettingsDialog(QDialog):
                  auto_convert_gif=True, auto_update=False, show_emoji_name=True,
                  hover_zoom=1.15, hover_preview_enabled=True, auto_input=True,
                  card_scale=1.0, name_font_size=10,
+                 ffmpeg_enabled=True, ffmpeg_path="",
+                 gif_render_mode="auto", gif_render_count=0, gpu_render=False,
+                 gpu_pref=0, gpu_adapters=None, gpu_accel=None,
                  data_manager=None, hotkey_desc="", parent=None):
         super().__init__(parent)
         self.setWindowTitle(tr("settings"))
-        # 470x510: slightly larger than before so English texts (longer than
-        # Chinese) do not squeeze the option pages / 470x510：比原来略大，
-        # 英文文案比中文长，避免挤压右侧选项页
-        self.setFixedSize(470, 510)
+        # 560x520: the right-hand pages need ~370 px for their rows (long hint
+        # text, the FFmpeg path row, the GPU row); at 470 px wide the pages were
+        # squeezed and their text was clipped at the edges (reported on the
+        # Performance tab). / 560x520：右侧各页的行需要约 370px（较长的提示
+        # 文字、FFmpeg 路径行、GPU 行）；470px 宽时页面被挤压，文字在边缘被
+        # 裁切（性能页即出现过）。
+        self.setFixedSize(560, 520)
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog
         )
@@ -183,6 +252,43 @@ class SettingsDialog(QDialog):
         self._card_scale = max(0.5, min(2.0, float(card_scale)))
         # Global name font size for image cards / 图片卡全局名字字号
         self._name_font_size = max(1, min(20, int(name_font_size)))
+        # FFmpeg usage: master switch + optional user-chosen binary path.
+        # Empty path = auto-detect the bundled ffmpeg. / FFmpeg 使用：总开关
+        # 与可选的用户自定义可执行文件路径；路径为空则自动检测内置 ffmpeg。
+        self._ffmpeg_enabled = bool(ffmpeg_enabled)
+        self._ffmpeg_path = str(ffmpeg_path or "")
+        # Animated-GIF render concurrency: "auto" follows the core count,
+        # "manual" uses the user's number. / 动态 GIF 渲染并发："auto" 按核心数
+        # 自动分配，"manual" 使用用户自定义数量。
+        self._gif_render_mode = gif_render_mode if gif_render_mode in (
+            "auto", "manual") else "auto"
+        self._gif_render_count = max(0, int(gif_render_count or 0))
+        # Experimental GPU-backed rendering / 实验性 GPU 渲染
+        self._gpu_render = bool(gpu_render)
+        # Windows per-app GPU preference (0 system / 1 power / 2 high perf) /
+        # Windows 按应用 GPU 首选项（0 系统 / 1 省电 / 2 高性能）
+        try:
+            self._gpu_pref = int(gpu_pref)
+        except (TypeError, ValueError):
+            self._gpu_pref = 0
+        if self._gpu_pref not in (0, 1, 2):
+            self._gpu_pref = 0
+        # Cached adapter names (probed in the background at startup, so opening
+        # this dialog never blocks) / 缓存的显卡名称（启动时后台探测，故打开本
+        # 对话框不会阻塞）
+        self._gpu_adapters = [str(n) for n in (gpu_adapters or []) if str(n).strip()]
+        # Acceleration master switch. Older builds had a separate
+        # `gpu_render` flag; keep honouring it so an existing choice migrates.
+        # 加速总开关。旧版本用的是独立的 `gpu_render` 标志；继续兼容它以便沿用
+        # 用户已有的选择。
+        if gpu_accel is None:
+            gpu_accel = bool(gpu_render)
+        self._gpu_accel = bool(gpu_accel)
+        try:
+            from app.utils import gpu_pref as _gp
+            self._gpu_target = _gp.preferred_exe_display()
+        except Exception:
+            self._gpu_target = ""
         self._dm = data_manager
         self._hotkey_mods = 0
         self._hotkey_vk = 0
@@ -193,6 +299,18 @@ class SettingsDialog(QDialog):
         self._dragging = False
         self._drag_start = QPoint()
 
+    def _schedule_fit(self):
+        # Debounced re-fit: the wrapped height must be measured after the page
+        # has been laid out at its final width (a 0 ms timer is too early and
+        # measured the previous width). / 去抖重适配：换行高度必须在页面按其最终
+        # 宽度完成布局后测量（0ms 太早，量到的是上一个宽度）。
+        if not hasattr(self, "_fit_timer") or self._fit_timer is None:
+            self._fit_timer = QTimer(self)
+            self._fit_timer.setSingleShot(True)
+            self._fit_timer.setInterval(30)
+            self._fit_timer.timeout.connect(self._fit_wrapped_labels)
+        self._fit_timer.start()
+
     def showEvent(self, event):
         super().showEvent(event)
         self._apply_rounded()
@@ -202,6 +320,42 @@ class SettingsDialog(QDialog):
                 pg.x() + (pg.width() - self.width()) // 2,
                 pg.y() + (pg.height() - self.height()) // 2,
             )
+        # Give every wrapping hint its real wrapped height once the width is
+        # known (see _fit_wrapped_labels). / 宽度确定后为每个换行提示设置其真实
+        # 换行高度（见 _fit_wrapped_labels）。
+        self._schedule_fit()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Re-fit after a size change (the wrapped height depends on the width)
+        # 尺寸变化后重新适配（换行高度取决于宽度）
+        self._schedule_fit()
+
+    def _fit_wrapped_labels(self):
+        # A word-wrapped QLabel reports a ONE-LINE minimum height, so a page
+        # whose content is taller than the viewport lets the layout squeeze the
+        # hint and cut off its last line ("text squeezed / incomplete").
+        # Pin each hint's minimum height to the height it actually needs at its
+        # current width; the page then grows and the scroll area scrolls.
+        # 自动换行的 QLabel 其最小高度只按一行计算，因此当页面内容高于视口时，
+        # 布局会把提示压扁并切掉最后一行（即"文字上下挤压、显示不全"）。这里按
+        # 当前宽度算出实际所需高度并设为最小高度；页面随之变高，由滚动区滚动。
+        page = self._stack.currentWidget()
+        if not isinstance(page, QScrollArea):
+            return
+        inner = page.widget()
+        if inner is None:
+            return
+        for lab in inner.findChildren(QLabel):
+            if not lab.wordWrap() or not lab.text():
+                continue
+            w = lab.width()
+            if w <= 0:
+                continue
+            h = lab.heightForWidth(w)
+            if h > 0 and lab.minimumHeight() != h:
+                lab.setMinimumHeight(h)
+
 
     def _apply_rounded(self):
         if sys.platform != "win32":
@@ -264,7 +418,7 @@ class SettingsDialog(QDialog):
         body.setSpacing(10)
 
         self._cat_list = QListWidget()
-        self._cat_list.setFixedWidth(118)
+        self._cat_list.setFixedWidth(108)
         # Hide the horizontal scrollbar and elide long English category
         # names (e.g. "Performance") instead of showing a scrollbar
         # 隐藏横向滚动条，超长的英文分类名（如 Performance）用省略号截断
@@ -289,8 +443,34 @@ class SettingsDialog(QDialog):
         self._stack.addWidget(self._build_update_page())
         self._stack.addWidget(self._build_about_page())
         self._cat_list.currentRowChanged.connect(self._stack.setCurrentIndex)
+        # Re-fit the wrapping hints whenever a page becomes visible: the wrapped
+        # height depends on the width, which is only known once shown.
+        # 每当某页显示时重新适配换行提示：换行高度取决于宽度，而宽度只有显示后
+        # 才确定。
+        self._cat_list.currentRowChanged.connect(
+            lambda _i: self._schedule_fit())
         body.addWidget(self._stack, 1)
         layout.addLayout(body, 1)
+
+        # Word-wrapping hints must be able to shrink HORIZONTALLY but never be
+        # squeezed VERTICALLY: Chinese text has no spaces, so a QLabel's
+        # minimumSizeHint equals the WHOLE line and would force the page wider
+        # than the viewport (the text then got clipped at the edges because the
+        # horizontal scrollbar is off). Ignoring the horizontal size hint lets
+        # each hint take the available width and wrap; a Minimum vertical policy
+        # then keeps the wrapped height (Preferred allowed the layout to
+        # compress it and cut off the last line, which looked like squeezed
+        # text). The page grows and the scroll area scrolls instead.
+        # 会自动换行的提示标签必须能在水平方向收缩，但绝不能被垂直压扁：中文没有
+        # 空格，QLabel 的 minimumSizeHint 等于整行宽度，会把页面撑得比视口更宽
+        # （横向滚动条关闭时文字就在边缘被裁切）。忽略水平尺寸提示后，提示会占用
+        # 可用宽度并换行；垂直策略用 Minimum 才能保住换行后的高度（Preferred
+        # 允许布局压缩它，最后一行被切掉，看起来就是文字被挤压）。页面会变高并由
+        # 滚动区滚动。
+        for _lab in self.findChildren(QLabel):
+            if _lab.wordWrap():
+                _lab.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                   QSizePolicy.Policy.Minimum)
 
         btn_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -338,8 +518,31 @@ class SettingsDialog(QDialog):
         scroll.setStyleSheet(
             "QScrollArea, QScrollArea > QWidget > QWidget { background:transparent; }"
         )
+        # Let the page shrink to the viewport instead of being clipped: with the
+        # horizontal scrollbar off, any child whose minimum width exceeds the
+        # viewport cut its text off at the edges (reported on the Performance
+        # tab). The minimum width is therefore driven by the individual
+        # controls below, not by the page.
+        # 允许页面收缩到视口宽度而不被裁切：横向滚动条关闭时，任何最小宽度超出
+        # 视口的子控件都会在边缘截断文字（性能页即出现过）。因此页面最小宽度改为
+        # 由下面各个控件自身决定。
+        page.setMinimumWidth(0)
         scroll.setWidget(page)
         return scroll
+
+    @staticmethod
+    def _bound_combo(combo, min_chars=12):
+        # A QComboBox's minimum width grows with its widest ITEM, which pushed
+        # the settings pages wider than the dialog (long GPU adapter names).
+        # Bounding it lets the text elide instead of stretching the layout.
+        # QComboBox 的最小宽度会随最宽条目增长，会把设置页撑得比对话框更宽
+        # （例如很长的显卡名）。限制后文字省略显示，而不再撑开布局。
+        combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(min_chars)
+        combo.setSizePolicy(QSizePolicy.Policy.Preferred,
+                            combo.sizePolicy().verticalPolicy())
+        combo.setMinimumWidth(90)
 
     # Draw a blue circle with a white "?" via QPainter. Using a bitmap
     # instead of QSS avoids stylesheet merge conflicts on the real window.
@@ -507,6 +710,7 @@ class SettingsDialog(QDialog):
         self._label_gs_by = QLabel(tr("global_sort_by"))
         row_by.addWidget(self._label_gs_by)
         self._combo_gs_by = QComboBox()
+        self._bound_combo(self._combo_gs_by, 12)
         self._combo_gs_by.addItem(tr("sort_by_time"), "time")
         self._combo_gs_by.addItem(tr("sort_by_name"), "name")
         self._combo_gs_by.addItem(tr("sort_by_freq"), "freq")
@@ -519,6 +723,7 @@ class SettingsDialog(QDialog):
         self._label_gs_dir = QLabel(tr("global_sort_dir"))
         row_dir.addWidget(self._label_gs_dir)
         self._combo_gs_dir = QComboBox()
+        self._bound_combo(self._combo_gs_dir, 12)
         self._combo_gs_dir.addItem(tr("sort_dir_asc"), False)
         self._combo_gs_dir.addItem(tr("sort_dir_desc"), True)
         self._combo_gs_dir.setCurrentIndex(1 if self._gs_desc else 0)
@@ -531,6 +736,52 @@ class SettingsDialog(QDialog):
         self._combo_gs_by.setEnabled(self._gs_enabled)
         self._combo_gs_dir.setEnabled(self._gs_enabled)
         self._page_layout.addWidget(self._gs_group)
+
+        # FFmpeg group lives on the General page (it is a general conversion
+        # engine setting, not a send-mode option). / FFmpeg 分组放在通用页
+        # （它属于通用转换引擎设置，而非发送模式选项）。
+        self._ffmpeg_group = QGroupBox(tr("ffmpeg_group"))
+        ff_layout = QVBoxLayout(self._ffmpeg_group)
+        self._cb_ffmpeg = QCheckBox(tr("ffmpeg_enable"))
+        self._cb_ffmpeg.setChecked(self._ffmpeg_enabled)
+        self._cb_ffmpeg.toggled.connect(self._on_ffmpeg_toggled)
+        ff_layout.addWidget(self._cb_ffmpeg)
+        self._ffmpeg_hint = QLabel(tr("ffmpeg_hint"))
+        self._ffmpeg_hint.setStyleSheet("color: #888; font-size: 11px;")
+        self._ffmpeg_hint.setWordWrap(True)
+        ff_layout.addWidget(self._ffmpeg_hint)
+        ff_row = QHBoxLayout()
+        self._label_ffmpeg_path = QLabel(tr("ffmpeg_path"))
+        ff_row.addWidget(self._label_ffmpeg_path)
+        self._edit_ffmpeg_path = QLineEdit(self._ffmpeg_path)
+        self._edit_ffmpeg_path.setPlaceholderText(tr("ffmpeg_path_placeholder"))
+        self._edit_ffmpeg_path.setReadOnly(True)
+        # Small minimum so the row can shrink inside the page /
+        # 最小宽度设小，使该行能在页面内收缩
+        self._edit_ffmpeg_path.setMinimumWidth(70)
+        ff_row.addWidget(self._edit_ffmpeg_path, 1)
+        self._btn_ffmpeg_browse = QPushButton(tr("browse"))
+        self._btn_ffmpeg_browse.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_ffmpeg_browse.clicked.connect(self._on_ffmpeg_browse)
+        ff_row.addWidget(self._btn_ffmpeg_browse)
+        ff_layout.addLayout(ff_row)
+        ff_btn_row = QHBoxLayout()
+        self._btn_ffmpeg_launch = QPushButton(tr("ffmpeg_launch"))
+        self._btn_ffmpeg_launch.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_ffmpeg_launch.clicked.connect(self._on_ffmpeg_launch)
+        ff_btn_row.addWidget(self._btn_ffmpeg_launch)
+        self._btn_ffmpeg_clear = QPushButton(tr("ffmpeg_clear"))
+        self._btn_ffmpeg_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_ffmpeg_clear.clicked.connect(self._on_ffmpeg_clear)
+        ff_btn_row.addWidget(self._btn_ffmpeg_clear)
+        ff_btn_row.addStretch()
+        ff_layout.addLayout(ff_btn_row)
+        self._lbl_ffmpeg_status = QLabel("")
+        self._lbl_ffmpeg_status.setStyleSheet("color: #888; font-size: 11px;")
+        self._lbl_ffmpeg_status.setWordWrap(True)
+        ff_layout.addWidget(self._lbl_ffmpeg_status)
+        self._page_layout.addWidget(self._ffmpeg_group)
+        self._on_ffmpeg_toggled(self._ffmpeg_enabled)
 
         # Clear logs / 清除日志
         self._log_group = QGroupBox(tr("logs_group"))
@@ -569,10 +820,17 @@ class SettingsDialog(QDialog):
         def _row(radio, label):
             row = QHBoxLayout()
             row.setSpacing(2)  # Radio dot and text stay close, same visual row / 圆点与文字紧贴，视觉同一行
-            # Align radio dot center with the first text line (radio is shorter, nudge down)
-            # 圆点中心对齐第一行文字中心（radio 比文字行矮，微调下移）
-            radio.setStyleSheet("QRadioButton { margin-top: 2px; }")
-            row.addWidget(radio, 0, Qt.AlignmentFlag.AlignTop)
+            # Vertically CENTRE both parts. A word-wrapped QLabel sizes its
+            # height from sizeHint (which can be two lines even when the actual
+            # width fits one), and with the radio top-aligned that left the dot
+            # visibly offset from the text. Centring makes the dot line up with
+            # the text whether the label ends up one or two lines tall.
+            # 两者都垂直居中。自动换行的 QLabel 会按 sizeHint 定高（实际宽度够
+            # 一行时也可能留出两行高度），而圆点此前顶对齐，于是圆点相对文字明显
+            # 偏移。改为居中后，无论标签是一行还是两行，圆点都与文字对齐。
+            row.addWidget(radio, 0, Qt.AlignmentFlag.AlignVCenter)
+            label.setAlignment(Qt.AlignmentFlag.AlignLeft
+                               | Qt.AlignmentFlag.AlignVCenter)
             row.addWidget(label, 1)
             return row
 
@@ -610,6 +868,80 @@ class SettingsDialog(QDialog):
         self._page_layout.addWidget(self._conv_group)
         self._page_layout.addStretch()
         return self._wrap_scroll(w)
+
+    def _on_ffmpeg_toggled(self, enabled):
+        # The path controls are only meaningful while ffmpeg is enabled /
+        # 路径控件仅在启用 ffmpeg 时才有意义
+        for wdg in (self._edit_ffmpeg_path, self._btn_ffmpeg_browse,
+                    self._btn_ffmpeg_launch, self._btn_ffmpeg_clear,
+                    self._label_ffmpeg_path):
+            wdg.setEnabled(bool(enabled))
+
+    def _on_ffmpeg_browse(self):
+        # Let the user pick an ffmpeg executable instead of relying on the
+        # bundled auto-detection. / 让用户选择 ffmpeg 可执行文件，而不是只依赖
+        # 内置自动检测。
+        path, _ = QFileDialog.getOpenFileName(
+            self, tr("ffmpeg_choose_title"), "",
+            "ffmpeg (ffmpeg.exe ffmpeg);;All files (*)")
+        if not path:
+            return
+        self._edit_ffmpeg_path.setText(path)
+        self._ffmpeg_path = path
+        self._check_ffmpeg(path)
+
+    def _on_ffmpeg_clear(self):
+        # Reset to the bundled auto-detection / 恢复为内置自动检测
+        self._edit_ffmpeg_path.setText("")
+        self._ffmpeg_path = ""
+        self._check_ffmpeg("")
+
+    def _on_ffmpeg_launch(self):
+        # "Launch / test ffmpeg": run it and report the result so the user can
+        # confirm the chosen binary actually works. / "启动/测试 ffmpeg"：运行
+        # 并显示结果，供用户确认所选可执行文件确实可用。
+        self._check_ffmpeg(self._edit_ffmpeg_path.text())
+
+    def _check_ffmpeg(self, path):
+        # Runs on a GLF thread: probing shells out to the binary and can block
+        # for up to 15 s, which used to freeze the dialog while the user waited.
+        # 在后台线程执行：探测会调用外部程序并可能阻塞 15 秒，此前会让对话框
+        # 在用户等待期间冻结。
+        self._ffmpeg_probe_path = path
+        self._lbl_ffmpeg_status.setText(tr("ffmpeg_testing"))
+        self._btn_ffmpeg_launch.setEnabled(False)
+        self._ensure_probe_signals()
+        QThreadPool.globalInstance().start(
+            _FfmpegProbeTask(self._probe_signals, path))
+
+    def _ensure_probe_signals(self):
+        # One signal hub per dialog, connected once / 每个对话框一个信号中枢，只连接一次
+        if getattr(self, "_probe_signals", None) is not None:
+            return
+        self._probe_signals = _ProbeSignals()
+        self._probe_signals.adapters_done.connect(self._on_adapters_done)
+        self._probe_signals.ffmpeg_done.connect(self._on_ffmpeg_done)
+
+    def _on_ffmpeg_done(self, ok, info):
+        # Ignore a stale result (the user changed the path meanwhile) /
+        # 忽略过期结果（用户其间改了路径）
+        self._btn_ffmpeg_launch.setEnabled(True)
+        if ok:
+            self._lbl_ffmpeg_status.setText(tr("ffmpeg_ok", info=info))
+        else:
+            self._lbl_ffmpeg_status.setText(tr("ffmpeg_fail", info=info))
+
+    def _on_adapters_done(self, names):
+        names = [str(n) for n in (names or []) if str(n).strip()]
+        self._btn_gpu_probe.setEnabled(True)
+        self._btn_gpu_probe.setText(tr("gpu_detect"))
+        if names:
+            self._gpu_adapters = names
+            self._fill_gpu_combo(names, self._combo_gpu_pref.currentData())
+            self._lbl_gpu_adapters.setText(
+                tr("gpu_adapters_found", list=" / ".join(names)))
+        else:
+            self._lbl_gpu_adapters.setText(tr("gpu_adapters_none"))
 
     # Hotkey page
     # 快捷键
@@ -936,9 +1268,98 @@ class SettingsDialog(QDialog):
         row.addWidget(self._label_threads_unit)
         row.addStretch()
         perf_layout.addLayout(row)
+
+        # Animated-GIF render concurrency: auto (by core count) or a
+        # user-chosen number of GIFs rendered at once. / 动态 GIF 渲染并发：
+        # 自动（按核心数）或用户自定义同时渲染的 GIF 数量。
+        self._gif_render_group = QGroupBox(tr("gif_render_group"))
+        gr_layout = QVBoxLayout(self._gif_render_group)
+        self._rb_gif_auto = QRadioButton(tr("gif_render_auto"))
+        self._rb_gif_manual = QRadioButton(tr("gif_render_manual"))
+        self._gif_render_btns = QButtonGroup(self)
+        self._gif_render_btns.addButton(self._rb_gif_auto, 0)
+        self._gif_render_btns.addButton(self._rb_gif_manual, 1)
+        if self._gif_render_mode == "manual":
+            self._rb_gif_manual.setChecked(True)
+        else:
+            self._rb_gif_auto.setChecked(True)
+        gr_layout.addWidget(self._rb_gif_auto)
+        manual_row = QHBoxLayout()
+        manual_row.addWidget(self._rb_gif_manual)
+        self._spin_gif_count = QSpinBox()
+        self._spin_gif_count.setRange(1, 64)
+        self._spin_gif_count.setValue(
+            self._gif_render_count if self._gif_render_count > 0
+            else min(16, recommended_thread_count() * 2))
+        self._spin_gif_count.setFixedWidth(72)
+        manual_row.addWidget(self._spin_gif_count)
+        self._label_gif_count_unit = QLabel(tr("gif_render_count_unit"))
+        manual_row.addWidget(self._label_gif_count_unit)
+        manual_row.addStretch()
+        gr_layout.addLayout(manual_row)
+        self._rb_gif_auto.toggled.connect(self._on_gif_render_mode_toggled)
+        self._on_gif_render_mode_toggled(self._rb_gif_auto.isChecked())
+        self._gif_render_hint = QLabel(tr("gif_render_hint"))
+        self._gif_render_hint.setStyleSheet("color: #888; font-size: 11px;")
+        self._gif_render_hint.setWordWrap(True)
+        gr_layout.addWidget(self._gif_render_hint)
+        # GPU acceleration switch + preferred adapter. The switch is the master
+        # control: ON writes the chosen adapter preference AND renders
+        # thumbnails in parallel (every CPU core) for speed; OFF clears the
+        # preference and falls back to serial rendering.
+        # GPU 加速开关 + 优先显卡。开关是总控：开启时写入所选显卡偏好，并把缩略图
+        # 改为并行（全部核心）渲染以提速；关闭时清除偏好并回退串行渲染。
+        self._cb_gpu_accel = QCheckBox(tr("gpu_accel_enable"))
+        self._cb_gpu_accel.setChecked(self._gpu_accel)
+        self._cb_gpu_accel.toggled.connect(self._on_gpu_accel_toggled)
+        gr_layout.addWidget(self._cb_gpu_accel)
+        gpu_row = QHBoxLayout()
+        self._label_gpu_pref = QLabel(tr("gpu_pref"))
+        gpu_row.addWidget(self._label_gpu_pref)
+        # The list shows the adapter NAMES (as detected), plus a "system
+        # default" entry. Windows only distinguishes the power-saving and the
+        # high-performance class, so a chosen name maps onto whichever class it
+        # belongs to. / 列表直接显示检测到的显卡名称，另有"系统默认"项。
+        # Windows 仅区分省电与高性能两类，因此选中的名称会映射到所属类别。
+        self._combo_gpu_pref = QComboBox()
+        self._bound_combo(self._combo_gpu_pref, 16)
+        self._fill_gpu_combo(self._gpu_adapters, self._gpu_pref)
+        gpu_row.addWidget(self._combo_gpu_pref, 1)
+        self._btn_gpu_probe = QPushButton(tr("gpu_detect"))
+        self._btn_gpu_probe.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_gpu_probe.clicked.connect(self._refresh_gpu_adapters)
+        gpu_row.addWidget(self._btn_gpu_probe)
+        gr_layout.addLayout(gpu_row)
+        self._lbl_gpu_adapters = QLabel("")
+        self._lbl_gpu_adapters.setStyleSheet("color: #888; font-size: 11px;")
+        self._lbl_gpu_adapters.setWordWrap(True)
+        gr_layout.addWidget(self._lbl_gpu_adapters)
+        self._lbl_gpu_target = QLabel(tr("gpu_pref_target", exe=self._gpu_target))
+        self._lbl_gpu_target.setStyleSheet("color: #888; font-size: 11px;")
+        self._lbl_gpu_target.setWordWrap(True)
+        gr_layout.addWidget(self._lbl_gpu_target)
+        self._lbl_gpu_hint = QLabel(tr("gpu_pref_hint"))
+        self._lbl_gpu_hint.setStyleSheet("color: #888; font-size: 11px;")
+        self._lbl_gpu_hint.setWordWrap(True)
+        gr_layout.addWidget(self._lbl_gpu_hint)
+        self._on_gpu_accel_toggled(self._gpu_accel)
+        perf_layout.addWidget(self._gif_render_group)
         self._page_layout.addWidget(self._perf_group)
         self._page_layout.addStretch()
         return self._wrap_scroll(w)
+
+    def _on_gpu_accel_toggled(self, enabled):
+        # The adapter choice only matters while acceleration is enabled /
+        # 仅在启用加速时，显卡选择才有意义
+        for wdg in (self._combo_gpu_pref, self._btn_gpu_probe,
+                    self._label_gpu_pref, self._lbl_gpu_target,
+                    self._lbl_gpu_hint):
+            wdg.setEnabled(bool(enabled))
+
+    def _on_gif_render_mode_toggled(self, auto_checked):
+        # The count box only applies to manual mode / 数量框仅在自定义模式生效
+        self._spin_gif_count.setEnabled(not auto_checked)
+        self._label_gif_count_unit.setEnabled(not auto_checked)
 
     def _on_ok(self):
         self._mode = 0 if self._rb_file.isChecked() else 1
@@ -1028,6 +1449,14 @@ class SettingsDialog(QDialog):
         self._cb_auto_convert.setText(tr("gif_auto_convert"))
         self._conv_hint.setText(tr("gif_auto_convert_hint"))
         self._btn_convert_library.setText(tr("gif_convert_all"))
+        # FFmpeg group / FFmpeg 分组
+        self._ffmpeg_group.setTitle(tr("ffmpeg_group"))
+        self._cb_ffmpeg.setText(tr("ffmpeg_enable"))
+        self._label_ffmpeg_path.setText(tr("ffmpeg_path"))
+        self._edit_ffmpeg_path.setPlaceholderText(tr("ffmpeg_path_placeholder"))
+        self._btn_ffmpeg_browse.setText(tr("browse"))
+        self._btn_ffmpeg_launch.setText(tr("ffmpeg_launch"))
+        self._btn_ffmpeg_clear.setText(tr("ffmpeg_clear"))
         self._lbl_current.setText(tr("update_current", version=__version__))
         self._cb_auto_update.setText(tr("update_auto"))
         self._btn_check.setText(tr("update_check"))
@@ -1046,6 +1475,28 @@ class SettingsDialog(QDialog):
         # Performance page / 性能页
         self._perf_group.setTitle(tr("perf_group"))
         self._perf_hint.setText(tr("perf_hint"))
+        self._gif_render_group.setTitle(tr("gif_render_group"))
+        self._rb_gif_auto.setText(tr("gif_render_auto"))
+        self._rb_gif_manual.setText(tr("gif_render_manual"))
+        self._label_gif_count_unit.setText(tr("gif_render_count_unit"))
+        self._gif_render_hint.setText(tr("gif_render_hint"))
+        self._cb_gpu_accel.setText(tr("gpu_accel_enable"))
+        self._label_gpu_pref.setText(tr("gpu_pref"))
+        if self._btn_gpu_probe.isEnabled():
+            # Do not overwrite the "detecting…" label while a probe is in
+            # flight / 探测进行中不要覆盖"检测中…"文案
+            self._btn_gpu_probe.setText(tr("gpu_detect"))
+        self._lbl_gpu_target.setText(
+            tr("gpu_pref_target", exe=self._gpu_target))
+        self._lbl_gpu_hint.setText(tr("gpu_pref_hint"))
+        # Refresh the adapter entry wording (adapter names stay as detected) /
+        # 刷新适配器项文案（显卡名保持检测到的原名）
+        self._fill_gpu_combo(self._gpu_adapters,
+                             self._combo_gpu_pref.currentData())
+        _gp = self._combo_gpu_pref
+        _gp.setItemText(0, tr("gpu_pref_system"))
+        _gp.setItemText(1, tr("gpu_pref_high"))
+        _gp.setItemText(2, tr("gpu_pref_power"))
         self._label_threads.setText(tr("thread_count"))
         self._label_threads_unit.setText(tr("thread_count_unit"))
         # Buttons / 按钮
@@ -1058,6 +1509,12 @@ class SettingsDialog(QDialog):
         self._theme_combo.updateGeometry()
         self.layout().invalidate()
         self.layout().activate()
+        # Re-measure the wrapped hints for the NEW language. English wording is
+        # longer, so the pre-switch minimum heights were too small and the last
+        # line of a hint could be clipped again after a language switch.
+        # 按新语言重新测量换行提示。英文文案更长，切换前设定的最小高度会偏小，
+        # 切换语言后提示的最后一行可能再次被裁切。
+        self._schedule_fit()
 
     def send_mode(self):
         return 0 if self._rb_file.isChecked() else 1
@@ -1100,6 +1557,92 @@ class SettingsDialog(QDialog):
 
     def auto_update(self):
         return self._auto_update
+
+    def ffmpeg_enabled(self):
+        return self._cb_ffmpeg.isChecked()
+
+    def ffmpeg_path(self):
+        # Empty string = auto-detect the bundled ffmpeg / 空字符串 = 自动检测内置
+        return self._edit_ffmpeg_path.text().strip()
+
+    def gif_render_mode(self):
+        return "auto" if self._rb_gif_auto.isChecked() else "manual"
+
+    def gif_render_count(self):
+        return self._spin_gif_count.value()
+
+    def gpu_render(self):
+        # Master switch for GPU/accelerated rendering / GPU/加速渲染总开关
+        return self._cb_gpu_accel.isChecked()
+
+    def gpu_accel(self):
+        return self._cb_gpu_accel.isChecked()
+
+    def gpu_preference(self):
+        # 0 = system default, 1 = power saving, 2 = high performance /
+        # 0 = 系统默认，1 = 省电，2 = 高性能
+        return self._combo_gpu_pref.currentData()
+
+    def _fill_gpu_combo(self, adapters, pref):
+        # Rebuild the GPU list: "system default" plus every detected adapter
+        # name, each carrying the Windows preference class it maps to.
+        # 重建显卡列表："系统默认"加每个检测到的显卡名，各自携带映射到的
+        # Windows 首选项类别。
+        from app.utils import gpu_pref as _gp
+        combo = self._combo_gpu_pref
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(tr("gpu_pref_system"), 0)
+        want = 0
+        unknown = []
+        for name in adapters:
+            cls = _gp.classify_adapter(name)
+            if cls is None:
+                # Windows only supports the two classes, so an unclassifiable
+                # adapter cannot be selected — but it must still be LISTED.
+                # Silently dropping it left the user seeing the card in the
+                # "detected" hint yet unable to pick it, with no explanation.
+                # Windows 只支持那两个类别，无法分类的显卡不能被选中——但仍必须
+                # 列出。此前静默丢弃会让用户在"已检测"提示里看到该卡却选不到，
+                # 且没有任何解释。
+                unknown.append(name)
+                continue
+            combo.addItem(name, cls)
+            if cls == pref and want == 0:
+                want = combo.count() - 1
+        for name in unknown:
+            # Added disabled, with a reason in the label / 以禁用状态加入，标签里
+            # 给出原因
+            combo.addItem(tr("gpu_adapter_unmapped", name=name), None)
+            idx = combo.count() - 1
+            item = combo.model().item(idx) if hasattr(combo.model(), "item") \
+                else None
+            if item is not None:
+                item.setEnabled(False)
+        if pref != 0 and want == 0:
+            # Preference stored but the matching adapter is not in the cached
+            # list: keep a generic entry so the value stays representable.
+            # 已保存首选项但缓存列表里没有对应显卡：补一个通用项，使该值仍可表示。
+            key = "gpu_pref_high" if pref == 2 else "gpu_pref_power"
+            combo.addItem(tr(key), pref)
+            want = combo.count() - 1
+        combo.setCurrentIndex(want)
+        combo.blockSignals(False)
+
+    def _refresh_gpu_adapters(self):
+        # Detect the installed adapters and repopulate the list. Detection
+        # shells out to Windows and can take up to ~12 s, so it runs on a pool
+        # thread and reports back through a signal; the button is disabled and
+        # relabelled while it works. (Running it on the GUI thread — even on
+        # demand — froze the settings window for the whole wait.)
+        # 检测已安装显卡并重建列表。检测会调用 Windows 接口、最长约 12 秒，因此在
+        # 线程池中执行并经信号回填；期间按钮禁用并改文案。（此前即使在按钮上按需
+        # 执行，也会让设置窗口冻结整个等待期。）
+        self._ensure_probe_signals()
+        self._btn_gpu_probe.setEnabled(False)
+        self._btn_gpu_probe.setText(tr("gpu_detecting"))
+        self._lbl_gpu_adapters.setText(tr("gpu_detecting"))
+        QThreadPool.globalInstance().start(_AdapterProbeTask(self._probe_signals))
 
     def _on_convert_all(self):
         # Emit a signal so MainWindow runs the conversion (it owns the progress

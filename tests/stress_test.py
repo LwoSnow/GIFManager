@@ -359,7 +359,15 @@ from app.widgets.settings_dialog import SettingsDialog
 
 
 def _dlg():
-    d = SettingsDialog(0, True, False, False, 100, 200, dm, "F10", w)
+    # Construct by keyword: the dialog gained thread_count/theme/FFmpeg/GPU
+    # parameters, so the old positional list put the DataManager into
+    # thread_count and raised TypeError. / 用关键字构造：对话框新增了
+    # thread_count/theme/FFmpeg/GPU 等参数，旧的位置参数会把 DataManager 传进
+    # thread_count 并抛 TypeError。
+    d = SettingsDialog(current_mode=0, remember_group=True, autostart=False,
+                       always_on_top=False, text_limit_single=100,
+                       text_limit_multi=200, data_manager=dm,
+                       hotkey_desc="F10", parent=w)
     d.show()
     flush(50)
     d.close()
@@ -480,9 +488,16 @@ dm.import_emoji(default_g["id"], img_paths[0])
 # Same image into the stress group (cross-group allowed) / 同一张图导入压测分组（跨组允许）
 dm.import_emoji(g2, img_paths[0])
 all_view = dm.get_all_emojis()
-cnt_first = sum(1 for e in all_view if e["content_hash"] == dm._file_md5(img_paths[0]))
+# Compare against the STORED record's hash, not the source file's: imports are
+# converted to gif, so content_hash is the converted file's md5 and never
+# equals md5(source .png) (comparing against the source reported 0 forever). /
+# 与"已存储记录"的哈希比较，而不是源文件哈希：导入会转成 gif，content_hash 是
+# 转换后文件的 md5，永远不会等于源 png 的 md5（此前用源哈希比较，恒为 0）。
+_stored = dm.get_emojis_by_group(default_g["id"])[-1]
+_h = _stored["content_hash"]
+cnt_first = sum(1 for e in all_view if e["content_hash"] == _h)
 bug("B6 「全部」按内容哈希折叠跨组重复",
-    cnt_first == 1, f"折叠后出现 {cnt_first} 次")
+    cnt_first == 1, f"折叠后出现 {cnt_first} 次（hash={_h[:12]}）")
 w.group_list.select_all_group()
 flush(150)
 
@@ -524,7 +539,15 @@ try:
 except Exception:
     pass
 QThreadPool = __import__("PySide6.QtCore", fromlist=["QThreadPool"]).QThreadPool
+QThreadPool.globalInstance().clear()
 QThreadPool.globalInstance().waitForDone(3000)
+# The app's OWN thumbnail pool is never awaited by Qt / 程序自有的缩略图池 Qt 不等待
+try:
+    from app.widgets.emoji_item import _loader
+    _loader.shutdown(3000)
+except Exception:
+    pass
+app.processEvents()
 app.quit()
 try:
     shutil.rmtree(TMP, ignore_errors=True)

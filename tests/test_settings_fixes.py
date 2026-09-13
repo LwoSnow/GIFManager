@@ -11,6 +11,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP = tempfile.mkdtemp(prefix="gifmgr_settings_")
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 sys.path.insert(0, ROOT)
+from tests._iso import drain_and_exit  # noqa: E402
 
 from PySide6.QtWidgets import QApplication
 from app.widgets.settings_dialog import SettingsDialog
@@ -76,4 +77,4 @@ dlg.deleteLater()
 n_pass = sum(1 for _, ok in RES if ok)
 print(f"\n设置页修复验证: {n_pass}/{len(RES)} 通过")
 import os as _os
-_os._exit(0 if n_pass == len(RES) else 1)
+drain_and_exit(0 if n_pass == len(RES) else 1)

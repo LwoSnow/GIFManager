@@ -14,6 +14,12 @@ QWidget {
 QMainWindow {
     background-color: #1E1E1E;
 }
+/* Emoji grid surface (also covers an empty group, so the blank area can never
+   fall through to an unthemed/black viewport) /
+   表情网格表面（也覆盖空分组，避免空白区域透出未上主题/纯黑视口） */
+QWidget#emojiGrid {
+    background-color: #1E1E1E;
+}
 
 /* ========== 工具栏 ========== */
 QToolBar {

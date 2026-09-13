@@ -11,6 +11,12 @@ TMP = tempfile.mkdtemp(prefix="gifmgr_qq_")
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 sys.path.insert(0, ROOT)
 
+# Isolate QSettings / the per-app GPU preference from the real user state /
+# 隔离 QSettings 与按应用 GPU 首选项，避免影响用户真实状态
+from tests._iso import isolate_all, drain_and_exit  # noqa: E402
+
+isolate_all()
+
 from PIL import Image
 
 import app.models.data_manager as dm_mod
@@ -98,4 +104,4 @@ check("D 空目录不崩溃", True)
 n_pass = sum(1 for _, ok in RES if ok)
 print(f"\nQQ 导入/设置防重验证: {n_pass}/{len(RES)} 通过")
 import os as _os
-_os._exit(0 if n_pass == len(RES) else 1)
+drain_and_exit(0 if n_pass == len(RES) else 1)

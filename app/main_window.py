@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt, QSize, QMimeData, QPoint, QTimer, QSettings, QThreadPool, QStandardPaths,
-    QEvent,
+    QEvent, QObject, QRunnable, Signal,
 )
 from PySide6.QtGui import (
     QDragEnterEvent, QDropEvent, QIcon, QAction, QKeyEvent, QKeySequence,
@@ -153,8 +153,60 @@ class SmoothScroll:
         self._timer.start()
 
 
+class _GpuProbeSignals(QObject):
+    # Signal holder for the adapter probe / 显卡探测的信号载体
+    done = Signal(list)
+
+
+class _GpuProbeTask(QRunnable):
+    # Probe the installed display adapters on a pool thread: the underlying
+    # Windows query takes ~2 s, so it must never run on the GUI thread (doing
+    # that when the settings dialog opened froze it). A pool task is used
+    # instead of a raw QThread so Qt waits for it during shutdown (destroying a
+    # running QThread aborts the process).
+    # 在线程池线程上探测已安装显卡：底层 Windows 查询约需 2 秒，绝不能跑在
+    # GUI 线程上（此前在设置对话框打开时执行导致卡顿）。使用线程池任务而非裸
+    # QThread，使 Qt 在退出时统一等待（运行中的 QThread 被销毁会中止进程）。
+    def __init__(self, signals):
+        super().__init__()
+        self._signals = signals
+
+    def run(self):
+        try:
+            from app.utils import gpu_pref
+            names = gpu_pref.list_adapters()
+        except Exception:
+            names = []
+        try:
+            from shiboken6 import isValid
+            if not isValid(self._signals):
+                return          # owner gone / 持有者已销毁
+        except ImportError:
+            pass
+        try:
+            self._signals.done.emit(names)
+        except RuntimeError:
+            pass
+
+
+# QSettings factory. Production always returns the real user key; tests replace
+# this function with one that points at a throwaway INI file, so a test run can
+# never read or write the user's real preferences. This matters: a test that once
+# called clear() on the production key silently wiped every setting, including
+# "窗口置顶" and the chosen GPU.
+# QSettings 工厂。生产环境始终返回用户真实的注册表键；测试会把这个函数替换为
+# 指向临时 INI 文件的实现，使测试永远不会读写用户真实的偏好设置。这一点很
+# 重要：曾经有测试对生产键调用 clear()，静默清空了包括"窗口置顶"与已选显卡
+# 在内的所有设置。
+def _new_settings():
+    return QSettings("GIFManager", "GIFManager")
+
+
 class MainWindow(QMainWindow):
     APP_TITLE = "GIFManager"
+    # Nominal size of the settings icon (drawn at 75% of this) /
+    # 设置图标的标称尺寸（实际按此的 75% 绘制）
+    ICON_PX = 22
 
     def __init__(self):
         super().__init__()
@@ -187,7 +239,7 @@ class MainWindow(QMainWindow):
             __version__,
         )
 
-        self._settings = QSettings("GIFManager", "GIFManager")
+        self._settings = _new_settings()
         self.data_manager = DataManager()
         self.current_group_id = None
         self._send_mode = 0
@@ -273,6 +325,41 @@ class MainWindow(QMainWindow):
         # Click an emoji -> auto-type (Ctrl+V) into the focused chat input /
         # 点击表情 → 自动输入（Ctrl+V）到焦点聊天输入框
         self._auto_input = self._settings.value("auto_input", True, type=bool)
+        # FFmpeg: master switch + optional user-chosen binary path /
+        # FFmpeg：总开关 + 可选的用户自定义可执行文件路径
+        self._ffmpeg_enabled = self._settings.value(
+            "ffmpeg_enabled", True, type=bool)
+        self._ffmpeg_path = self._settings.value("ffmpeg_path", "")
+        from app.utils import gif_converter as _gc
+        _gc.set_ffmpeg_config(path=self._ffmpeg_path,
+                              enabled=self._ffmpeg_enabled)
+        # Animated-GIF render concurrency (auto by cores / manual count) and
+        # the experimental GPU rendering switch / 动态 GIF 渲染并发（按核心数
+        # 自动 / 自定义数量）与实验性 GPU 渲染开关
+        mode = self._settings.value("gif_render_mode", "auto")
+        self._gif_render_mode = mode if mode in ("auto", "manual") else "auto"
+        self._gif_render_count = self._settings.value(
+            "gif_render_count", 0, type=int)
+        self._gpu_render = self._settings.value("gpu_render", False, type=bool)
+        # Master switch for GPU/accelerated rendering: ON renders thumbnails in
+        # parallel and applies the chosen adapter preference; OFF clears it.
+        # GPU/加速渲染总开关：开启时并行渲染缩略图并写入所选显卡偏好；关闭时清除。
+        self._gpu_accel = self._settings.value(
+            "gpu_accel", self._gpu_render, type=bool)
+        # Windows per-app GPU preference (0 system / 1 power / 2 high perf) /
+        # Windows 按应用 GPU 首选项（0 系统 / 1 省电 / 2 高性能）
+        self._gpu_pref = self._settings.value("gpu_pref", 0, type=int)
+        if self._gpu_pref not in (0, 1, 2):
+            self._gpu_pref = 0
+        # GPU acceleration: parallel thumbnail rendering (every CPU core) /
+        # GPU 加速：并行缩略图渲染（使用全部 CPU 核心）
+        EmojiItem.set_parallel_render(self._gpu_accel)
+        # Cached GPU adapter names (so the settings dialog lists them by name
+        # without running the ~2 s detection). / 缓存的显卡名称（使设置对话框
+        # 直接按名称列出，无需执行约 2 秒的检测）。
+        cached = self._settings.value("gpu_adapters", "")
+        self._gpu_adapters = [n for n in str(cached).split("|") if n.strip()]
+        self._gpu_probe_signals = None
         lang = self._settings.value("language", "zh_CN")
         try:
             set_language(lang)
@@ -292,10 +379,140 @@ class MainWindow(QMainWindow):
             # GIF frames are decoded off the GUI thread (gifdec.dll) and
             # cached, so playback is just a pixmap swap; raise the
             # concurrent-playback cap accordingly (was core*2, too low on
-            # multi-core machines) / GIF 帧已在后台（gifdec.dll）解码并缓存，
-            # 播放只是切换 pixmap，故提高同时播放上限（原为核心数×2，多核
-            # 机器上偏少）
-            self.emoji_grid._gif_limit = max(8, n * 4)
+            # multi-core machines). The user can instead pin an explicit
+            # number of simultaneously rendered GIFs in Settings -> Performance.
+            # GIF 帧已在后台（gifdec.dll）解码并缓存，播放只是切换 pixmap，
+            # 故提高同时播放上限（原为核心数×2，多核机器上偏少）。用户也可在
+            # 设置 → 性能 中指定同时渲染的动态 GIF 数量。
+            mode = getattr(self, "_gif_render_mode", "auto")
+            count = getattr(self, "_gif_render_count", 0)
+            if mode == "manual" and count > 0:
+                self.emoji_grid._gif_limit = max(1, count)
+            else:
+                self.emoji_grid._gif_limit = max(8, n * 4)
+
+    def _apply_gpu_preference(self, explicit=False):
+        # Windows' per-application GPU preference (HKCU DirectX
+        # UserGpuPreferences). Qt cannot bind a process to an adapter, so this
+        # is the only real mechanism; it takes effect on the next launch.
+        #
+        # `explicit` is True only when the user pressed OK in Settings. A
+        # non-explicit (startup) call must NOT delete an existing entry: the
+        # app would otherwise silently erase a Windows-level, app-wide setting
+        # that the user may have made in Windows Settings — and any run with
+        # acceleration off (including every test run) wiped it. Startup only
+        # writes (or refreshes) a real choice (acceleration on AND a specific
+        # adapter); removal happens on the explicit user action alone. It also
+        # must not DELETE when acceleration is on but the adapter is "system
+        # default" (pref 0) — that is not a request to clear anything.
+        # `explicit` 仅在用户于设置中按下确定时为 True。非显式（启动）调用绝不
+        # 删除已有项：否则程序会静默抹掉用户在 Windows 设置里做过的、系统级的
+        # 按应用设置——而且任何"加速关闭"的运行（包括每次测试）都会清掉它。
+        # 启动时只写入（刷新）真正的选择（加速开启"且"指定了显卡）；删除只由用户
+        # 的显式操作触发。加速开启但显卡为"系统默认"（pref 0）时同样不得删除——
+        # 那并不表示要清除任何东西。
+        try:
+            from app.utils import gpu_pref
+            accel = bool(getattr(self, "_gpu_accel", False))
+            pref = int(getattr(self, "_gpu_pref", 0) or 0)
+            if not explicit:
+                if not accel or not pref:
+                    self._log.info(
+                        "GPU preference -> startup, left untouched / 未改动")
+                    return
+            else:
+                # Explicit OK: the UI state IS the desired state — turning
+                # acceleration off (or picking "system default") clears the
+                # override. Always applied, never gated on a value change, so
+                # the registry can never drift away from what the dialog shows.
+                # 显式确定：界面状态即目标状态——关闭加速（或选"系统默认"）即清除
+                # 覆盖项。始终执行、不以"值是否变化"为条件，注册表因此不可能与
+                # 对话框显示的状态不一致。
+                pref = pref if accel else 0
+            exe = gpu_pref.current_exe()
+            ok = gpu_pref.apply_preference(exe, pref)
+            self._log.info(
+                "GPU preference -> explicit=%s accel=%s pref=%s exe=%s "
+                "applied=%s", explicit, accel, pref, exe, ok)
+        except Exception:
+            self._log.exception("Apply GPU preference failed")
+
+    def _start_gpu_adapter_probe(self):
+        # Run the ~2 s adapter detection on a pool thread once, then cache the
+        # result so later launches list the GPUs instantly. The pool is OWNED by
+        # the window (not the global instance) so _stop_gpu_adapter_probe() can
+        # really drain it: Qt only awaits the global pool at shutdown, and a
+        # task that outlived the window used to signal a destroyed receiver
+        # while the process was exiting.
+        # 在线程池上执行一次约 2 秒的显卡检测并缓存结果，使后续启动可立即列显卡。
+        # 该池由窗口自己持有（不用全局池），这样 _stop_gpu_adapter_probe() 才能真
+        # 正排空它：Qt 只在退出时等待全局池，而比窗口活得更久的任务会在进程退出时
+        # 向已销毁的接收者发信号。
+        if self._gpu_adapters:
+            return
+        try:
+            if getattr(self, "_gpu_pool", None) is None:
+                self._gpu_pool = QThreadPool()
+                self._gpu_pool.setMaxThreadCount(1)
+            self._gpu_probe_signals = _GpuProbeSignals()
+            self._gpu_probe_signals.done.connect(self._on_gpu_probe_done)
+            self._gpu_pool.start(_GpuProbeTask(self._gpu_probe_signals))
+        except Exception:
+            self._log.exception("Start GPU adapter probe failed")
+
+    def _on_gpu_probe_done(self, names):
+        # Cache the detected adapters for the settings dialog / 缓存检测到的
+        # 显卡供设置对话框使用
+        self._gpu_adapters = [str(n) for n in (names or []) if str(n).strip()]
+        if self._gpu_adapters:
+            self._settings.setValue("gpu_adapters", "|".join(self._gpu_adapters))
+            self._log.info("GPU adapters cached -> %s", self._gpu_adapters)
+
+    def _apply_gpu_render(self, at_startup=True):
+        # GPU handling is now ONLY the Windows per-application GPU preference
+        # (see _apply_gpu_preference). The earlier experimental OpenGL viewport
+        # swap was removed because field reports showed it is not a usable
+        # control:
+        #   - its first paint could be black (an empty group showed a pure black
+        #     page until a full repaint happened),
+        #   - re-creating it while toggling crashed the renderer and left the
+        #     sticker page completely black,
+        #   - and it never determined which GPU the app actually used, so turning
+        #     it "off" left the GPU preference in place.
+        # Qt also cannot bind a process to an adapter; the OS-level preference is
+        # the supported mechanism.
+        # GPU 处理现在只依赖 Windows 的按应用 GPU 首选项（见
+        # _apply_gpu_preference）。此前的实验性 OpenGL 视口切换已移除，因为实际
+        # 反馈表明它并不是一个可用的控件：
+        #   - 首次绘制可能是黑的（空分组显示整页纯黑，直到一次完整重绘才恢复），
+        #   - 反复创建/销毁它会导致渲染崩溃、表情包页面整片变黑，
+        #   - 而且它并不决定程序实际使用哪块显卡，所以"关闭"后 GPU 偏好依然
+        #     生效（独显仍被调用）。
+        # Qt 也无法把进程绑定到指定显卡；操作系统级首选项才是受支持的机制。
+        self._apply_viewport_background()
+
+    def _apply_viewport_background(self):
+        # Paint the scroll viewport (and the grid) with the theme surface colour
+        # so the empty area can never fall through to an unthemed/black
+        # viewport. / 用主题表面色绘制滚动视口（与网格），使空白区域绝不会
+        # 透出未上主题/纯黑的视口。
+        try:
+            from PySide6.QtGui import QPalette, QColor
+        except ImportError:
+            return
+        dark = (getattr(self, "_theme", "dark") != "light")
+        color = QColor("#1E1E1E") if dark else QColor("#F2F3F5")
+        for wdg in (self._scroll_area.viewport(), getattr(self, "emoji_grid", None)):
+            if wdg is None:
+                continue
+            try:
+                wdg.setAutoFillBackground(True)
+                pal = wdg.palette()
+                pal.setColor(QPalette.ColorRole.Window, color)
+                pal.setColor(QPalette.ColorRole.Base, color)
+                wdg.setPalette(pal)
+            except RuntimeError:
+                continue
 
     def _install_no_activate_filter(self):
         # Start the focus guard: clicking this window must never steal focus
@@ -320,6 +537,14 @@ class MainWindow(QMainWindow):
         self._settings.setValue("always_on_top", self._always_on_top)
         self._settings.setValue("thread_count", self._thread_count)
         self._settings.setValue("theme", self._theme)
+        self._settings.setValue("ffmpeg_enabled", self._ffmpeg_enabled)
+        self._settings.setValue("ffmpeg_path", self._ffmpeg_path)
+        self._settings.setValue("gif_render_mode", self._gif_render_mode)
+        self._settings.setValue("gif_render_count", self._gif_render_count)
+        self._settings.setValue("gpu_render", self._gpu_render)
+        self._settings.setValue("gpu_accel", self._gpu_accel)
+        self._settings.setValue("gpu_pref", self._gpu_pref)
+        self._settings.setValue("gpu_adapters", "|".join(self._gpu_adapters))
         self._settings.setValue("text_preview_limit_single", self._text_limit_single)
         self._settings.setValue("text_preview_limit_multi", self._text_limit_multi)
         self._settings.setValue("global_sort_enabled", self._gs_enabled)
@@ -464,9 +689,11 @@ class MainWindow(QMainWindow):
         self.btn_add_text.hide()
         toolbar_layout.addWidget(self.btn_add_text)
 
-        self.btn_settings = QPushButton("⚙")
+        self.btn_settings = QPushButton()
         self.btn_settings.setFixedSize(32, 32)
         self.btn_settings.setFlat(True)
+        self.btn_settings.setToolTip(tr("settings"))
+        self._apply_settings_icon()
         toolbar_layout.addWidget(self.btn_settings)
 
         root.addWidget(toolbar)
@@ -480,11 +707,34 @@ class MainWindow(QMainWindow):
         self._scroll_area.setWidgetResizable(True)
         self._scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.emoji_grid = EmojiGridWidget()
+        # Explicit surface background so the empty area can never fall through
+        # to an unthemed (e.g. black) viewport — an empty group used to look
+        # pure black, which was the GL viewport showing through.
+        # 显式设置表面背景，使空白区域不会透出未上主题的（如纯黑）视口——
+        # 空分组曾显示为纯黑，正是 GL 视口透出所致。
+        self.emoji_grid.setObjectName("emojiGrid")
         self.emoji_grid._show_emoji_name = self._show_emoji_name
         self.emoji_grid._card_scale = self._card_scale
         EmojiItem._card_scale = self._card_scale
         self.emoji_grid._hover_zoom = self._hover_zoom
         self.emoji_grid._hover_preview_enabled = self._hover_preview_enabled
+        # Resize auto-fill only applies while a global sort is active /
+        # 仅当启用全局排序时，拉伸窗口才自动铺满
+        self.emoji_grid._global_sort_enabled = self._gs_enabled
+        # Concurrent animated-GIF render cap (Settings -> Performance) /
+        # 动态 GIF 同时渲染上限（设置 → 性能）
+        self._apply_thread_count()
+        # Experimental GPU rendering of the grid viewport / 实验性 GPU 渲染网格视口
+        self._apply_gpu_render()
+        # Keep the Windows per-app GPU preference in sync with the setting
+        # (also re-applies if the executable path changed). /
+        # 保持 Windows 按应用 GPU 首选项与设置一致（可执行文件路径变化时也会重写）。
+        self._apply_gpu_preference()
+        # Probe the installed adapters in the background (only when nothing is
+        # cached) so the settings dialog can list them by name without ever
+        # blocking. / 后台探测已安装显卡（仅在无缓存时），使设置对话框能按名称
+        # 列出而绝不阻塞。
+        self._start_gpu_adapter_probe()
         self._scroll_area.setWidget(self.emoji_grid)
         root.addWidget(self._scroll_area, 1)
 
@@ -528,6 +778,9 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._btn_edit_delete)
         self._edit_move_btn = QPushButton(tr("edit_move"))
         self._edit_move_btn.setObjectName("editToolBtn")
+        # Connected ONCE; the menu is built lazily on click /
+        # 只连接一次；菜单在点击时惰性构建
+        self._edit_move_btn.clicked.connect(self._on_edit_move_clicked)
         lay.addWidget(self._edit_move_btn)
         self._btn_edit_exit = QPushButton(tr("edit_exit"))
         self._btn_edit_exit.setObjectName("editToolBtn")
@@ -536,6 +789,12 @@ class MainWindow(QMainWindow):
         bar.hide()
         self._edit_bar = bar
         self.status_bar.addPermanentWidget(bar)
+        # Cached move-target menu: built lazily and reused while the selection
+        # signature is unchanged (it used to be rebuilt — and leaked — once per
+        # check-state change). / 缓存的移动目标菜单：惰性构建，选中特征不变时
+        # 复用（此前每次勾选变化都重建一次并泄漏）。
+        self._edit_move_menu = None
+        self._edit_move_sig = None
 
     def _enter_edit_mode(self):
         # Enter multi-select edit mode on the grid / 让网格进入多选编辑模式
@@ -563,50 +822,58 @@ class MainWindow(QMainWindow):
         has = count > 0
         self._btn_edit_delete.setEnabled(has)
         self._edit_move_btn.setEnabled(has)
-        # Rebuild the move targets filtered by the selection's type /
-        # 按所选内容的类型重建移动目标
-        self._rebuild_edit_move_menu()
+        # The move menu itself is built lazily on click (see
+        # _ensure_edit_move_menu). Building it here ran a get_all_groups()
+        # query and created a fresh QMenu for EVERY card whose check state
+        # changed — during "select all" on a large library that was one query
+        # plus one leaked menu per card.
+        # 移动菜单改为点击时惰性构建（见 _ensure_edit_move_menu）。此前在这里构建
+        # 会对"每一张勾选状态变化的卡片"执行一次 get_all_groups() 查询并新建一个
+        # QMenu——大图库全选时就是每张卡一次查询加一个泄漏的菜单。
+        self._edit_move_sig = None
 
-    def _rebuild_edit_move_menu(self):
-        # Move targets must match the type of the selected items (image
-        # groups only for images, text groups only for text) so the two
-        # kinds never mix. / 移动目标必须与所选内容的类型一致（图片只能进
-        # 图片分组、文字只能进文字分组），两类互不串组。
-        # Disconnect the previous slot; a fresh click connection is created
-        # below. The RuntimeWarning from disconnect() on an unconnected
-        # signal is suppressed (it is benign). / 断开旧槽，下方新建点击连接。
-        # disconnect() 对未连接的信号会打 RuntimeWarning，属良性，忽略之。
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            try:
-                self._edit_move_btn.clicked.disconnect()
-            except (RuntimeError, TypeError):
-                pass
+    def _ensure_edit_move_menu(self):
+        # Build (or reuse) the move-target menu for the current selection.
+        # Targets must match the type of the selected items (image groups only
+        # for images, text groups only for text) so the two kinds never mix.
+        # 构建（或复用）当前选中的移动目标菜单。目标必须与所选内容类型一致
+        # （图片只能进图片分组、文字只能进文字分组），两类互不串组。
         selected = self.emoji_grid.selected_emojis()
         if not selected:
-            self._edit_move_btn.clicked.connect(self._noop_move)
-            return
+            return None
         is_text = all(bool(e.get("text_content")) for e in selected)
         groups = self.data_manager.get_all_groups()
         all_id = self.data_manager._all_group_id()
         cur_gid = self.current_group_id
         targets = [
-            g for g in groups
+            (g["id"], g["name"]) for g in groups
             if g["id"] != all_id
             and g["id"] != cur_gid
             and g["type"] == ("text" if is_text else "image")
         ]
         if not targets:
-            self._edit_move_btn.clicked.connect(self._noop_move)
-            return
-        menu = QMenu(self)
-        for g in targets:
-            menu.addAction(g["name"]).triggered.connect(
-                lambda checked, gid=g["id"]: self._edit_move_selected(gid)
+            return None
+        signature = (is_text, cur_gid, tuple(targets))
+        if signature == self._edit_move_sig and self._edit_move_menu is not None:
+            return self._edit_move_menu
+        if self._edit_move_menu is None:
+            self._edit_move_menu = QMenu(self)
+        menu = self._edit_move_menu
+        menu.clear()
+        for gid, name in targets:
+            menu.addAction(name).triggered.connect(
+                lambda checked=False, _gid=gid: self._edit_move_selected(_gid)
             )
-        self._edit_move_btn.clicked.connect(
-            lambda: menu.exec(self._edit_move_btn.mapToGlobal(
-                self._edit_move_btn.rect().bottomLeft())))
+        self._edit_move_sig = signature
+        return menu
+
+    def _on_edit_move_clicked(self):
+        # Show the (cached) move menu / 弹出（已缓存的）移动菜单
+        menu = self._ensure_edit_move_menu()
+        if menu is None:
+            return
+        menu.exec(self._edit_move_btn.mapToGlobal(
+            self._edit_move_btn.rect().bottomLeft()))
 
     def _noop_move(self):
         pass
@@ -616,37 +883,20 @@ class MainWindow(QMainWindow):
         # lazily-created visible cards: _items is only the visible band, so
         # selecting by _items would silently select a subset on large
         # libraries, and the toggle check would misbehave after cards were
-        # recycled. / 按当前数据集全选（或清空），而非仅懒加载可见卡：
-        # _items 只是可视区子集，按 _items 全选在大图库下会静默只选子集，
-        # 且卡片被回收后切换判定会失效。
+        # recycled. The grid does the whole pass in one shot (signals batched).
+        # / 按当前数据集全选（或清空），而非仅懒加载可见卡：_items 只是可视区
+        # 子集，按 _items 全选在大图库下会静默只选子集，且卡片被回收后切换判定会
+        # 失效。整趟操作由网格一次性完成（信号合并）。
         grid = self.emoji_grid
         if not grid.in_edit_mode():
             return
         data = grid._data
         if not data:
             return
-        if grid.selection_count() >= len(data):
-            target = False
-        else:
-            target = True
-        for em in data:
-            card = None
-            for c in grid._items:
-                if str(c._emoji.get("id", "")) == str(em.get("id", "")):
-                    card = c
-                    break
-            if card is not None:
-                card.set_checked(target)
-            else:
-                # Card not materialized yet: update the selection map directly
-                # (the card applies its state when it is created later).
-                # 卡片尚未物化：直接更新选中集合（卡片稍后创建时套用状态）。
-                if target:
-                    grid._selection[str(em.get("id", ""))] = em
-                else:
-                    grid._selection.pop(str(em.get("id", "")), None)
-        grid.selection_changed.emit(grid.selection_count())
-
+        # Already fully selected -> clear; otherwise select everything /
+        # 已全选 → 清空；否则全选
+        target = grid.selection_count() < len(data)
+        grid.set_all_selection(target)
     def _edit_move_selected(self, target_group_id):
         # Move all selected emojis to a same-type group / 把所选表情全部
         # 移到同类型分组
@@ -696,14 +946,28 @@ class MainWindow(QMainWindow):
         # 先分离 QMovie 文件句柄：GIF 播放中 Windows 无法删除文件
         # （与分组删除的要求一致）。
         self.emoji_grid.release_gif_handles()
+        # In the All view a card represents several rows folded by content_hash,
+        # so deleting only the representative left the other copies behind and
+        # the stickers "would not go away". Expand the selection to every row
+        # sharing a selected content hash before deleting.
+        # 在"全部"视图中一张卡代表按 content_hash 折叠的多行，只删代表行会留下其余
+        # 副本，表现为"删不干净"。删除前把选中项扩展为共享同一内容哈希的所有行。
+        ids = [em["id"] for em in selected]
+        if self.current_group_id is None:
+            expanded = self.data_manager.ids_sharing_content_hash(ids)
+            if expanded:
+                ids = expanded
         failed = 0
-        for em in selected:
+        deleted = 0
+        for emo_id in ids:
             try:
-                self.data_manager.delete_emoji(em["id"])
+                if self.data_manager.delete_emoji(emo_id):
+                    deleted += 1
             except Exception:
                 failed += 1
-                self._log.exception("Edit delete failed for id=%s", em.get("id"))
-        self._log.info("Edit delete -> count=%s", len(selected) - failed)
+                self._log.exception("Edit delete failed for id=%s", emo_id)
+        self._log.info("Edit delete -> selected=%s deleted=%s failed=%s",
+                       len(selected), deleted, failed)
         self._exit_edit_mode()
         self._refresh_emoji_grid()
         self._refresh_status()
@@ -712,7 +976,8 @@ class MainWindow(QMainWindow):
                 f"  ⚠ {tr('edit_delete_failed', count=failed)}", 4000)
         else:
             self.status_bar.showMessage(
-                f"  ✓ {tr('edit_deleted', count=len(selected))}", 2500)
+                f"  ✓ {tr('edit_deleted', count=max(deleted, len(selected)))}",
+                2500)
 
     def _build_import_menu(self):
         menu = QMenu(self)
@@ -793,8 +1058,57 @@ class MainWindow(QMainWindow):
         self._log.info("Import from QQ -> dir=%s files=%d", emoji_dir, len(files))
         self._do_import(files)
 
+    def _apply_settings_icon(self):
+        # Settings button icon from setting.svg, tinted for the active theme
+        # (the SVG has no fill, so it would render black — invisible on the
+        # dark toolbar). Falls back to the gear glyph when the file is missing.
+        # 设置按钮图标取自 setting.svg，并按当前主题着色（该 SVG 没有 fill，
+        # 默认渲染为黑色——在深色工具栏上看不见）。文件缺失时回退为齿轮字符。
+        try:
+            path = os.path.join(_root_dir(), "setting.svg")
+            if not os.path.isfile(path):
+                self.btn_settings.setText("⚙")
+                return
+            color = "#333333" if self._theme == "light" else "#E0E0E0"
+            with open(path, "r", encoding="utf-8") as f:
+                svg = f.read()
+            # Give the fill-less paths an explicit theme colour /
+            # 给未指定 fill 的路径加上主题颜色
+            if "<svg " in svg:
+                svg = svg.replace("<svg ", '<svg fill="%s" ' % color, 1)
+            from PySide6.QtSvg import QSvgRenderer
+            from PySide6.QtGui import QPainter, QPixmap
+            from PySide6.QtCore import QByteArray
+            renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+            dpr = self.devicePixelRatioF() if hasattr(self, "devicePixelRatioF") else 1.0
+            # 75% of the original 22 px glyph; the button itself stays 32x32 /
+            # 原 22px 的 75%，按钮本身仍为 32x32
+            icon_px = int(self.ICON_PX * 0.75)
+            side = max(1, int(icon_px * dpr))
+            pix = QPixmap(side, side)
+            pix.fill(Qt.GlobalColor.transparent)
+            p = QPainter(pix)
+            try:
+                renderer.render(p)
+            finally:
+                p.end()
+            pix.setDevicePixelRatio(dpr)
+            self.btn_settings.setText("")
+            self.btn_settings.setIcon(QIcon(pix))
+            self.btn_settings.setIconSize(QSize(icon_px, icon_px))
+        except Exception:
+            self._log.exception("Load settings icon failed")
+            self.btn_settings.setText("⚙")
+
     def _apply_theme(self):
         self.setStyleSheet(DARK_QSS if self._theme != "light" else LIGHT_QSS)
+        # Re-tint the settings icon for the new theme / 按新主题重新着色设置图标
+        if hasattr(self, "btn_settings"):
+            self._apply_settings_icon()
+        # Keep the viewport/grid surface in step with the theme so an empty
+        # group always shows the theme background. / 视口/网格表面随主题同步，
+        # 使空分组始终显示主题背景。
+        self._apply_viewport_background()
 
     # System tray / 系统托盘
 
@@ -836,6 +1150,7 @@ class MainWindow(QMainWindow):
         self._save_geometry()
         self._save_current_group()
         self._save_settings()
+        self._stop_gpu_adapter_probe()
         if self._hotkey_mgr:
             self._hotkey_mgr.unregister()
         self._scroll_watcher.stop()
@@ -843,8 +1158,44 @@ class MainWindow(QMainWindow):
         # 解释器退出前停止 GIF 解码工作线程
         from app.utils import gif_player
         gif_player.shutdown()
+        # Drain the private thumbnail pool as well. Qt only awaits its GLOBAL
+        # pool at QApplication destruction, so an owned pool left with in-flight
+        # tasks could still signal a half-destroyed loader during exit (the
+        # suspected 0xC0000005 / 0xC0000409 crash on quit).
+        # 同样要排空私有缩略图线程池。Qt 只在 QApplication 析构时等待"全局"池，
+        # 自建池若仍有任务在飞，退出时还会向半销毁的加载器发信号（退出阶段偶发
+        # 0xC0000005 / 0xC0000409 崩溃的嫌疑原因）。
+        self._shutdown_thumb_loader()
         self._tray.hide()
         QApplication.quit()
+
+    def _shutdown_thumb_loader(self):
+        # Idempotent: _real_quit and aboutToQuit can both reach here /
+        # 幂等：_real_quit 与 aboutToQuit 都可能走到这里
+        if getattr(self, "_thumb_loader_drained", False):
+            return
+        self._thumb_loader_drained = True
+        try:
+            from app.widgets.emoji_item import _loader
+            _loader.shutdown(3000)
+        except Exception:
+            self._log.exception("Shutdown thumbnail loader failed")
+
+    def _stop_gpu_adapter_probe(self):
+        # Drain the adapter probe's OWN pool. The old comment claimed Qt waits
+        # for pool tasks at shutdown, which is only true of the global pool — a
+        # pooled task that outlives the window then emits into a destroyed
+        # receiver while the interpreter is tearing down.
+        # 排空显卡探测自己的线程池。旧注释称 Qt 会在退出时等待线程池任务，但那只对
+        # 全局池成立——比窗口活得更久的池任务会在解释器收尾时向已销毁的接收者发信号。
+        pool = getattr(self, "_gpu_pool", None)
+        if pool is None:
+            return
+        try:
+            pool.clear()
+            pool.waitForDone(2000)
+        except RuntimeError:
+            pass  # already destroyed / 已销毁
 
     def _on_smooth_scroll_reset(self):
         # Stop any in-flight smooth scroll when data/group changes /
@@ -875,6 +1226,7 @@ class MainWindow(QMainWindow):
                     pass  # dialog closed concurrently / 对话框已同时关闭
 
     def closeEvent(self, event):
+        self._stop_gpu_adapter_probe()
         self._save_geometry()
         self._save_current_group()
         self._save_settings()
@@ -898,6 +1250,13 @@ class MainWindow(QMainWindow):
     # Signals / 信号
 
     def _connect_signals(self):
+        # Drain the private thumbnail pool whenever Qt is about to quit —
+        # _real_quit() is not the only exit path (WM_QUIT, qApp.quit(), and the
+        # test harness all skip it). / 只要 Qt 即将退出就排空私有缩略图线程池：
+        # _real_quit() 并非唯一退出路径（WM_QUIT、qApp.quit()、测试脚本都会绕过它）。
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._shutdown_thumb_loader)
         self.search_bar.textChanged.connect(self._on_search)
         # Import menu actions are connected inside _build_import_menu because
         # the menu is rebuilt on language switches / 导入菜单 action 在
@@ -1002,6 +1361,7 @@ class MainWindow(QMainWindow):
         self.emoji_grid.load_emojis(
             emojis, group_type,
             preview_limits=(self._text_limit_single, self._text_limit_multi),
+            keyword=keyword,
         )
         if scroll_val is not None:
             # Restore the previous position once the new layout is ready /
@@ -1129,13 +1489,36 @@ class MainWindow(QMainWindow):
         # Convert non-gif files one by one on the main thread while showing
         # a progress dialog, then batch-insert everything.
         # 主线程逐张转换非 gif 文件并显示进度条，随后批量入库。
+        # Skip files already in the group BEFORE converting them: hashing the
+        # source is cheap, while converting every file again (decode +
+        # re-encode + temp write, often spawning ffmpeg) is what made a
+        # repeated 400+ QQ import slow and heavy. / 转换之前先跳过本组已有
+        # 文件：哈希源文件很便宜，而反复转换每个文件（解码+重编码+写临时文件，
+        # 常需启动 ffmpeg）才是重复导入 400+ QQ 表情包时又慢又耗资源的原因。
+        # hash_map: {source path: md5} filled by the pre-filter so the original
+        # file is never hashed twice (it used to be summed up to 3x per file,
+        # cancelling out much of the "skip early" win).
+        # hash_map：由预过滤填入 {源路径: md5}，使同一文件不会被哈希两次
+        # （此前每个文件最多哈希 3 次，把"提前跳过"的收益抵消了大半）。
+        hash_map = {}
+        files, pre_skipped = self.data_manager.filter_already_imported(
+            group_id, files, hash_out=hash_map)
         dlg = QProgressDialog(
-            tr("converting_gif"), tr("cancel"), 0, len(files), self)
+            tr("converting_gif"), tr("cancel"), 0, max(1, len(files)), self)
         dlg.setWindowTitle(tr("importing"))
         dlg.setWindowModality(Qt.WindowModality.WindowModal)
         dlg.setMinimumDuration(0)
         dlg.setAutoClose(False)
         ready = []
+        # ONLY the temp files THIS method created may be deleted afterwards.
+        # The old cleanup filtered `ready` by "lives in %TEMP% and ends in .gif",
+        # which deleted a user's own source file when they imported one from
+        # %TEMP%. / 之后只能删除本方法创建的临时文件。旧清理按"位于 %TEMP% 且
+        # 以 .gif 结尾"过滤 ready，会把用户从 %TEMP% 导入的源文件一起删掉。
+        temps = []
+        # {path handed to the batch importer: md5 of the user's original file} /
+        # {交给批量导入的路径: 用户原文件 md5}
+        src_hash_map = {}
         imported = duplicated = converted_n = fail_n = 0
         try:
             for i, f in enumerate(files):
@@ -1144,6 +1527,8 @@ class MainWindow(QMainWindow):
                 dlg.setValue(i)
                 dlg.setLabelText(tr("converting_file", name=os.path.basename(f)))
                 QApplication.processEvents()
+                original_hash = hash_map.get(f, "")
+                picked = f
                 if gif_converter.needs_gif_conversion(f):
                     # Non-GIF content (animated or static) -> convert to gif;
                     # oversized results are downscaled inside the converter
@@ -1153,14 +1538,14 @@ class MainWindow(QMainWindow):
                     tmp = os.path.join(
                         tempfile.gettempdir(), f"gm_conv_{os.urandom(4).hex()}.gif")
                     if gif_converter.convert_to_gif(f, tmp):
-                        ready.append(tmp)
+                        picked = tmp
+                        temps.append(tmp)
                         converted_n += 1
                     else:
                         # failed -> keep original format / 失败保持原格式
                         self._log.warning(
                             "import_progress: convert_to_gif failed for %s, "
                             "store original", f)
-                        ready.append(f)
                         fail_n += 1
                 else:
                     # Genuine GIF: copy as-is unless oversized — downscale it
@@ -1174,37 +1559,44 @@ class MainWindow(QMainWindow):
                             tempfile.gettempdir(),
                             f"gm_conv_{os.urandom(4).hex()}.gif")
                         if gif_converter.downscale_gif_if_needed(f, tmp):
-                            ready.append(tmp)
+                            picked = tmp
+                            temps.append(tmp)
                         else:
                             self._log.warning(
                                 "import_progress: downscale oversized gif failed "
                                 "for %s (dims=%s), store original", f, dims)
-                            ready.append(f)
                     elif dims is None:
                         self._log.warning(
                             "import_progress: cannot read dimensions of %s, "
                             "store original", f)
-                        ready.append(f)
-                    else:
-                        ready.append(f)
+                ready.append(picked)
+                if original_hash:
+                    # Record the USER's file hash against whatever path the
+                    # batch importer receives, so the pre-skip keeps working
+                    # for this batch. / 把"用户文件"的哈希登记到批量导入实际收到
+                    # 的路径上，使本批的预跳过继续有效。
+                    src_hash_map[picked] = original_hash
             dlg.setValue(len(files))
             if ready:
                 imported, duplicated = self.data_manager.import_emojis_batch(
                     group_id, ready,
                     workers=QThreadPool.globalInstance().maxThreadCount(),
                     auto_convert=False,
+                    src_hash_map=src_hash_map,
                 )
         finally:
             dlg.close()
-            # Clean up temp gif files (already copied into the library) /
-            # 清理临时 gif 文件（已复制入库）
-            for p in ready:
-                if p.endswith(".gif") and os.path.dirname(p) == tempfile.gettempdir():
-                    try:
-                        os.remove(p)
-                    except OSError:
-                        pass
-        return imported, duplicated, converted_n, fail_n
+            # Clean up ONLY the temp gif files this method created (already
+            # copied into the library) / 只清理本方法创建的临时 gif（已复制入库）
+            for p in temps:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        # Files skipped before conversion count as duplicates, so the summary
+        # reports everything that was filtered out. / 转换前跳过的文件计入
+        # 重复数，使汇总反映全部被过滤的文件。
+        return imported, duplicated + pre_skipped, converted_n, fail_n
 
     def _on_convert_library(self):
         # One-click convert: all non-gif images in every group -> gif /
@@ -1630,6 +2022,14 @@ class MainWindow(QMainWindow):
             auto_input=self._auto_input,
             card_scale=self._card_scale,
             name_font_size=self._name_font_size,
+            ffmpeg_enabled=self._ffmpeg_enabled,
+            ffmpeg_path=self._ffmpeg_path,
+            gif_render_mode=self._gif_render_mode,
+            gif_render_count=self._gif_render_count,
+            gpu_render=self._gpu_render,
+            gpu_accel=self._gpu_accel,
+            gpu_pref=self._gpu_pref,
+            gpu_adapters=self._gpu_adapters,
             data_manager=self.data_manager,
             hotkey_desc=self._hotkey_desc(),
             parent=self,
@@ -1682,6 +2082,9 @@ class MainWindow(QMainWindow):
         self._gs_enabled = dlg.global_sort_enabled()
         self._gs_by = dlg.global_sort_by()
         self._gs_desc = dlg.global_sort_desc()
+        # Gate the resize auto-fill on the (possibly changed) sort setting /
+        # 依据（可能已变化的）排序设置开关"拉伸自动铺满"
+        self.emoji_grid._global_sort_enabled = self._gs_enabled
         if gs_changed and self._gs_enabled:
             self._apply_global_sort_all()
         # Auto-convert setting may change without closing the dialog / 自动转换开关可能在对话框内直接变化
@@ -1695,7 +2098,12 @@ class MainWindow(QMainWindow):
         # (and the layout heights) use the new setting / 显示/隐藏表情包名称：
         # 传给网格，重建的卡片与布局高度使用新设置
         self._show_emoji_name = dlg.show_emoji_name()
-        self.emoji_grid._show_emoji_name = self._show_emoji_name
+        # Route through the setter: it also drops the card pool and rebuilds,
+        # which a plain attribute write did not do — pooled cards kept the old
+        # fixed height and overlapped the rebuilt ones.
+        # 经由 setter 设置：它同时清空卡片池并重建，而单纯改属性不会——池卡会保留
+        # 旧固定高度并与重建的卡片重叠。
+        self.emoji_grid.set_show_emoji_name(self._show_emoji_name)
         # Hover zoom factor / 悬停放大倍数（新建卡片时使用）
         self._hover_zoom = dlg.hover_zoom()
         self.emoji_grid._hover_zoom = self._hover_zoom
@@ -1719,6 +2127,35 @@ class MainWindow(QMainWindow):
         if new_nf != self._name_font_size:
             self._name_font_size = new_nf
             self.emoji_grid.apply_name_font_size(self._name_font_size)
+        # FFmpeg usage + optional custom binary / FFmpeg 使用与自定义路径
+        self._ffmpeg_enabled = dlg.ffmpeg_enabled()
+        self._ffmpeg_path = dlg.ffmpeg_path()
+        from app.utils import gif_converter
+        gif_converter.set_ffmpeg_config(path=self._ffmpeg_path,
+                                       enabled=self._ffmpeg_enabled)
+        # Animated-GIF render concurrency / 动态 GIF 渲染并发
+        self._gif_render_mode = dlg.gif_render_mode()
+        self._gif_render_count = dlg.gif_render_count()
+        self._apply_thread_count()
+        # GPU acceleration master switch: turns parallel thumbnail rendering on
+        # and applies/clears the Windows GPU preference accordingly.
+        # GPU 加速总开关：开启并行缩略图渲染，并写入/清除 Windows 的 GPU 偏好。
+        new_accel = dlg.gpu_accel()
+        new_pref = dlg.gpu_preference()
+        if new_accel != self._gpu_accel or new_pref != self._gpu_pref:
+            self._gpu_accel = new_accel
+            self._gpu_pref = new_pref
+            self._gpu_render = new_accel
+            EmojiItem.set_parallel_render(self._gpu_accel)
+        # Pressing OK always re-synchronises the Windows preference, even when
+        # neither value changed: the gate that used to guard this call left the
+        # registry stale whenever it had drifted (e.g. reset outside the app, or
+        # a previous "off" that never got cleared), so the UI and the actual
+        # Windows setting could disagree. The write is idempotent.
+        # 按下确定时总是重新同步 Windows 首选项，即使两个值都没变：此前包裹该调用
+        # 的判定会在注册表已经跑偏时（例如被程序外部重置、或上一次"关闭"没能清除）
+        # 留下过期状态，使界面与实际 Windows 设置不一致。该写入是幂等的。
+        self._apply_gpu_preference(explicit=True)
         theme_changed = (dlg.theme() != self._theme)
         self._theme = dlg.theme()
         self._log.info(

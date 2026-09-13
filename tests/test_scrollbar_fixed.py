@@ -8,6 +8,7 @@ import sys
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tests._iso import drain_and_exit  # noqa: E402
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QScrollBar
@@ -59,4 +60,4 @@ sb.deleteLater()
 n_pass = sum(1 for _, ok in RES if ok)
 print(f"\n滚动条固定位置验证: {n_pass}/{len(RES)} 通过")
 import os as _os
-_os._exit(0 if n_pass == len(RES) else 1)
+drain_and_exit(0 if n_pass == len(RES) else 1)
