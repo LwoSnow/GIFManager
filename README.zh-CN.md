@@ -208,3 +208,17 @@ HarmonyOS Sans SC 六个字重随包放在 `resources/fonts/`，按其字体自�
 [SWB-QML-UI](https://github.com/xxmzwf/SWB-QML-UI)（MIT）与 shadcn 的观感，采用移植而不是链接的
 方式，因为 PySide6 不自带 Qt 的 CMake 包。交互细节来自 Apple 的 *Designing Fluid Interfaces* 与
 Emil Kowalski 关于界面打磨的写作：按下即反馈、可中断的运动、用对比度表达状态、字体的光学字距。
+
+## 贡献者
+
+<p align="left">
+  <a href="https://github.com/LwoSnow" title="LwoSnow">
+    <img src="https://github.com/LwoSnow.png" alt="LwoSnow" width="48" height="48" style="border-radius:50%" />
+  </a>
+  <a href="https://github.com/Sunroin9" title="Sunroin9">
+    <img src="https://github.com/Sunroin9.png" alt="Sunroin9" width="48" height="48" style="border-radius:50%" />
+  </a>
+</p>
+
+
+**LwoSnow** **Sunroin9**

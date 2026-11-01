@@ -227,7 +227,7 @@ new file is selectable immediately.
 
 `CONTRIBUTING.md` has the comment, commit and pull-request conventions.
 
-## License and credits
+## License and credits
 
 **MIT** — see [LICENSE](LICENSE). Use it, fork it, ship it.
 
@@ -237,3 +237,17 @@ component set follows the ideas in [SWB-QML-UI](https://github.com/xxmzwf/SWB-QM
 shadcn's look, ported to QML rather than linked, because PySide6 ships no Qt CMake package. The
 interaction details — press feedback, interruptible motion, contrast as state, optical type —
 come from Apple's *Designing Fluid Interfaces* and Emil Kowalski's writing on interface polish.
+
+## Contributors
+
+<p align="left">
+  <a href="https://github.com/LwoSnow" title="LwoSnow">
+    <img src="https://github.com/LwoSnow.png" alt="LwoSnow" width="48" height="48" style="border-radius:50%" />
+  </a>
+  <a href="https://github.com/Sunroin9" title="Sunroin9">
+    <img src="https://github.com/Sunroin9.png" alt="Sunroin9" width="48" height="48" style="border-radius:50%" />
+  </a>
+</p>
+
+
+**LwoSnow** **Sunroin9**
