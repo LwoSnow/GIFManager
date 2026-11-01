@@ -1,0 +1,43 @@
+#!/bin/sh
+# AppRun for the GIFManager AppImage.
+#
+# The AppImage runtime executes this file from the mounted image, with `$APPDIR` pointing at the mount
+# point. The payload is a PyInstaller onedir tree at `$APPDIR/usr/lib/gifmanager`, so the only thing this
+# has to do is put the bundle on the library path - PyInstaller's own bootstrap resolves everything else
+# relative to its executable.
+#
+# # Why `exec` and `/proc/self/exe`
+#
+# `exec` matters: without it the shell stays as the parent, and the application's single-instance check
+# sees a wrapper process instead of the real one. `/proc/self/exe` is used to locate the bundle because
+# `$APPDIR` is not exported by every AppImage runtime version, whereas the resolved path always is.
+#
+# GIFManager AppImage 的 AppRun。
+#
+# AppImage 运行时从挂载后的镜像中执行本文件，`$APPDIR` 指向挂载点。负载是位于
+# `$APPDIR/usr/lib/gifmanager` 的 PyInstaller onedir 树，因此这里唯一要做的是把包放到库搜索路径上——
+# PyInstaller 自身的引导器会相对其可执行文件解析其余一切。
+#
+# # 为什么用 `exec` 与 `/proc/self/exe`
+#
+# `exec` 是要紧的：没有它 shell 会留在父进程位置，而程序的单实例检查将看到一个包装进程而不是真正的那个。
+# 用 `/proc/self/exe` 定位包，是因为并非每个 AppImage 运行时版本都会导出 `$APPDIR`，而解析后的路径总是
+# 存在的。
+
+set -eu
+
+SELF_DIR=$(dirname "$(readlink -f /proc/self/exe 2>/dev/null || echo "$0")")
+HERE=${APPDIR:-$SELF_DIR}
+
+BUNDLE="$HERE/usr/lib/gifmanager"
+export LD_LIBRARY_PATH="$BUNDLE${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# Qt must not try to use a portal it cannot reach inside a read-only mount; the platform plugin is chosen
+# at runtime and Wayland is preferred when the session provides it.
+# Qt 不得尝试使用它在只读挂载中无法触达的门户；平台插件在运行时选择，会话提供 Wayland 时优先使用它。
+if [ -z "${QT_QPA_PLATFORM:-}" ] && [ -n "${WAYLAND_DISPLAY:-}" ]; then
+  QT_QPA_PLATFORM=wayland
+  export QT_QPA_PLATFORM
+fi
+
+exec "$BUNDLE/GIFManager" "$@"

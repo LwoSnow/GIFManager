@@ -179,7 +179,16 @@ UiDialog {
                 color: theme.text
                 font.pixelSize: theme.fontSizeBody
             }
-            ComboBox {
+            // `UiComboBox`, not the stock `ComboBox`.
+            //
+            // This was the last unstyled dropdown in the interface: it kept the Basic style's own
+            // frame, arrow and highlight, so the import dialog's most-used control looked like it came
+            // from a different application than the buttons underneath it.
+            // 用 `UiComboBox`，而不是原生 `ComboBox`。
+            //
+            // 这是界面里最后一个未套样式的下拉框：它保留着 Basic 样式自己的边框、箭头与高亮，使导入
+            // 对话框里最常用的控件看起来像来自另一个应用，而不是来自它下方那些按钮的系统。
+            UiComboBox {
                 id: targetGroup
                 Layout.fillWidth: true
                 enabled: !importDialog.busy

@@ -15,13 +15,31 @@ macOS 需要定位二进制而不是假定它在 `PATH` 上；Linux 在打开任
 `$DISPLAY`。本模块把这一切收敛到一个很小的接口上。
 """
 import os
+import logging
 import shutil
 import subprocess
 import sys
 
-from gifmanager.core import logging_setup, paths
+from gifmanager.core import paths
 
-log = logging_setup.get_logger()
+# A plain logger, not `logging_setup.get_logger()`.
+#
+# `get_logger()` initialises logging on first call, which CREATES a log file and prints the session
+# banner. Called at module import time that turned "import this module" into a side effect:
+# PyInstaller's
+# analysis and any test that touched the platform layer produced a fresh log file, and the build
+# output
+# looked as though the application had launched. The handler set is configured by the real entry
+# points,
+# which attach it to the "GIFManager" logger, so a plain `getLogger` inherits exactly the same
+# output.
+# 普通 logger，而不是 `logging_setup.get_logger()`。
+#
+# `get_logger()` 在首次调用时初始化日志，即"创建日志文件并打印会话横幅"。在模块导入时调用它，把
+# "导入本模块"变成一个副作用：PyInstaller 的分析过程以及任何触及平台层的测试都会产生一个新的日志文件，
+# 而构建输出看起来像程序已经启动了。处理器集合由真正的入口点配置并挂在 "GIFManager" logger 上，
+# 因此普通的 `getLogger` 会继承完全相同的输出。
+log = logging.getLogger("GIFManager")
 
 # Bundled ffmpeg file name per platform / 各平台内置 ffmpeg 的文件名
 _FFMPEG_NAMES = ("ffmpeg.exe", "ffmpeg")

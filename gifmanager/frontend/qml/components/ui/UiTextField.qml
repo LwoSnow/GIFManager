@@ -60,4 +60,32 @@ TextField {
             visible: control.activeFocus
         }
     }
+
+    // No context menu.
+    //
+    // Qt gives a text field the standard Undo/Redo/Cut/Copy/Paste/Delete/Select All menu on right
+    // click. That menu is styled by `QtQuick.Controls.Basic` - it cannot be themed from QML - so it
+    // appeared as a black panel with a white frame amid an interface that had just been unified, and
+    // it offered nothing this application needs (the fields here hold short names or a hint string,
+    // and selection still works through dragging).
+    //
+    // `acceptedButtons: Qt.RightButton` is the whole trick: the handler takes ONLY right clicks, so
+    // left clicks pass straight through to the field and editing, selection and the caret are
+    // untouched. Declared last so it sits above the field's own content item, which is what receives
+    // the right click and opens the menu.
+    // 不显示上下文菜单。
+    //
+    // Qt 会给文本字段提供标准的撤销/重做/剪切/复制/粘贴/删除/全选右键菜单。该菜单由
+    // `QtQuick.Controls.Basic` 绘制——无法从 QML 上色——因此它表现为一块黑底白框的面板，出现在刚刚
+    // 统一过风格的界面里，而且它并不提供本应用需要的东西（这里的字段装的是短名称或提示字符串，选择
+    // 仍然可以拖动完成）。
+    //
+    // `acceptedButtons: Qt.RightButton` 就是全部技巧：该处理器"只"接管右键，因此左键直接穿过到字段，
+    // 编辑、选择与光标都不受影响。声明在最后，使它位于字段自身的内容元素之上——而正是那个元素接收右键
+    // 并打开菜单。
+    MouseArea {
+        anchors.fill: parent
+        acceptedButtons: Qt.RightButton
+        onPressed: function (mouse) { mouse.accepted = true }
+    }
 }

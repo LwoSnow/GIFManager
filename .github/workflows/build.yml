@@ -1,113 +1,448 @@
 name: build
 
-# Build and check on all three target systems.
+# Manual release build.
 #
-# The whole point of this refactor is that the non-Qt layers run everywhere, so
-# the matrix runs the LAYER CHECK and the pure-Python tests on every platform.
-# Only the Qt shell needs a display, and it uses the offscreen platform plugin so
-# no virtual framebuffer is required.
+# # One trigger, on purpose
 #
-# 在三个目标系统上构建并检查。
+# `workflow_dispatch` only: this workflow produces INSTALLERS, and an installer that appears on every push
+# is noise that also costs an hour of runner time per run (the Flatpak alone downloads a runtime). The
+# version is not passed in either - it is read from `gifmanager/__init__.py`, so a build can never be
+# labelled with a number the code does not carry.
 #
-# 这次重构的全部意义就在于非 Qt 各层可以在任何系统上运行，因此矩阵在每个平台上都跑
-# 分层检查与纯 Python 测试。只有 Qt 外壳需要显示器，而它使用离屏平台插件，因此无需
-# 虚拟帧缓冲。
+# 手动发布构建。
+#
+# # 刻意只有一个触发器
+#
+# 仅 `workflow_dispatch`：本 workflow 产出"安装包"，而每次推送都产出安装包既是噪音、也要为每轮花掉
+# 近一小时的运行时间（光 Flatpak 就要下载一个运行时）。版本也不从外部传入——它读取
+# `gifmanager/__init__.py`，因此一个构建永远不会被标上一个代码并未携带的版本号。
+#
+# # Outputs / 产物
+#
+#   GIFManager-<version>-win64.zip              portable Windows bundle
+#   GIFManager-Setup-<version>.exe              Windows installer (Inno Setup)
+#   GIFManager-<version>-linux-x86_64.AppImage
+#   GIFManager-<version>-linux-x86_64.bin       self-extracting installer
+#   gifmanager_<version>_amd64.deb
+#   gifmanager-<version>-1-x86_64.pkg.tar.zst   Arch package
+#   GIFManager-<version>-x86_64.flatpak
 
 on:
-  push:
-    branches: [main, master]
-    tags: ["v*"]
-  pull_request:
-    branches: [main, master]
   workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Publish a GitHub Release with these files / 用这些文件发布 GitHub Release"
+        type: boolean
+        default: false
 
 env:
   PYTHONUTF8: "1"
-  QT_QPA_PLATFORM: offscreen
+  QT_QPA_PLATFORM: "offscreen"
+
+permissions:
+  contents: write
 
 jobs:
-  check:
-    name: check (${{ matrix.os }} / py${{ matrix.python }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            python: "3.12"
-            artifact: GIFManager-windows
-          - os: macos-latest
-            python: "3.12"
-            artifact: GIFManager-macos
-          - os: ubuntu-latest
-            python: "3.12"
-            artifact: GIFManager-linux
-
+  # ------------------------------------------------------------------ version
+  version:
+    name: resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python / 配置 Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-
-      - name: Install dependencies / 安装依赖
+      # The single authority for the version is `gifmanager/__init__.py`. It is read with a regular
+      # expression rather than imported: importing the package would pull in PySide6 on a runner that has
+      # not installed it yet, and would also execute any import-time side effects.
+      # 版本的唯一权威是 `gifmanager/__init__.py`。它用正则读取而不是导入：导入该包会在尚未安装 PySide6
+      # 的运行器上拉进依赖，也会执行任何导入期副作用。
+      - name: Read __version__
+        id: read
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import pathlib
+          import re
+          import sys
 
-      # Runs FIRST because it needs no dependencies at all: a layering violation
-      # is a design error, not a runtime one, and catching it before a three-minute
-      # Qt install gives faster feedback.
-      # 最先运行，因为它完全不需要依赖：分层违规是设计错误而非运行时错误，在耗时数分钟
-      # 的 Qt 安装之前发现它能更快给出反馈。
-      - name: Verify layering / 校验分层
-        run: python tools/check_layers.py
+          text = pathlib.Path("gifmanager/__init__.py").read_text(encoding="utf-8")
+          match = re.search(r'^__version__\s*=\s*"([^"]+)"', text, re.MULTILINE)
+          if match is None:
+              sys.exit("gifmanager/__init__.py has no __version__ = \"...\" line")
+          print(f"version={match.group(1)}")
+          PY
 
-      - name: Verify style / 校验风格
-        run: python tools/check_style.py gifmanager apps tests tools
+      - name: Show the version
+        run: echo "Building GIFManager ${{ steps.read.outputs.version }}"
 
-      - name: Run tests / 运行测试
-        run: python -m unittest discover -s tests -t . -p "test_*.py"
-
-      - name: Smoke-test the Qt shell / Qt 外壳冒烟测试
-        run: python tests/smoke_qt.py
-
-  package:
-    name: package (${{ matrix.os }})
-    needs: check
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            artifact: GIFManager-windows
-          - os: macos-latest
-            artifact: GIFManager-macos
-          - os: ubuntu-latest
-            artifact: GIFManager-linux
-
+  # ------------------------------------------------------------------- verify
+  verify:
+    name: verify
+    needs: version
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python / 配置 Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install dependencies / 安装依赖
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
 
-      - name: Build the bundle / 构建打包产物
-        run: python -m PyInstaller --noconfirm --clean packaging/GIFManagerNext.spec
+      # Layering first: it needs no dependencies, so a design error is reported before the Qt install.
+      # 先跑分层检查：它不需要任何依赖，因此设计错误会在 Qt 安装之前被报告。
+      - name: Verify layering
+        run: python tools/check_layers.py
 
-      - name: Upload the bundle / 上传打包产物
-        uses: actions/upload-artifact@v4
+      - name: Verify style
+        run: python tools/check_style.py gifmanager apps tests tools packaging docs
+
+      - name: Verify translations
+        run: python tools/sync_language_keys.py --quiet
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -t . -p "test_*.py"
+
+      - name: Smoke-test the QML shell
+        run: python tests/smoke_qml.py
+
+  # ------------------------------------------------------------------ windows
+  windows:
+    name: windows
+    needs: [version, verify]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
-          name: ${{ matrix.artifact }}
-          path: dist/GIFManager
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      # The QML spec, not `GIFManagerNext.spec`: the latter builds the retired QtWidgets interface and
+      # EXCLUDES Qt Quick, so shipping it would ship a front-end this project no longer uses.
+      # 用 QML 的 spec，而不是 `GIFManagerNext.spec`：后者构建已退役的 QtWidgets 界面并"排除" Qt Quick，
+      # 发布它等于发布一个本项目已不再使用的前端。
+      - name: Build the bundle
+        run: python -m PyInstaller --noconfirm --clean packaging/GIFManagerQml.spec
+
+      # A failed bundle is better caught by its absence than by a user.
+      # 让缺失的包在构建时暴露，比让用户发现更好。
+      - name: Verify the bundle is complete
+        run: |
+          if (-not (Test-Path "dist/GIFManager/GIFManager.exe")) { throw "the executable is missing" }
+          if (-not (Test-Path "dist/GIFManager/_internal/gifmanager/frontend/qml/shell/Main.qml")) {
+            throw "the QML files are missing from the bundle"
+          }
+          if (-not (Test-Path "dist/GIFManager/_internal/resources/fonts")) {
+            throw "the bundled fonts are missing"
+          }
+
+      - name: Build the portable zip
+        run: |
+          $version = "${{ needs.version.outputs.version }}"
+          Compress-Archive -Path "dist/GIFManager" -DestinationPath "GIFManager-$version-win64.zip"
+
+      # Inno Setup does not ship a Simplified Chinese translation, and inventing one at build time would
+      # make the build depend on a network fetch. The installer is therefore English; the APPLICATION is
+      # localised as usual.
+      # Inno Setup 未随附简体中文翻译，而在构建期临时编一份会让构建依赖网络抓取。因此安装器是英文的；
+      # "程序本身"照常本地化。
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build the installer
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          $version = "${{ needs.version.outputs.version }}"
+          $source = Join-Path $env:GITHUB_WORKSPACE "dist\GIFManager"
+          & $iscc "/DMyAppVersion=$version" "/DMySource=$source" "packaging\windows\GIFManager.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
+
+      - name: Collect the artifacts
+        run: |
+          $version = "${{ needs.version.outputs.version }}"
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item "GIFManager-$version-win64.zip" out\
+          Copy-Item "dist/GIFManager-Setup-$version.exe" out\
+          Get-ChildItem out | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*
           if-no-files-found: error
+
+  # -------------------------------------------------------------------- linux
+  linux:
+    name: linux
+    needs: [version, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      # The Qt runtime libraries PyInstaller's bundle links against. `xvfb` is not needed: the build itself
+      # never opens a window.
+      # PyInstaller 包链接的 Qt 运行时库。不需要 `xvfb`：构建过程本身从不打开窗口。
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libegl1 libxkbcommon0 libfontconfig1 libdbus-1-3 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 \
+            libxcb-xkb1 libxcb-render-util0 libxcb-image0 libxi6 \
+            fakeroot dpkg-dev makeself
+
+      - name: Build the bundle
+        run: python -m PyInstaller --noconfirm --clean packaging/GIFManagerQml.spec
+
+      - name: Verify the bundle is complete
+        run: |
+          test -x "dist/GIFManager/GIFManager" || { echo "the executable is missing"; exit 1; }
+          test -f "dist/GIFManager/_internal/gifmanager/frontend/qml/shell/Main.qml" \
+            || { echo "the QML files are missing"; exit 1; }
+          test -d "dist/GIFManager/_internal/resources/fonts" \
+            || { echo "the bundled fonts are missing"; exit 1; }
+
+      # ---------------------------------------------------------------- deb
+      - name: Build the .deb
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version.outputs.version }}"
+          PKG="gifmanager_${VERSION}_amd64"
+          rm -rf "$PKG"
+          mkdir -p "$PKG/DEBIAN" "$PKG/usr/lib/gifmanager" "$PKG/usr/bin" \
+                   "$PKG/usr/share/applications" "$PKG/usr/share/icons/hicolor/256x256/apps" \
+                   "$PKG/usr/share/doc/gifmanager"
+
+          cp -R dist/GIFManager/. "$PKG/usr/lib/gifmanager/"
+
+          # A launcher script rather than a symlink: PyInstaller resolves `_internal` next to the path it
+          # believes is its executable, and a symlink would send it to the link's directory.
+          # 用启动脚本而不是符号链接：PyInstaller 会在它认为的可执行文件旁边找 `_internal`，而符号链接会把它
+          # 带到链接所在的目录。
+          printf '#!/bin/sh\nexec /usr/lib/gifmanager/GIFManager "$@"\n' > "$PKG/usr/bin/gifmanager"
+          chmod 755 "$PKG/usr/bin/gifmanager"
+
+          sed 's|^Exec=.*|Exec=gifmanager|' packaging/gifmanager.desktop \
+            > "$PKG/usr/share/applications/gifmanager.desktop"
+          cp resources/icons/gifmanager.png "$PKG/usr/share/icons/hicolor/256x256/apps/gifmanager.png"
+          cp LICENSE "$PKG/usr/share/doc/gifmanager/copyright"
+
+          # Depends is the set of system libraries the Qt bundle actually loads; it deliberately does NOT
+          # list Qt itself, because the bundle carries its own copy.
+          # Depends 是 Qt 包实际加载的系统库集合；刻意"不"列出 Qt 本身，因为包里自带一份。
+          cat > "$PKG/DEBIAN/control" <<CONTROL
+          Package: gifmanager
+          Version: ${VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Maintainer: LwoSnow <noreply@github.com>
+          Installed-Size: $(du -sk "$PKG/usr" | cut -f1)
+          Depends: libc6, libgl1, libegl1, libxkbcommon0, libfontconfig1, libdbus-1-3, libxcb-cursor0, libxcb-icccm4, libxcb-keysyms1, libxcb-shape0, libxcb-xkb1, libxcb-render-util0, libxcb-image0, libxi6
+          Homepage: https://github.com/LwoSnow/GIFManager
+          Description: Emoji, sticker and animated GIF manager
+           Organise emoji, stickers and animated GIFs into groups and send them to any
+           application through the clipboard. Local SQLite library, no network.
+          CONTROL
+
+          dpkg-deb --root-owner-group --build "$PKG" "gifmanager_${VERSION}_amd64.deb"
+          dpkg-deb --info "gifmanager_${VERSION}_amd64.deb"
+
+      # ------------------------------------------------------------ AppImage
+      - name: Build the AppImage
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version.outputs.version }}"
+          APPDIR=AppDir
+          rm -rf "$APPDIR"
+          mkdir -p "$APPDIR/usr/lib/gifmanager"
+          cp -R dist/GIFManager/. "$APPDIR/usr/lib/gifmanager/"
+          install -m 755 packaging/linux/AppRun "$APPDIR/AppRun"
+          install -m 644 packaging/gifmanager.desktop "$APPDIR/gifmanager.desktop"
+          install -m 644 resources/icons/gifmanager.png "$APPDIR/gifmanager.png"
+          # `.DirIcon` is what the runtime shows in a file manager before the desktop file is read.
+          # `.DirIcon` 是运行时在读取桌面文件之前于文件管理器中显示的图标。
+          install -m 644 resources/icons/gifmanager.png "$APPDIR/.DirIcon"
+
+          # `--appimage-extract-and-run` avoids needing FUSE on the runner; the produced AppImage still
+          # needs it on a user's machine, which is normal for the format.
+          # `--appimage-extract-and-run` 使运行器无需 FUSE；产物在用户机器上仍需要它，这对该格式是正常的。
+          curl -fsSL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run --no-appstream \
+            "$APPDIR" "GIFManager-${VERSION}-linux-x86_64.AppImage"
+
+      # ------------------------------------------------------------ .bin
+      - name: Build the self-extracting .bin
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version.outputs.version }}"
+          STAGE=bin-stage
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          cp -R dist/GIFManager "$STAGE/payload"
+          cp packaging/gifmanager.desktop "$STAGE/gifmanager.desktop"
+          cp resources/icons/gifmanager.png "$STAGE/gifmanager.png"
+          cp LICENSE "$STAGE/LICENSE"
+          sed "s|__VERSION__|${VERSION}|g" packaging/linux/install-bin.sh > "$STAGE/install.sh"
+          chmod +x "$STAGE/install.sh"
+
+          # `--sha256` so the installer refuses a truncated download; `--notemp` is NOT used because the
+          # installer copies the payload out and the temp directory can then be cleaned up normally.
+          # 用 `--sha256` 使安装器拒绝被截断的下载；"不"使用 `--notemp`，因为安装器会把负载复制出去，
+          # 之后临时目录可以正常清理。
+          makeself --gzip --sha256 --nomd5 "$STAGE" \
+            "GIFManager-${VERSION}-linux-x86_64.bin" \
+            "GIFManager ${VERSION} installer" ./install.sh
+
+      # ------------------------------------------------------------ Flatpak
+      - name: Build the Flatpak
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version.outputs.version }}"
+          MANIFEST_DIR=packaging/linux/flatpak
+
+          # The manifest installs a PREBUILT bundle (see its header for why), so the payload and the
+          # small assets are staged beside it.
+          # 该清单安装"预构建"包（理由见其文件头），因此负载与小资产都放在它旁边。
+          rm -rf "$MANIFEST_DIR/payload"
+          cp -R dist/GIFManager "$MANIFEST_DIR/payload"
+          cp packaging/gifmanager.desktop "$MANIFEST_DIR/gifmanager.desktop"
+          cp resources/icons/gifmanager.png "$MANIFEST_DIR/gifmanager.png"
+          cp LICENSE "$MANIFEST_DIR/LICENSE"
+          sed -i "s|__VERSION__|${VERSION}|g; s|__DATE__|$(date -u +%Y-%m-%d)|g" \
+            "$MANIFEST_DIR/org.lwosnow.GIFManager.metainfo.xml"
+
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder
+          flatpak remote-add --user --if-not-exists flathub \
+            https://flathub.org/repo/flathub.flatpakrepo
+
+          # `--disable-rofiles-fuse` because the runner's kernel often lacks /dev/fuse.
+          # 用 `--disable-rofiles-fuse`，因为运行器内核通常没有 /dev/fuse。
+          flatpak-builder --user --disable-rofiles-fuse \
+            --install-deps-from=flathub --repo=repo --force-clean \
+            builddir "$MANIFEST_DIR/org.lwosnow.GIFManager.yml"
+          flatpak build-bundle repo "GIFManager-${VERSION}-x86_64.flatpak" org.lwosnow.GIFManager
+
+      - name: Collect the artifacts
+        run: |
+          mkdir -p out
+          cp *.deb *.AppImage *.bin *.flatpak out/
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: out/*
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------- arch
+  arch:
+    name: arch
+    needs: [version, verify]
+    runs-on: ubuntu-latest
+    # Arch's own tooling is the only way to produce a package that `pacman -U` accepts without warnings,
+    # and `makepkg` refuses to run as root, hence the container plus an unprivileged user.
+    # 只有 Arch 自身的工具链才能产出 `pacman -U` 无警告接受的包，而 `makepkg` 拒绝以 root 运行，因此用
+    # 容器加一个非特权用户。
+    container: archlinux:latest
+    steps:
+      # `archlinux:latest` is a bare image with no git, and `actions/checkout` needs it - so the toolchain
+      # is installed BEFORE the checkout, not after.
+      # `archlinux:latest` 是只有 pacman 的裸镜像，而 `actions/checkout` 需要 git，因此工具链要在
+      # checkout "之前"安装，而不是之后。
+      - name: Install the toolchain
+        run: |
+          pacman -Syu --noconfirm --needed git python python-pip base-devel
+
+      - uses: actions/checkout@v4
+
+      # A virtual environment, because Arch marks its system Python as externally managed and pip then
+      # refuses to install into it.
+      # 用虚拟环境，因为 Arch 把系统 Python 标记为外部管理，pip 会拒绝直接安装。
+      - name: Install the Python dependencies
+        run: |
+          python -m venv /opt/build-venv
+          /opt/build-venv/bin/pip install --upgrade pip
+          /opt/build-venv/bin/pip install -r requirements-dev.txt
+
+      - name: Build the bundle
+        run: /opt/build-venv/bin/python -m PyInstaller --noconfirm --clean packaging/GIFManagerQml.spec
+
+      - name: Package for pacman
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version.outputs.version }}"
+          WORK=/tmp/pkgbuild
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+
+          cp packaging/linux/PKGBUILD "$WORK/PKGBUILD"
+          sed -i "s|^pkgver=.*|pkgver=${VERSION}|" "$WORK/PKGBUILD"
+          cp -R dist/GIFManager "$WORK/payload"
+          cp packaging/gifmanager.desktop resources/icons/gifmanager.png LICENSE "$WORK/"
+
+          useradd --create-home builder 2>/dev/null || true
+          chown -R builder:builder "$WORK"
+
+          # `--nodeps`: the runtime dependencies are declared but not installed in this throwaway container,
+          # and installing an entire desktop stack to satisfy them would add ten minutes for no coverage.
+          # `--nodeps`：运行时依赖已声明但未在这个一次性容器里安装，而为满足它们装一整套桌面栈要多花十分钟
+          # 却毫无覆盖价值。
+          su builder -c "cd $WORK && makepkg --nodeps --noconfirm --force"
+          cp "$WORK"/*.pkg.tar.zst .
+          ls -l ./*.pkg.tar.zst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch
+          path: "*.pkg.tar.zst"
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------- release
+  release:
+    name: release
+    needs: [version, windows, linux, arch]
+    if: ${{ inputs.create_release }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download every artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Show what will be published
+        run: ls -l artifacts
+
+      # `softprops/action-gh-release` is used rather than the API directly so the release body, the tag and
+      # the retry behaviour stay out of this file.
+      # 用 `softprops/action-gh-release` 而不是直接调 API，使发布正文、标签与重试行为不必写进本文件。
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: GIFManager ${{ needs.version.outputs.version }}
+          draft: true
+          generate_release_notes: true
+          files: artifacts/*

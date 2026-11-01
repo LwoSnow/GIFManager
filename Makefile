@@ -46,7 +46,8 @@ help:
 	@echo "  make qml-check  Probe the QML runtime, then smoke-load the interface"
 	@echo "  make native     Build the Rust image pipeline (optional)"
 	@echo "  make bench      Measure the native pipeline against the Qt path"
-	@echo "  make build      Build a onedir bundle with PyInstaller"
+	@echo "  make build      Build the retired QtWidgets bundle (GIFManagerNext.spec)"
+	@echo "  make build-qml  Build the shipped QML bundle (the one CI packages)"
 	@echo "  make clean      Remove bytecode, build output and dist"
 	@echo ""
 	@echo "  The native pipeline is OPTIONAL: without it the application runs and"
@@ -162,6 +163,18 @@ qml-check:
 .PHONY: build
 build:
 	$(PYTHON) -m PyInstaller --noconfirm --clean packaging/GIFManagerNext.spec
+
+# The QML front-end — the interface this project ships, and the one the release workflow packages.
+#
+# `build` above still builds the retired QtWidgets interface with `GIFManagerNext.spec`, which EXCLUDES
+# Qt Quick; running that one and expecting the QML window is the mistake this target exists to avoid.
+# QML 前端——本项目发布的界面，也是发布 workflow 打包的那个。
+#
+# 上面的 `build` 仍用 `GIFManagerNext.spec` 构建已退役的 QtWidgets 界面，而该 spec "排除"了 Qt Quick；
+# 跑那个却期待 QML 窗口，正是本目标要避免的混淆。
+.PHONY: build-qml
+build-qml:
+	$(PYTHON) -m PyInstaller --noconfirm --clean packaging/GIFManagerQml.spec
 
 .PHONY: clean
 clean:

@@ -202,6 +202,16 @@ Item {
                 border.width: 1
 
                 TextEdit {
+
+    // No context menu: see `UiTextField` for why. Only right clicks are taken, so editing and
+    // selection are untouched.
+    // 不显示上下文菜单：理由见 `UiTextField`。只接管右键，因此编辑与选择不受影响。
+    MouseArea {
+        anchors.fill: parent
+        acceptedButtons: Qt.RightButton
+        onPressed: function (mouse) { mouse.accepted = true }
+    }
+
                     id: licenseText
                     anchors.fill: parent
                     anchors.margins: theme.spacing
@@ -218,8 +228,8 @@ Item {
                     // 的换行会对齐而不会漂移。
                     font.family: "Consolas, Menlo, DejaVu Sans Mono, monospace"
                     font.pixelSize: theme.fontSizeSmall
-                    selectionColor: theme.accent
-                    selectedTextColor: theme.accentText
+                    selectionColor: theme.uiColors.selected
+                    selectedTextColor: theme.uiColors.selectedForeground
                 }
             }
 
@@ -273,7 +283,7 @@ Item {
 
                     Label {
                         text: page.app ? page.app.repositoryUrl : ""
-                        color: repoButton.hovered ? theme.accent : theme.textMuted
+                        color: repoButton.hovered ? theme.text : theme.textMuted
                         font.pixelSize: theme.fontSizeSmall
                         verticalAlignment: Text.AlignVCenter
                     }

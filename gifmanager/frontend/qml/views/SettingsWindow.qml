@@ -126,7 +126,7 @@ Window {
         Rectangle {
             Layout.fillWidth: true
             implicitHeight: 38
-            color: theme.surface
+            color: theme.window
 
             MouseArea {
                 anchors.fill: parent
@@ -183,7 +183,16 @@ Window {
             Rectangle {
                 Layout.preferredWidth: 132
                 Layout.fillHeight: true
-                color: theme.surface
+                color: theme.window
+
+                // A right-hand separator replaces the fill contrast the sidebar used to carry.
+                // 一条右侧分隔线取代了侧栏过去依靠的填充对比。
+                Rectangle {
+                    anchors.right: parent.right
+                    width: 1
+                    height: parent.height
+                    color: theme.borderStrong
+                }
 
                 ListView {
                     id: categories
@@ -316,8 +325,20 @@ Window {
                                 }
 
                                 Repeater {
+                                    // `shortcutList`, not `shortcuts()`.
+                                    //
+                                    // A binding that CALLS a method has no dependency to re-evaluate
+                                    // on, so this table was computed once and never refreshed - the
+                                    // global hotkey row kept showing the old sequence after a change.
+                                    // The property form carries `notify=settingsChanged`, and committing
+                                    // the hotkey emits exactly that.
+                                    // 用 `shortcutList` 而不是 `shortcuts()`。
+                                    //
+                                    // 调用方法的绑定没有可依赖的求值依据，因此该表只算一次、永不刷新——改掉
+                                    // 全局热键后该行仍显示旧序列。属性形式带有 `notify=settingsChanged`，
+                                    // 而提交热键正好发出该信号。
                                     model: settingsWindow.app
-                                           ? settingsWindow.app.shortcuts() : []
+                                           ? settingsWindow.app.shortcutList : []
 
                                     delegate: RowLayout {
                                         required property var modelData
@@ -328,7 +349,7 @@ Window {
                                         Label {
                                             Layout.preferredWidth: 130
                                             text: modelData.keys
-                                            color: theme.accent
+                                            color: theme.text
                                             font.family: "Consolas, Menlo, monospace"
                                             font.pixelSize: theme.fontSizeBody
                                         }
@@ -405,9 +426,15 @@ Window {
                                                            : theme.textMuted
                                     font.pixelSize: theme.fontSizeBody
                                     wrapMode: Text.WordWrap
-                                    ToolTip.visible: rowHover.hovered
-                                                   && rowRoot.hint !== ""
-                                    ToolTip.text: rowRoot.hint
+                                    // An explicit `UiToolTip`, not the attached `ToolTip.*` form:
+                                    // the attached one is drawn by `QtQuick.Controls.Basic` and kept
+                                    // its own frame no matter how the application palette was set.
+                                    // 显式的 `UiToolTip`，而非附加属性 `ToolTip.*`：附加形式由
+                                    // `QtQuick.Controls.Basic` 绘制，无论应用调色板怎么设都保留着它自己的边框。
+                                    UiToolTip {
+                                        text: rowRoot.hint
+                                        visible: rowHover.hovered && rowRoot.hint !== ""
+                                    }
                                 }
 
                                 Loader {
@@ -554,8 +581,33 @@ Window {
                                                              controlValue)
                                 Component.onCompleted: currentIndex = Math.max(
                                     0, indexOfValue(controlValue))
-                                onActivated: settingsWindow.app.settings.setValue(
-                                                 controlField, currentValue)
+                                onActivated: {
+                                    // 外观 applies AT ONCE; every other choice stays a draft.
+                                    //
+                                    // A colour scheme is not a value the user needs to confirm: picking
+                                    // it and seeing nothing change reads as a broken control, not as
+                                    // "press 应用". Fixing the theme needs no restart and no revert
+                                    // strategy, so the honest treatment is to show the result
+                                    // immediately.
+                                    //
+                                    // Everything else keeps the dialog's draft contract, because those
+                                    // values (send mode, sorting) are not visible while the dialog is
+                                    // open and a stray change is better left cancellable.
+                                    // 外观"立即"生效；其他选项仍留作草稿。
+                                    //
+                                    // 配色方案不是需要用户确认的值：选中它却看不出任何变化，读起来是控件坏了，
+                                    // 而不是"请按应用"。修复主题既不需要重启也不需要回退策略，因此诚实的处理
+                                    // 就是立刻显示结果。
+                                    //
+                                    // 其余选项保留对话框的草稿契约，因为那些值（发送模式、排序）在对话框打开
+                                    // 时并不可见，而一次误改更好留作可取消。
+                                    if (controlField === "theme")
+                                        settingsWindow.app.setSettingNow(controlField,
+                                                                         currentValue)
+                                    else
+                                        settingsWindow.app.settings.setValue(controlField,
+                                                                             currentValue)
+                                }
                             }
                         }
 
@@ -602,74 +654,154 @@ Window {
 
                         Component {
                             id: hotkeyControl
-                            UiTextField {
+                            // A Rectangle + Label, NOT a `TextField`.
+                            //
+                            // # Why the text input had to go
+                            //
+                            // A `TextField` - even a `readOnly` one - brings Qt's whole text-editing
+                            // machinery with it, and that machinery competes with the capture:
+                            //
+                            //   * Shift+F10 is the standard "open the context menu" key, so it opened
+                            //     the field's own Undo/Redo/Cut/Copy/Paste/Delete/Select All menu
+                            //     instead of being captured. That menu is the dialog the user reported.
+                            //   * Alt combinations are menu-accelerator traffic, and the field consumed
+                            //     them before the capture filter could see a complete combination.
+                            //   * Focus produced a white ring that never went away, because the field
+                            //     kept focus after the capture finished - which reads as "still
+                            //     waiting for input".
+                            //
+                            // None of that is needed: the capture is process-wide (see
+                            // `BackendBridge.beginHotkeyCapture`), so the control only has to LOOK like
+                            // a field and react to a click. A plain item has no text editing, no context
+                            // menu, no shortcut table and no focus requirement, which removes all three
+                            // failures at once instead of working around each.
+                            // 一个 Rectangle + Label，而不是 `TextField`。
+                            //
+                            // # 为什么必须去掉文本输入
+                            //
+                            // `TextField`——即便设了 `readOnly`——会带来 Qt 的整套文本编辑机制，而那套机制
+                            // 与捕获相互竞争：
+                            //
+                            //   * Shift+F10 是标准的"打开上下文菜单"键，于是它打开的是字段自己的
+                            //     撤销/重做/剪切/复制/粘贴/删除/全选菜单，而不是被捕获。那个菜单就是用户
+                            //     报告的对话框。
+                            //   * Alt 组合属于菜单加速键流量，字段会在捕获过滤器看到完整组合之前把它们消费掉。
+                            //   * 焦点会产生一个不会消失的白色聚焦环，因为捕获结束后字段仍持有焦点——那读起来
+                            //     就像"还在等待输入"。
+                            //
+                            // 这些都不需要：捕获是进程级的（见 `BackendBridge.beginHotkeyCapture`），
+                            // 因此控件只需要"看起来像"字段并对点击作出反应。一个普通元素没有文本编辑、
+                            // 没有上下文菜单、没有快捷键表、也不需要焦点，于是一次性消除全部三个失效点，
+                            // 而不是逐个绕开。
+                            Rectangle {
                                 id: hotkeyField
-                                // Named so a check can find it. A `TextField` inside a `Loader`
-                                // inside a `Repeater` has no stable path from Python, and
-                                // `findChildren(QObject)` cannot identify QML types by class
-                                // (every visual item reports `QQuickItem`), so an explicit name is
-                                // the only reliable handle — and without one the hotkey field
-                                // cannot be tested at all.
-                                // 命名使检查能找到它。位于 `Repeater` 内 `Loader` 内的
-                                // `TextField` 从 Python 没有稳定路径，而 `findChildren(QObject)`
-                                // 无法按类识别 QML 类型（每个可视元素都报告为 `QQuickItem`），
-                                // 因此显式名称是唯一可靠的把手——没有它，热键字段根本无法测试。
+                                // Named so a check can find it / 命名使检查能找到它
                                 objectName: "hotkeyField"
                                 property var controlValue: undefined
                                 property string controlField: ""
 
-                                readOnly: true
-                                selectByMouse: false
-
-                                // `activeFocusOnTab` plus `focus: true` make the field focusable
-                                // at all. Without them it could not take focus, and a control
-                                // that cannot take focus never receives `Keys.onPressed` — so the
-                                // hotkey could not be changed, which is exactly the reported
-                                // symptom. A `TextField` inside a `Loader` does NOT take focus by
-                                // itself.
-                                // `activeFocusOnTab` 与 `focus: true` 让它至少"可聚焦"。缺了它们
-                                // 该字段无法获得焦点，而无法获得焦点的控件永远收不到
-                                // `Keys.onPressed`——于是热键无法更换，这正是报告的症状。`Loader`
-                                // 内的 `TextField` "不会"自行取得焦点。
-                                activeFocusOnTab: true
-                                focus: true
-
-                                text: hotkeyText(controlValue)
-                                placeholderText: settingsWindow.app.trE("hotkey_hint", settingsWindow.app.languageEpoch)
-
-                                // NO `background` override.
+                                // What the field shows: what was just captured, else the stored value.
                                 //
-                                // The field used to draw its own rectangle with `theme.surfaceAlt` and
-                                // a 2px accent border, which replaced `UiTextField`'s shell entirely -
-                                // so this one control in the settings window ignored the design
-                                // system. `UiTextField` already gives the armed state a visible
-                                // treatment: the border turns to `ring` on focus, plus the outer ring.
+                                // The captured text is kept locally because it must be visible the
+                                // instant the key is pressed; waiting for the settings model to
+                                // re-evaluate would make a correct capture look like nothing happened.
+                                // 字段显示的内容：刚捕获的值，否则是已存储的值。
                                 //
-                                // 不覆写 `background`。
-                                //
-                                // 该字段过去自绘矩形（`theme.surfaceAlt` + 2px 强调色边框），完全替换了
-                                // `UiTextField` 的外壳——于是设置窗口里只有这一个控件无视设计系统。
-                                // `UiTextField` 已经给"已就绪"一个可见的处理：聚焦时边框变为 `ring`，并
-                                // 加上外层聚焦环。
+                                // 捕获到的文本保存在本地，因为它必须在按键那一刻就可见；等待设置模型重新
+                                // 求值会让一次成功的捕获看起来像什么都没发生。
+                                property string capturedText: ""
 
-                                // A click must arm the field even though the press cannot change
-                                // the text: `readOnly` blocks editing but not focus, and clicking
-                                // is how a user says "capture my next key".
-                                // 点击必须让该字段就绪，即使按下无法改变文本：`readOnly` 阻止编辑但
-                                // 不阻止聚焦，而点击正是用户表达"捕获我的下一个按键"的方式。
-                                MouseArea {
-                                    anchors.fill: parent
-                                    cursorShape: Qt.IBeamCursor
-                                    onPressed: hotkeyField.forceActiveFocus()
+                                // `armed` drives the visual state and is CLEARED when the capture ends.
+                                //
+                                // This is the guidance that was missing: the highlighted border means "I
+                                // am listening", and it drops back the instant a shortcut is recorded, so
+                                // nothing suggests the field is still waiting for input.
+                                // `armed` 驱动视觉状态，并在捕获结束时"清除"。
+                                //
+                                // 这正是此前缺失的引导：高亮边框表示"正在监听"，而它在快捷键被记录的那一刻
+                                // 恢复常态，因此没有任何东西暗示字段仍在等待输入。
+                                property bool armed: false
+
+                                Layout.fillWidth: true
+                                implicitHeight: theme.uiMetrics.uiControlHeight
+                                radius: theme.uiMetrics.uiRadius
+                                color: theme.uiColors.surface1
+                                border.width: armed ? 2 : 1
+                                border.color: armed ? theme.uiColors.selected
+                                                    : hoverArea.containsMouse
+                                                      ? theme.uiColors.borderStrong
+                                                      : theme.uiColors.border
+
+                                Behavior on border.color {
+                                    ColorAnimation { duration: theme.uiMetrics.uiAnimationMs }
                                 }
 
-                                // The stored value arrives in either shape: a
-                                // portable string ("Ctrl+Alt+F10") or the parsed
-                                // {modifiers, key} map the schema keeps. Both
-                                // render as one canonical string.
-                                // 存储值有两种形态：可移植字符串（"Ctrl+Alt+F10"）
-                                // 或 schema 解析出的 {modifiers, key} 映射。两者都
-                                // 渲染成同一个规范字符串。
+                                Label {
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    anchors.leftMargin: theme.uiMetrics.uiPaddingX
+                                    anchors.rightMargin: theme.uiMetrics.uiPaddingX
+                                    text: hotkeyField.capturedText !== ""
+                                          ? hotkeyField.capturedText
+                                          : hotkeyField.hotkeyText(hotkeyField.controlValue)
+                                    color: hotkeyField.capturedText !== ""
+                                           || hotkeyField.controlValue !== undefined
+                                           ? theme.uiColors.foreground
+                                           : theme.uiColors.mutedForeground
+                                    font.pixelSize: theme.uiMetrics.uiFontSize
+                                    elide: Text.ElideRight
+                                }
+
+                                MouseArea {
+                                    id: hoverArea
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: {
+                                        hotkeyField.armed = true
+                                        hotkeyField.capturedText = ""
+                                        settingsWindow.app.beginHotkeyCapture(
+                                            hotkeyField.controlField)
+                                    }
+                                }
+
+                                // The capture must not survive the control it belongs to.
+                                //
+                                // The filter is PROCESS-WIDE, so an armed capture that outlives its
+                                // field keeps swallowing every keystroke in the application: the user
+                                // switches category or closes the window and the rest of the interface
+                                // stops responding to the keyboard. Disarming on destruction covers the
+                                // category switch (it destroys the Loader's item) and the window close.
+                                // 捕获不得比它所归属的控件活得更久。
+                                //
+                                // 过滤器是"进程级"的，因此一个比自己字段活得更久的待捕获状态会持续吞掉应用里
+                                // 的每一次击键：用户切换分类或关闭窗口后，界面其余部分就不再响应键盘。销毁时
+                                // 解除覆盖了切换分类（它会销毁 Loader 的元素）与关闭窗口两种情况。
+                                Component.onDestruction: if (armed)
+                                                             settingsWindow.app.endHotkeyCapture()
+
+                                Connections {
+                                    target: settingsWindow.app
+                                    function onHotkeyCaptured(field, text) {
+                                        if (field !== hotkeyField.controlField)
+                                            return
+                                        hotkeyField.capturedText = text
+                                        // Disarm, so the border returns to normal and the user can see
+                                        // the shortcut is configured.
+                                        // 解除待捕获，使边框恢复常态、用户能看到快捷键已配置完成。
+                                        hotkeyField.armed = false
+                                    }
+                                    function onHotkeyCaptureEnded() {
+                                        hotkeyField.armed = false
+                                    }
+                                }
+
+                                // The stored value arrives in either shape: a portable string
+                                // ("Ctrl+Alt+F10") or the parsed {modifiers, key} map the schema keeps.
+                                // Both render as one canonical string.
+                                // 存储值有两种形态：可移植字符串（"Ctrl+Alt+F10"）或 schema 解析出的
+                                // {modifiers, key} 映射。两者都渲染成同一个规范字符串。
                                 function hotkeyText(value) {
                                     if (value === undefined || value === null
                                             || value === "")
@@ -691,39 +823,6 @@ Window {
                                     }
                                     return String(value)
                                 }
-
-                                Keys.onPressed: function (event) {
-                                    var parts = []
-                                    if (event.modifiers & Qt.ControlModifier)
-                                        parts.push("Ctrl")
-                                    if (event.modifiers & Qt.AltModifier)
-                                        parts.push("Alt")
-                                    if (event.modifiers & Qt.ShiftModifier)
-                                        parts.push("Shift")
-                                    if (event.modifiers & Qt.MetaModifier)
-                                        parts.push("Meta")
-
-                                    var key = event.key
-                                    if (key === Qt.Key_Control || key === Qt.Key_Shift
-                                            || key === Qt.Key_Alt
-                                            || key === Qt.Key_Meta) {
-                                        event.accepted = true
-                                        return
-                                    }
-                                    if (key === Qt.Key_Escape) {
-                                        settingsWindow.app.settings.setValue(
-                                            controlField, "")
-                                        event.accepted = true
-                                        return
-                                    }
-                                    var name = settingsWindow.app.keyName(key)
-                                    if (name === "")
-                                        return
-                                    parts.push(name)
-                                    settingsWindow.app.settings.setValue(
-                                        controlField, parts.join("+"))
-                                    event.accepted = true
-                                }
                             }
                         }
                     }
@@ -737,7 +836,7 @@ Window {
         Rectangle {
             Layout.fillWidth: true
             implicitHeight: 44
-            color: theme.surface
+            color: theme.window
 
             Rectangle {
                 anchors.top: parent.top
@@ -774,7 +873,12 @@ Window {
                 UiButton {
                     text: settingsWindow.app
                           ? settingsWindow.app.trE("apply", settingsWindow.app.languageEpoch) : ""
-                    onClicked: settingsWindow.app.settings.applyPending()
+                    // `applySettings` instead of `settings.applyPending`: the bridge slot never raises,
+                    // so a failed coercion cannot abort the QML statement. See the OK button below for
+                    // why that matters.
+                    // 用 `applySettings` 而不是 `settings.applyPending`：桥的槽绝不抛出，因此一次失败的
+                    // 强制转换无法中断 QML 语句。原因见下方的"确定"按钮。
+                    onClicked: settingsWindow.app.applySettings()
                 }
 
                 UiButton {
@@ -789,8 +893,22 @@ Window {
                 UiButton {
                     text: settingsWindow.app
                           ? settingsWindow.app.trE("ok", settingsWindow.app.languageEpoch) : ""
+                    // Apply, THEN close, with the apply unable to throw.
+                    //
+                    // The previous form was `settings.app.applyPending(); settingsWindow.close()`. A
+                    // Python exception in `applyPending` (a rejected coercion, an unavailable platform
+                    // service, a failed registry write) propagated out of the QML handler, so `close()`
+                    // was skipped: the window stayed open and nothing was saved. That is the reported
+                    // "clicking save does not close the settings window", and wrapping the apply is what
+                    // makes the close unconditional.
+                    // 先应用、再关闭，并且应用不会抛出。
+                    //
+                    // 旧写法是 `settings.app.applyPending(); settingsWindow.close()`。`applyPending` 中的
+                    // Python 异常（被拒绝的强制转换、不可用的平台服务、失败的注册表写入）会从 QML 处理函数
+                    // 中传播出去，于是 `close()` 被跳过：窗口留在原地且什么都没保存。这正是用户报告的
+                    // "点击保存后不会关闭设置窗口"——包住应用步骤，才让关闭成为无条件行为。
                     onClicked: {
-                        settingsWindow.app.settings.applyPending()
+                        settingsWindow.app.applySettings()
                         settingsWindow.close()
                     }
                 }

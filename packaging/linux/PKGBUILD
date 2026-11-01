@@ -1,0 +1,67 @@
+# Maintainer: LwoSnow <noreply@github.com>
+#
+# Arch package for GIFManager Next.
+#
+# # How CI fills this in
+#
+# The workflow rewrites `pkgver` from `gifmanager/__init__.py`, drops the PyInstaller onedir tree into
+# `srcdir/payload`, and runs `makepkg --nodeps --skipinteg` inside an `archlinux` container. That is why
+# `source=()` is empty: the payload is already there, so there is nothing to fetch and no checksum that
+# could go stale.
+#
+# Arch 包配置。
+#
+# # CI 如何填充本文件
+#
+# workflow 从 `gifmanager/__init__.py` 改写 `pkgver`，把 PyInstaller onedir 树放进 `srcdir/payload`，
+# 并在 `archlinux` 容器里运行 `makepkg --nodeps --skipinteg`。这就是 `source=()` 为空的原因：负载已经
+# 在那儿，无需抓取，也就没有会过期的校验和。
+
+pkgname=gifmanager
+pkgver=__VERSION__
+pkgrel=1
+pkgdesc="Emoji, sticker and animated GIF manager with a QML interface"
+arch=('x86_64')
+url="https://github.com/LwoSnow/GIFManager"
+license=('MIT')
+# The PyInstaller bundle carries its own Qt, Python and plugins, so the runtime dependencies are only the
+# system libraries it links against: the compositor client libraries and the usual glibc/X11 stack.
+# PyInstaller 包自带 Qt、Python 与插件，因此运行时依赖只是它链接的系统库：合成器客户端库与常见的
+# glibc/X11 栈。
+depends=('glibc' 'gcc-libs' 'fontconfig' 'freetype2' 'libglvnd'
+         'libxkbcommon' 'xcb-util-cursor' 'xcb-util-image' 'xcb-util-keysyms'
+         'xcb-util-renderutil' 'xcb-util-wm' 'libx11' 'libxcb' 'libxi' 'zlib')
+optdepends=('wayland: native Wayland support'
+            'ffmpeg: converting non-GIF images without Pillow'
+            'libnotify: tray notifications')
+options=('!strip' '!debug')
+# Prebuilt: there is nothing to compile, and the payload is not reproducible from source here. No
+# `.install` script either - the only post-install step would be refreshing the desktop database, which
+# pacman already hooks.
+# 预构建：没有可编译的内容，而负载在此无法从源码复现。也不需要 `.install` 脚本——唯一可能的安装后步骤是
+# 刷新桌面数据库，而 pacman 已有该钩子。
+
+package() {
+  # The whole onedir bundle is installed under /usr/lib/gifmanager so the launcher can be a two-line
+  # script that keeps `sys.executable` pointing INSIDE the bundle - PyInstaller looks for `_internal`
+  # next to whatever it thinks the executable is.
+  # 整个 onedir 包安装到 /usr/lib/gifmanager，使启动器可以是一个两行脚本，并让 `sys.executable` 指向
+  # 包"内部"——PyInstaller 会在它认为的可执行文件旁边查找 `_internal`。
+  install -d "$pkgdir/usr/lib/gifmanager"
+  cp -R "$startdir/payload/." "$pkgdir/usr/lib/gifmanager/"
+
+  install -d "$pkgdir/usr/bin"
+  cat > "$pkgdir/usr/bin/gifmanager" <<'LAUNCHER'
+#!/bin/sh
+exec /usr/lib/gifmanager/GIFManager "$@"
+LAUNCHER
+  chmod 755 "$pkgdir/usr/bin/gifmanager"
+
+  install -Dm644 "$startdir/gifmanager.desktop" \
+    "$pkgdir/usr/share/applications/gifmanager.desktop"
+  if [ -f "$startdir/gifmanager.png" ]; then
+    install -Dm644 "$startdir/gifmanager.png" \
+      "$pkgdir/usr/share/icons/hicolor/256x256/apps/gifmanager.png"
+  fi
+  install -Dm644 "$startdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

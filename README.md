@@ -1,290 +1,310 @@
-The 2.0.0 version of the program is still under development. The old README file is currently displayed.
+<p align="center"><img src="assets/logo.png" width="128" alt="GIFManager logo"></p>
 
----
-# GIFManager
+<h1 align="center">GIFManager</h1>
 
-A lightweight sticker (emoji/GIF) manager for Windows, built with **PySide6 (Qt 6)**.
-It mimics the look and feel of the QQ sticker panel: browse your sticker packs,
-manage them in groups, and send them to any chat window in one click.
+<p align="center"><b>Your emoji, sticker and GIF library — one keystroke away from any application.</b></p>
 
-**[简体中文](README.zh-CN.md)**
+<p align="center">
+  <a href="README.zh-CN.md">简体中文</a> ·
+  <b>English</b>
+</p>
+
+<p align="center">
+  <img alt="version" src="https://img.shields.io/badge/version-2.0.0-4a4a55?style=flat-square">
+  <img alt="python" src="https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square">
+  <img alt="qt" src="https://img.shields.io/badge/Qt-6.11-41cd52?style=flat-square">
+  <img alt="platforms" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-2ea44f?style=flat-square">
+  <img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square">
+</p>
 
 <p align="center"><img src="https://count.getloli.com/@Lwogifmanagerreadnums?theme=moebooru" alt="ReadNums"></p>
 
 ---
 
-## Features
+GIFManager is a desktop manager for the pictures you send a hundred times a day: reaction GIFs, stickers,
+and plain emoji. Instead of scrolling a chat application's sticker panel, you keep your own library on your
+own disk, grouped the way you think about it, and retrieve any of it with a single global keystroke — while
+the window stays out of the way over whatever you were typing into.
 
-- **Borderless dark and bright UI** — a clean frameless window with a draggable toolbar,
-  Win11 rounded corners, dark/light themes, and a modern flat look.
-- **Bottom group tab bar** Personalized grouping of bottom expressions.
-  The built-in **"All"** tab shows every sticker across groups; a **"Default"** group is
-  always available for quick imports.
-- **Two group types**
-  - *Image groups* — store GIF/PNG/JPG/WebP/BMP stickers.
-  - *Text groups* — store pure text (kaomoji / Emoticon). Paste text with **Ctrl+V**
-    to batch-save each line as a sticker.
-- **Import method**
-  - `Import GIF` button → *Import from folder* (recursive scan) or *Import from files*
-    (multi-select).
-  - Drag & drop files directly onto the window to batch-import into the current group
-    (or the Default group when "All" is active).
-  - Duplicate files in the same group are skipped automatically (MD5 content hash);
-    the same file may exist in several groups as a multi-tag.
-- **Send to chat** — click a sticker to copy it to the clipboard:
-  - **File path mode** (default, recommended) — paste directly in QQ / WeChat.
-  - **Image data mode** — copies the raw image pixels for apps that need image data.
-- **Text stickers** — compact text cards instead of image thumbnails; preview length is
-  configurable (single-line / multi-line limits).
-- **Search** — real-time filtering by file name / text content.
-- **Rich interactions**
-  - Right-click a sticker: Send, Rename/Edit, Move to group, Delete.
-  - In the "All" view, deleting a duplicated sticker opens a dialog to pick which group
-    copies to remove.
-  - Drag stickers to reorder within a column; drag group tabs to reorder groups;
-    right-click a group to rename/delete (built-ins are protected).
-  - **One-click rearrange** — evenly distribute stickers into columns by window width.
-  - Hover a GIF to play its animation (visibility-driven playback, never plays
-    off-screen GIFs).
-- **System tray resident** — closing hides to the tray; left-click the tray icon (or
-  press the global hotkey) to toggle visibility, tray menu to quit.
-- **Global hotkey** — default **F10** to show/hide; supports key combinations
-  (e.g. `Ctrl+Shift+1`), **mouse side buttons** (XButton1/XButton2), and ESC to clear.
-- **Memory system** — window size/position, the last selected group (toggleable),
-  send mode, theme, language, and hotkey persist across restarts.
-- **Performance built-in** — lazy card creation (only visible cards are built),
-  thread-pool thumbnail decoding with a 64 MB pixmap cache, configurable CPU core count,
-  and column-merging on window resize so the layout never breaks.
-- **Logging** — timestamped logs under `logs/`, crash-safe (flushed per line), with a
-  one-click "Clear logs" action in Settings.
+Everything is local. There is no account, no cloud, no network request in the sending path: the library is a
+SQLite database next to your files, and "sending" means putting the image — or its file path, whichever your
+chat application prefers — on the clipboard.
+
+![The library window](assets/screenshot.png)
 
 ---
 
-## AI Disclosure
+## Contents
 
-This project used AI-assisted development tools:
-
-- **Tool**: DeepSeek v4 flash 0731
-- **Role**: Code generation, implementation assistance
-- **Human oversight**: All code was reviewed, tested, and integrated by the project maintainer
-
----
-## UI Layout
-
-![GIFManager UI (English)](.github/image/GUI_en.png)
-
----
-
-## Requirements
-
-- **Windows 10 / 11** (global hotkey, tray, rounded corners, and autostart are
-  Windows-specific; the app otherwise runs on other platforms)
-- **Python 3.10+** (Program version is Python 3.12.0)
-- **PySide6 ≥ 6.5**
-
-The only third-party dependency is PySide6.
+- [What it does](#what-it-does)
+- [Cross-platform support](#cross-platform-support)
+- [Languages](#languages)
+- [Project structure](#project-structure)
+- [Install](#install)
+- [Where your data lives](#where-your-data-lives)
+- [Building the installers](#building-the-installers)
+- [Development](#development)
+- [License and credits](#license-and-credits)
 
 ---
 
-## Installation & Run
+## What it does
+
+### A library that stays yours
+
+- **Groups, two kinds.** Image groups hold pictures; text groups hold text snippets. The two never mix, so
+  "the right panel" is never ambiguous. Groups can be created, renamed and deleted, and the built-in group
+  is protected from deletion.
+- **Import from files or a whole folder**, recursively. Anything that is not already a GIF can be converted
+  on import, so a folder of PNGs becomes an animated library without a second tool.
+- **Search** the current group as you type, and **sort** by import time, name, or how often you actually use
+  each sticker — the last one is measured, not guessed: every send increments a counter.
+- **Card size from 50% to 200%**, with an optional hover preview and zoom, so the grid can be dense or
+  comfortable without changing anything else.
+
+### Sending without leaving the keyboard
+
+- A **global hotkey** summons and hides the window over any application. It accepts a single key (`F10`) or a
+  combination (`Ctrl+Alt+F8`); a lone key is deliberately allowed, because a tray utility that demands a
+  modifier for its only shortcut is harder to use, not safer.
+- Click a sticker and it lands on the **clipboard as image data** (paste anywhere) or **as a file path**
+  (which QQ and WeChat accept directly). Which one is a setting.
+- **Optional auto-paste**: after the clipboard is filled, GIFManager sends the paste keystroke to the window
+  you were in before it appeared, so the whole interaction is *hotkey → click → it is already in the chat*.
+- A **tray icon** offers show/hide/quit, and a second launch of the program does not start a second copy — it
+  forwards a command (`--toggle`, `--show`, `--hide`, `--quit`) to the running one.
+
+### Editing a library, not one sticker at a time
+
+- **Edit mode** turns the grid into a selection surface: click to toggle, drag to paint the selection across
+  cards, *Select all* / *Deselect all* toggles the whole set, then delete or move everything at once.
+- **Drag to reorder** cards by hand, or let the frequency sort do it for you.
+- **Text stickers** for anything that is a phrase rather than a picture, with separate limits for single-line
+  and multi-line content.
+
+### An interface that gets out of the way
+
+- **Dark and light themes**, switched instantly — the palette is applied when you pick it, not after a
+  restart or a confirmation dialog.
+- A **bundled typeface** (HarmonyOS Sans SC, six weights) so the grid, the labels and the dialogs have the
+  same metrics on every machine instead of inheriting whatever the host happens to have installed.
+- A deliberately **low-contrast palette** in which the base surfaces sit a few percent apart and only the
+  *selected* element is high contrast, so a window opened dozens of times a day stays quiet.
+- Frameless window, remember-last-group, restore-window-geometry, always-on-top, start-with-the-system.
+
+### Performance that survives a large library
+
+- GIF frames are **decoded on a worker pool**, never on the thread that draws, and cached under a pixel
+  budget. Only the animations **on screen** play; the rest keep a still frame.
+- The decode queue is **newest-first with stale work dropped**, so scrolling fast through a thousand
+  stickers does not leave the visible row waiting behind rows you already passed.
+- An **optional native decoder** (Rust, built from `native/`) makes scrolling smoother still; without it the
+  program falls back to a pure-Python path and loses nothing but speed.
+
+---
+
+## Cross-platform support
+
+The application is layered so that all of the logic runs anywhere and only the front-end needs a toolkit. The
+table below describes what is actually implemented, honestly labelled:
+
+| Area | Windows | Linux | macOS |
+|---|---|---|---|
+| Interface (Qt Quick) | ✅ | ✅ | ⚠️ untested |
+| Frameless window, rounded corners | ✅ DWM | ✅ | ⚠️ untested |
+| Global hotkey | ✅ `RegisterHotKey` | ✅ X11 · ⚠️ Wayland needs the compositor | ❌ not implemented |
+| Clipboard send + auto-paste | ✅ `SendInput` | ⚠️ where `xdotool`/`ydotool` exists | ⚠️ untested |
+| Tray icon | ✅ | ✅ StatusNotifier | ⚠️ untested |
+| Start with the system | ✅ registry | ✅ XDG autostart | ⚠️ untested |
+| Single instance + command forwarding | ✅ | ✅ | ⚠️ untested |
+
+**Linux, in more detail.** The build is exercised against a Wayland session (niri). Two things are worth
+knowing before you file a bug:
+
+- **Global shortcuts belong to the compositor on Wayland.** The program cannot register one itself, so the
+  documented route is a compositor binding that runs `gifmanager --toggle`. Example rules for niri ship as
+  `packaging/niri-binds.kdl` and `packaging/niri-window-rule.kdl`.
+- The desktop entry must be installed as `gifmanager.desktop` — the XDG portal looks the application up by
+  that exact name before it will hand out an app id. `scripts/install-desktop-entry.sh` does it.
+
+**macOS.** The platform backend exists so the layering stays honest, and the interface runs, but it has not
+been exercised by CI or by hand. Treat it as unproven rather than supported.
+
+---
+
+## Languages
+
+The interface ships in **English** and **Simplified Chinese**, switchable at runtime from *Settings → General
+→ Language* without restarting.
+
+Translations are plain JSON tables under `resources/language/`:
+
+```json
+{
+  "settings": "Settings",
+  "import_gif": "Import GIF"
+}
+```
+
+To add a language:
+
+1. copy `resources/language/en_US.json` to `<locale>.json` (for example `ja_JP.json`);
+2. translate the values — **never the keys**;
+3. run `python tools/sync_language_keys.py` — it fails if one table is missing a key another table has, which
+   is what keeps a half-translated interface out of a release.
+
+The file name is the locale identifier the settings table offers, so a new file becomes selectable at once.
+
+---
+
+## Project structure
+
+```
+gifmanager/
+  core/          # store (SQLite), imaging, settings schema, paths, logging   — no toolkit
+  platform/      # per-OS services: window, hotkey, clipboard, autostart      — no toolkit
+  backend/       # the application object tying core + platform together      — no toolkit
+  frontend/
+    qml/         # * the shipped interface: Python bridge + 23 .qml files
+    qt/          # the earlier QtWidgets shell, kept for comparison
+apps/            # entry points: gifmanager_qml.py (shipped), gifmanager_qt.py (legacy)
+resources/       # fonts, icons, translations, optional decoder source
+packaging/       # PyInstaller specs, Inno Setup script, deb/Arch/AppImage/Flatpak files
+tests/           # unit tests and the smoke suite
+tools/           # the check suite used by CI and by `make check`
+native/          # optional Rust GIF decoder
+```
+
+The layering is a rule rather than a suggestion, and CI enforces it with `tools/check_layers.py`:
+
+| Layer | May import | Why the boundary exists |
+|---|---|---|
+| `core` | standard library | Testable without a display or a toolkit; no `sys.platform` branches. |
+| `platform` | `core` | The only place that knows about Windows, macOS or Linux. |
+| `backend` | `core`, `platform` | One application object, still toolkit-free. |
+| `frontend/*` | everything | The only layer allowed to import PySide6. |
+
+That is also why the QML interface is a new subtree rather than an edit of the old front-end: the backend
+already notifies changes, so the declarative interface binds to it instead of rebuilding the grid from twenty
+call sites.
+
+---
+
+## Install
+
+### Prebuilt packages
+
+Every release is built manually from `.github/workflows/build.yml` and attached to the release page:
+
+| Platform | File | Notes |
+|---|---|---|
+| Windows | `GIFManager-Setup-<version>.exe` | Installer (Inno Setup), per-user by default |
+| Windows | `GIFManager-<version>-win64.zip` | Portable: unpack and run |
+| Debian/Ubuntu | `gifmanager_<version>_amd64.deb` | `sudo apt install ./gifmanager_*.deb` |
+| Any Linux | `GIFManager-<version>-linux-x86_64.AppImage` | `chmod +x`, then run |
+| Any Linux | `GIFManager-<version>-linux-x86_64.bin` | Self-extracting installer, `--help` for options |
+| Arch | `gifmanager-<version>-1-x86_64.pkg.tar.zst` | `sudo pacman -U` |
+| Flatpak | `GIFManager-<version>-x86_64.flatpak` | `flatpak install ./GIFManager-*.flatpak` |
+
+### From source
+
+Requires **Python 3.10+** (3.12 recommended). Qt 6.11.1 arrives with PySide6, pinned in `pyproject.toml`.
 
 ```bash
-# 1. Create a virtual environment (optional but recommended)
+git clone https://github.com/LwoSnow/GIFManager.git
+cd GIFManager
+
 python -m venv .venv
+# Windows: .venv\Scripts\activate
+source .venv/bin/activate
 
-# 2. Activate it (Windows)
-.venv\Scripts\activate
+pip install -r requirements-dev.txt
 
-# 3. Install the dependency
-pip install PySide6
-
-# 4. Run
-python main.py
+python -m gifmanager          # the shipped QML interface
 ```
 
-Or, if you already have the `.venv` shipped with the project:
+Two further entry points reach the same interface: `gifmanager-qml` (console script) and
+`apps/gifmanager_qml.py`. `gifmanager` on its own launches the older QtWidgets shell.
+
+An **optional** speed-up for long animated stickers:
 
 ```bash
-.venv\Scripts\python.exe main.py
+scripts/build-native.sh        # Windows: scripts/build-native.ps1
 ```
 
-On first launch the app creates `data/emoji.db` (SQLite, WAL mode) and
-`data/emojis/<group>/` folders automatically.
+---
+
+## Where your data lives
+
+| What | Where | Override |
+|---|---|---|
+| Library (SQLite + sticker files) | `~/.local/share/GIFManager` | `GIFMANAGER_DATA_DIR` |
+| Logs | `~/.cache/GIFManager/logs` | — |
+| Settings | inside the library directory | — |
+
+Nothing leaves the machine. Uninstalling the program does not delete this directory; remove it yourself if
+you want a clean start.
 
 ---
 
-## Usage Guide
+## Building the installers
 
-### Importing stickers
+The release build is `.github/workflows/build.yml`, triggered **manually** — an installer on every push is
+noise that also costs an hour of runner time. It reads the version from `gifmanager/__init__.py`, so a build
+can never be labelled with a number the code does not carry, and it produces every file in the table above
+from a single bundle build per platform.
 
-| Action | Result |
-| --- | --- |
-| Click **Import GIF** → *From files* | Multi-select GIF/PNG/JPG/WebP/BMP, copied into the current group |
-| Click **Import GIF** → *From folder* | Recursively scans a folder for supported images |
-| Drag & drop files onto the window | Batch import into the current group (or Default when "All" is active) |
-| Ctrl+V while a **text group** is selected | Each line of the clipboard becomes a text sticker |
-
-### Groups
-
-- The **All** tab is built-in and cannot be deleted/renamed; it shows every sticker,
-  folding cross-group duplicates into one card.
-- The **Default** group is the fallback target when importing while "All" is selected.
-- Click **＋** at the right end of the tab bar to create a new **image group** or
-  **text group**.
-- Drag tabs to reorder; right-click a tab to rename or delete (built-ins protected).
-
-### Sending stickers
-
-1. Click a sticker — it is copied to the clipboard immediately (status bar confirms).
-2. Switch the send mode in **Settings → Send**: *Copy file path* (recommended) or
-   *Copy image data*.
-3. Paste in QQ / WeChat / any chat window.
-
-> Tip: QQ accepts pasted file paths directly; WeChat also pastes the image.
-> If a target app doesn't accept a pasted path, switch to *Copy image data*.
-
-### Keyboard shortcuts
-
-- **F10** (default, configurable): show/hide the window from anywhere.
-- **ESC** while capturing a hotkey: clear the hotkey (disabled).
-- Right-click inside the search box shows a localized context menu
-  (Undo/Redo/Cut/Copy/Paste/Delete/Select All).
-
----
-
-## Data Storage & Backup
-
-```
-GIFManager/
-├── main.py                     # entry point
-├── app/                        # application code
-│   ├── main_window.py          # main window, tray, hotkey, drag & drop
-│   ├── models/
-│   │   ├── data_manager.py     # SQLite + file management, clipboard
-│   │   ├── lang_manager.py     # i18n loader (language/*.json)
-│   │   └── logger.py           # crash-safe logging
-│   ├── widgets/                # group tabs, sticker grid, settings, hotkey, ...
-│   └── theme/                  # dark / light QSS
-├── language/                   # translation files (zh_CN.json, en_US.json, ...)
-├── data/
-│   ├── emoji.db                # SQLite database (groups, emojis, columns)
-│   └── emojis/<group>/         # actual sticker files, one folder per image group
-├── logs/                       # timestamped session logs (auto-created)
-└── icon.ico                    # app & tray icon
-```
-
-**To back up your stickers, copy the whole `data/` folder** — it contains both the
-database and all sticker files. Sticker files are renamed to random 8-hex names, so
-group membership is tracked in `emoji.db`.
-
-### SQLite schema (summary)
-
-- `groups(id, name, type, sort_order, is_builtin, created_at)` — `type` is
-  `'image'` or `'text'`.
-- `emojis(id, group_id, filename, text_content, original_name, content_hash,
-  sort_order, col_index, user_sorted, created_at)` — `content_hash` enables
-  same-group deduplication and cross-group folding in the "All" view.
-
----
-
-## Settings
-
-| Category | Setting | Notes |
-| --- | --- | --- |
-| General | Language | `zh_CN` / `en_US` (auto-detected from `language/*.json`), applied instantly |
-| General | Restore last group on startup | On by default |
-| General | Launch at startup | Windows registry `Run` key |
-| General | Always on top | Window stays above others |
-| General | Theme | Dark (default) / Light |
-| General | Clear logs | Deletes all `logs/*.log` |
-| Send | Send mode | File path (recommended) / Image data |
-| Hotkey | Global hotkey | Default F10; supports combinations, mouse side buttons; ESC clears |
-| Text | Preview limits | Single-line / multi-line char caps for text sticker cards |
-| Performance | Thread count | CPU cores for thumbnails & batch import (0 = auto) |
-| About | — | Version, Agreement |
-
----
-
-## Language
-
-Translations live in `language/<code>.json`. The app scans this folder and lists every
-available language in **Settings → Language**. Adding a new language is just a matter of
-creating another JSON file with the same keys as `zh_CN.json`.
-
----
-
-## Performance Design
-
-- **Lazy rendering** — only stickers inside the visible area (±300 px buffer) are
-  materialized as widgets; the "All" view builds all cards at once but stays fluid
-  thanks to the pixmap cache.
-- **Thread-pool thumbnails** — decoding/scaling runs on a global `QThreadPool`
-  (min(cores−1, 8) by default); results are cached in a 64 MB `QPixmapCache`.
-- **Visibility-driven GIF playback** — only GIFs in the viewport (±150 px) play, capped
-  at `threads × 2` simultaneous animations; others show their first frame.
-- **Column merging** — when the window shrinks, overflowing masonry columns merge into
-  earlier ones (150 ms debounce), so cards never overlap.
-- **Batch import** — hashing + file copying are parallelized; DB inserts run in a single
-  transaction with deduplication.
-
----
-
-## Tests
-
-Automated tests live under `tests/`. All of them run **offscreen** with data and
-settings isolated in temporary directories, so they never touch your real `data/`
-folder or registry configuration.
-
-### Unit / regression tests (unittest)
+Locally:
 
 ```bash
-# Layout, "All" aggregation/deduplication, and card-overlap regression
-python -m unittest tests.test_layout -v
-
-# Masonry columns, resize merging, and drag-reorder regression
-python -m unittest tests.test_columns -v
+make build-qml      # PyInstaller onedir bundle in dist/GIFManager
 ```
 
-### Standalone scripts
+### Uploading the source
 
-Run these directly (not via unittest):
+This working directory is not a publishable tree: it carries a virtual environment (~680 MB), Rust build
+output (~376 MB), PyInstaller output and a few stray test artefacts — about 1.1 GB that should not be pushed.
+
+`make-archive.bat` produces a clean archive instead. It uses `git archive`, so only *tracked* files are
+exported, and it drops the handful of tracked files that do not belong in an upload:
+
+```bat
+make-archive.bat        :: writes GIFManager-clean.zip beside the script
+```
+
+Upload the **contents** of that zip, not the contents of this folder.
+
+---
+
+## Development
 
 ```bash
-# Pre-release full-line test: data layer + UI integration + robustness + performance;
-# writes tests/output/full_results.json and TEST_REPORT.md
-.venv/Scripts/python.exe tests/full_test.py
-
-# Stress + bug test: imports 2000 512x512 images, then measures group switching,
-# search, copy, move, delete, and text groups, and clears the group;
-# writes tests/output/results.json
-.venv/Scripts/python.exe tests/stress_test.py
-
-# Supplementary stress: complex (noise) image load + single-shot SQL/layout timing
-.venv/Scripts/python.exe tests/stress_extra.py
-
-# Quick regression script for recent fixes / new features (rerunnable)
-.venv/Scripts/python.exe tests/test_regressions.py
+make check          # environment, layering, style, translations, unit tests
+make smoke          # the smoke suite (needs a Qt build; runs offscreen)
+make run-qml        # run the interface from source
 ```
 
-> Note: `full_test.py`, `stress_test.py`, and `stress_extra.py` generate hundreds to
-> thousands of images and may take minutes — they are meant for release validation,
-> not for every local edit.
+The check suite is not decoration — CI runs it before anything is packaged:
+
+| Check | What it refuses |
+|---|---|
+| `tools/check_layers.py` | a `core` module importing Qt, or front-end logic leaking downwards |
+| `tools/check_style.py` | lines over 100 columns, tabs, trailing whitespace, comments that are not bilingual |
+| `tools/sync_language_keys.py` | a translation table missing a key another table has |
+| `tools/check_batch_encoding.py` | a `.bat` that is not pure ASCII with CRLF endings |
+| `tests/smoke_*.py` | a broken import, a blank window, an animation that never advances |
+
+`CONTRIBUTING.md` documents the comment and naming conventions those checks enforce.
 
 ---
 
-## Troubleshooting
+## License and credits
 
-- **Hotkey registration failed** — another program already owns that key combination.
-  Pick another hotkey in Settings.
-- **Pasting a "file path" doesn't work in some app** — switch to *Copy image data* in
-  Settings → Send.
-- **Import seems to skip files** — files identical to existing ones in the same group
-  are skipped as duplicates on purpose.
-- **GIF doesn't animate** — playback is limited to visible GIFs for performance; scroll
-  it into view and it will start playing.
+**MIT** — see [LICENSE](LICENSE). Use it, fork it, ship it.
 
----
-
-## License
-
-[MIT](LICENSE) © 2026 LwoSnow
+- **HarmonyOS Sans SC** is bundled under `resources/fonts/` and redistributed under the terms of its own font
+  licence.
+- The component design follows the ideas in [SWB-QML-UI](https://github.com/xxmzwf/SWB-QML-UI) (MIT) and the
+  shadcn aesthetic, ported to QML rather than linked, because PySide6 ships no Qt CMake package.
+- The interaction details — press feedback, interruptible motion, contrast-as-state, optical type — come from
+  Apple's *Designing Fluid Interfaces* and Emil Kowalski's writing on interface polish.

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metadata for the Flatpak build.
+
+  Without a metainfo file `flatpak build-finish` warns and the application appears in software centres with
+  no name, no summary and no icon - which looks like a broken package rather than a missing file. Only the
+  fields that are actually known are filled in; inventing screenshots or a changelog would be worse than
+  omitting them.
+  Flatpak 构建所需的 AppStream 元数据。
+
+  缺少 metainfo 文件时 `flatpak build-finish` 会警告，而应用在软件中心里没有名称、没有摘要、没有图标——
+  那看起来像包坏了，而不是少了一个文件。这里只填写确实已知的字段；编造截图或更新日志比省略更糟。
+-->
+<component type="desktop-application">
+  <id>org.lwosnow.GIFManager</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <name>GIFManager</name>
+  <summary>Emoji, sticker and animated GIF manager</summary>
+  <summary xml:lang="zh-CN">表情包、贴纸与动图管理器</summary>
+  <description>
+    <p>
+      Organise emoji, stickers and animated GIFs into groups, then send them to any application through the
+      clipboard. The library is a local SQLite database; nothing leaves the machine.
+    </p>
+    <p xml:lang="zh-CN">
+      把表情包、贴纸与动图整理成分组，再通过剪贴板发送到任意应用。素材库是本地 SQLite 数据库；没有任何
+      数据离开这台机器。
+    </p>
+  </description>
+  <launchable type="desktop-id">org.lwosnow.GIFManager.desktop</launchable>
+  <url type="homepage">https://github.com/LwoSnow/GIFManager</url>
+  <url type="bugtracker">https://github.com/LwoSnow/GIFManager/issues</url>
+  <developer_name>LwoSnow</developer_name>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="__VERSION__" date="__DATE__"/>
+  </releases>
+</component>

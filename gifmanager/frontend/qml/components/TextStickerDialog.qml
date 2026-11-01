@@ -154,17 +154,21 @@ UiDialog {
             Layout.preferredHeight: 120
             clip: true
             TextArea {
+
+    // No context menu: see `UiTextField` for why. Only right clicks are taken, so editing and
+    // selection are untouched.
+    // 不显示上下文菜单：理由见 `UiTextField`。只接管右键，因此编辑与选择不受影响。
+    MouseArea {
+        anchors.fill: parent
+        acceptedButtons: Qt.RightButton
+        onPressed: function (mouse) { mouse.accepted = true }
+    }
+
                 id: editor
                 wrapMode: TextArea.Wrap
                 selectByMouse: true
                 color: theme.text
                 font.pixelSize: theme.fontSizeBody
-                background: Rectangle {
-                    color: theme.surfaceAlt
-                    border.color: editor.activeFocus ? theme.accent : theme.border
-                    border.width: 1
-                    radius: theme.radius
-                }
                 // Ctrl+Enter saves, Enter inserts a newline: a text sticker may
                 // legitimately be several lines, so Enter cannot be the submit key.
                 // Ctrl+Enter 保存，Enter 插入换行：文字贴纸合理情况下可能有多行，因此 Enter

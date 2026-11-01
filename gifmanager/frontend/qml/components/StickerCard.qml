@@ -93,6 +93,11 @@ Item {
     signal sweepApply(int stickerId)
     signal sweepEnd()
 
+    // Scene position of the pointer while a sweep is running. The page converts it into grid
+    // coordinates and hit-tests, which is what makes the sweep follow the pointer 1:1 across cells.
+    // 扫选运行时指针的场景坐标。页面把它换算成网格坐标并做命中测试——这正是让扫选跨单元格"跟手"的原因。
+    signal sweepAt(real sceneX, real sceneY)
+
     // The item scene coordinates are expressed in. Set by the page to its window.
     // 场景坐标所基于的元素。由页面设为其窗口。
     property Item positionRoot: null
@@ -103,6 +108,41 @@ Item {
     // 本卡片是否在播放动画而非显示静态图。由 `registerAnimation` 设置，它向动画器询问
     // 该贴纸是否有帧。
     property bool animated: false
+
+    // The stickers the PAGE says are on screen, as an id list.
+    //
+    // # Why a list rather than a geometric test
+    //
+    // Registration used to follow this item's `visible` property, assuming `GridView` hides delegates
+    // that scroll out of sight. Measured with 60 GIF stickers and about 32 on screen: ALL 60 stayed
+    // registered. Once the registry exceeds the animator's cap ("the last N registrations advance"),
+    // the winners are the most recently bound cards - and while scrolling down those are the ones
+    // entering at the BOTTOM, so the cards above the fold froze. That is the report: "at two thirds
+    // down, only the lower half animates".
+    //
+    // A geometric test from the card side could not replace it: the view positions delegates through an
+    // internal wrapper, so every delegate item reported `y == 0` in measurement. The page, however, can
+    // compute the visible index range arithmetically from `contentY`, `cellHeight` and its column count
+    // - which is the same arithmetic its hit test already relies on.
+    //
+    // 页面认为在屏幕上的贴纸，以 id 列表给出。
+    //
+    // # 为什么用列表而不是几何判断
+    //
+    // 注册过去跟随本元素的 `visible` 属性，假设 `GridView` 会隐藏滚出视野的委托。用 60 个 GIF、屏幕内
+    // 约 32 个实测：全部 60 个保持注册。一旦注册数超过动画器上限（"最后 N 个注册允许推进"），胜出的是
+    // 最近绑定的卡片——而向下滚动时那正是从"底部"进入的，于是折线以上的卡片被冻住。这正是用户报告：
+    // "滚到三分之二处，只有下半部分在动"。
+    //
+    // 从卡片一侧做几何判断替代不了它：视图通过内部包装器定位委托，实测每个委托项的 `y` 都报告为 0。
+    // 而页面可以按 `contentY`、`cellHeight` 与列数用算术算出可见索引区间——那正是它的命中测试已经在用的
+    // 同一套算术。
+    property var activeIds: []
+
+    readonly property bool inViewport: card.activeIds === undefined
+                                       || card.activeIds === null
+                                       ? card.visible
+                                       : card.activeIds.indexOf(card.stickerId) >= 0
 
     // Managed by the MouseArea's enter/exit; a binding to containsMouse would be
     // re-evaluated at moments the overlay cannot track.
@@ -185,8 +225,8 @@ Item {
                                          ? card.app.previewUrlFor(card.path, card.cardSize)
                                          : ""
 
-    onVisibleChanged: {
-        if (visible)
+    onInViewportChanged: {
+        if (inViewport)
             registerAnimation()
         else
             releaseAnimation()
@@ -194,12 +234,12 @@ Item {
 
     onStickerIdChanged: {
         releaseAnimation()
-        if (visible)
+        if (inViewport)
             registerAnimation()
     }
 
     Component.onDestruction: releaseAnimation()
-    Component.onCompleted: if (visible) registerAnimation()
+    Component.onCompleted: if (inViewport) registerAnimation()
 
     // Image mode: square cell. Text mode: the column's width, and the height
     // follows the content (the label below measures itself).
@@ -237,7 +277,7 @@ Item {
                : hoverArea.containsMouse ? theme.cardHover
                : theme.card
         border.width: card.isSelected ? 2 : 1
-        border.color: card.isSelected ? theme.accent
+        border.color: card.isSelected ? theme.textMuted
                       : hoverArea.containsMouse ? theme.borderHover
                       : (card.isText ? theme.border : "transparent")
         // Clips the scaled thumbnail to the card, so the hover zoom enlarges
@@ -341,9 +381,9 @@ Item {
             height: 18
             radius: 9
             visible: card.editMode
-            color: card.isSelected ? theme.accent : "transparent"
+            color: card.isSelected ? theme.uiColors.selected : "transparent"
             border.width: 2
-            border.color: card.isSelected ? theme.accent : "#8A8A8A"
+            border.color: card.isSelected ? theme.uiColors.selected : theme.borderStrong
         }
     }
 
@@ -368,6 +408,20 @@ Item {
         hoverEnabled: true
         acceptedButtons: Qt.LeftButton | Qt.RightButton
         cursorShape: Qt.PointingHandCursor
+
+        // Hold the gesture for its whole duration while editing.
+        //
+        // Without this the press was implicitly released to whatever sat under the
+        // pointer as soon as it left the card, so a sweep died at the first cell boundary
+        // - and the moves it lost arrived nowhere, which is why the selection lagged and
+        // eventually stopped. Off in normal mode so the grid can still be dragged to
+        // scroll.
+        // 编辑时在整个手势期间持有事件。
+        //
+        // 缺了它，指针一离开卡片，按下就被隐式交还给指针下的其他元素，于是扫选在第一个
+        // 单元格边界就断掉——而它丢失的那些移动没有到达任何地方，这就是选择会迟滞并最终停住的
+        // 原因。普通模式下关闭，使网格仍能通过拖拽滚动。
+        preventStealing: card.editMode
 
         // Named so a check can find the interactive area of a card and deliver real mouse events
         // to it. Without a name there is no way to test selection at all: `findChildren(QObject)`
@@ -412,13 +466,18 @@ Item {
         }
 
         onPositionChanged: function (mouse) {
-            // NO sweep handling here. The page's overlay owns the sweep once it has started,
-            // because this `MouseArea` stops receiving moves the moment the cursor crosses into a
-            // neighbour (measured in `tests/probe_drag_delivery.py`). Two drivers would apply the
-            // latch twice per card and fight over which card is "current".
-            // 此处"不"处理扫选。扫选一旦开始就由页面的覆盖层拥有，因为光标一进入邻卡，本
-            // `MouseArea` 就不再收到移动（`tests/probe_drag_delivery.py` 实测）。两个驱动会对每张
-            // 卡片应用两次锁定值，并为"哪张是当前卡片"相互竞争。
+            // In edit mode the pointer belongs to the sweep, and this card OWNS the gesture (see
+            // `preventStealing`), so every move is reported to the page as a scene position. The page
+            // hit-tests the grid, which is what makes a sweep cross cells without this item ever
+            // knowing which card it is over.
+            // 编辑模式下指针属于扫选，而本卡片"持有"该手势（见 `preventStealing`），因此每一次移动都以
+            // 场景坐标报给页面。页面负责在网格上命中测试——这正是让扫选能跨单元格、而本元素无需知道
+            // 自己正压在哪个卡片上的原因。
+            if (card.editMode && pressed) {
+                var sweepPoint = card.scenePoint(mouse.x, mouse.y)
+                card.sweepAt(sweepPoint.x, sweepPoint.y)
+                return
+            }
             if (!pressed || !card.reorderEnabled)
                 return
             var dx = mouse.x - pressPoint.x

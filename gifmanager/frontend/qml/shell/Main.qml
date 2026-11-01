@@ -347,8 +347,15 @@ ApplicationWindow {
                     // `theme.surfaceHover`.
                     // 用 ghost，使悬停底色来自设计令牌，而不是手工混出的 `theme.surfaceHover`。
                     variant: "ghost"
-                    ToolTip.visible: hovered
-                    ToolTip.text: bridge.trE("settings", bridge.languageEpoch)
+                    // An explicit `UiToolTip`, not the attached `ToolTip.*` form: the attached one is
+                    // drawn by `QtQuick.Controls.Basic` and kept its own frame regardless of the
+                    // application palette.
+                    // 显式的 `UiToolTip`，而非附加属性 `ToolTip.*`：附加形式由
+                    // `QtQuick.Controls.Basic` 绘制，无论应用调色板如何都保留着它自己的边框。
+                    UiToolTip {
+                        text: bridge.trE("settings", bridge.languageEpoch)
+                        visible: settingsButton.hovered
+                    }
                     onClicked: shell.openSettings()
 
                     contentItem: Item {
@@ -461,7 +468,6 @@ ApplicationWindow {
                 elide: Text.ElideRight
                 width: parent.width - 2 * theme.spacingLoose
                        - (editBar.visible ? editBar.width : 0)
-                       - (importBar.visible ? importBar.width : 0)
             }
 
             // The bar itself, drawn UNDER the label's text so the numbers stay readable on top
@@ -473,11 +479,25 @@ ApplicationWindow {
                 anchors.leftMargin: theme.spacingLoose
                 anchors.verticalCenter: parent.verticalCenter
                 height: 3
-                width: (statusLabel.width) * Math.max(0.0, Math.min(1.0,
-                                                                  bridge.importer
-                                                                  ? bridge.importer.fraction : 0.0))
+                // The BAR's width, not `statusLabel.width`.
+                //
+                // It used to be `statusLabel.width * fraction` while `statusLabel.width` subtracted
+                // `importBar.width` - each depended on the other, and Qt reported
+                // `QML QQuickRectangle: Binding loop detected for property "width"` the moment an
+                // import started. Sizing the fill to the bar breaks the cycle: the label no longer
+                // needs to exclude it, because the fill is drawn UNDER the text rather than beside it.
+                // 用"状态栏"的宽度，而不是 `statusLabel.width`。
+                //
+                // 它过去是 `statusLabel.width * fraction`，而 `statusLabel.width` 又减去了
+                // `importBar.width`——两者互相依赖，导入一开始 Qt 就报
+                // `QML QQuickRectangle: Binding loop detected for property "width"`。让填充按状态栏定宽
+                // 打破这个循环：标签不再需要排除它，因为填充画在文字"下方"而不是旁边。
+                width: Math.max(0, parent.width - 2 * theme.spacingLoose)
+                       * Math.max(0.0, Math.min(1.0,
+                                                bridge.importer
+                                                ? bridge.importer.fraction : 0.0))
                 visible: bridge.importer ? bridge.importer.running : false
-                color: theme.accent
+                color: theme.uiColors.foreground
                 radius: 2
                 z: -1
             }
@@ -498,7 +518,19 @@ ApplicationWindow {
 
                 component EditButton: Button {
                     id: editBtn
-                    height: 22
+                    // Derived from the status bar's height, then reduced.
+                    //
+                    // The bar is `theme.statusHeight` (26) tall. Filling it exactly made the buttons
+                    // look TALLER than the strip they sit in - the bar's 1px top border plus the row's
+                    // own padding left them visually overflowing the bottom. Five pixels off brings
+                    // their bottom edge in line with the bar's and keeps them reading as a segment of
+                    // the bar rather than as pills resting on it.
+                    // 由状态栏高度推导，再加以缩减。
+                    //
+                    // 条高是 `theme.statusHeight`（26）。完全填满会让按钮看起来"高于"它们所在的条——条的
+                    // 1px 顶边框加上该行自身的留白，使它们在视觉上溢出下缘。减五个像素让下缘与条对齐，并使
+                    // 它们读作条的一段，而不是搁在条上的药丸。
+                    height: theme.statusHeight - 7
                     flat: true
 
                     background: Rectangle {
@@ -522,8 +554,30 @@ ApplicationWindow {
                 }
 
                 EditButton {
-                    text: bridge.trE("edit_select_all", bridge.languageEpoch)
-                    onClicked: bridge.stickers.selectAll()
+                    id: selectAllButton
+
+                    // "全选" becomes "取消全选" once everything is selected.
+                    //
+                    // The label is derived from a notifying count rather than from `bridge.allSelected()`
+                    // : a binding that CALLS a method has no dependency to re-evaluate on, so the label
+                    // would be computed once and never change - the same defect that left the settings
+                    // shortcut preview stale. `count` and `selectedCount` both notify through
+                    // `countChanged`, which every selection change emits.
+                    // 全选之后"全选"变成"取消全选"。
+                    //
+                    // 文案由"带通知"的计数推导，而不是 `bridge.allSelected()`：调用方法的绑定没有可依赖的
+                    // 求值依据，因此文案只会算一次、永不改变——正是让设置里的快捷键预览过期的同一个缺陷。
+                    // `count` 与 `selectedCount` 都通过 `countChanged` 发出通知，而每次选择变化都会发出它。
+                    readonly property bool everythingSelected: bridge.stickers.count > 0
+                                                              && bridge.stickers.selectedCount
+                                                                 >= bridge.stickers.count
+
+                    text: everythingSelected
+                          ? bridge.trE("edit_deselect_all", bridge.languageEpoch)
+                          : bridge.trE("edit_select_all", bridge.languageEpoch)
+                    // `bridge.selectAll()` toggles (select all / clear), matching the label above it.
+                    // 调用 `bridge.selectAll()` 做切换（全选/清空），与它上方的文案一致。
+                    onClicked: bridge.selectAll()
                 }
                 EditButton {
                     text: bridge.trE("edit_delete", bridge.languageEpoch)

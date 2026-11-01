@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=GIFManager
+GenericName=Emoji and Sticker Manager
+Comment=Send emoji, stickers and animated GIFs to any application
+Keywords=emoji;sticker;gif;gifmanager;
+Exec=gifmanager
+Icon=org.lwosnow.GIFManager
+Terminal=false
+Categories=Utility;
+StartupNotify=true
+StartupWMClass=gifmanager
+X-GNOME-UsesNotifications=true

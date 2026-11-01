@@ -55,12 +55,14 @@ def make_animated_gif(path, frames=6, size=64, delay_ms=80):
 
 
 def main():
+    from PySide6.QtGui import QImage
     from PySide6.QtWidgets import QApplication
 
     from gifmanager.backend import MemorySettingsStore, create_backend
+    from gifmanager.frontend.qml import animator
     from gifmanager.frontend.qml import app as qml_app
-    from gifmanager.frontend.qt.bridge import BackendAdapter
     from gifmanager.frontend.qt import animation
+    from gifmanager.frontend.qt.bridge import BackendAdapter
 
     application = qml_app.build_application([])
     problems = []
@@ -235,11 +237,191 @@ def main():
             if len(keys) < 2:
                 problems.append("frameKey never changed, so the card would show one frame")
 
+            # Unregistering must also release the store PIN.
+            #
+            # `register` is called again on every delegate re-bind, so an unconditional pin leaked
+            # one
+            # reference per call while `unregister` released one - the animation count returned to
+            # zero
+            # while paths stayed pinned forever, which quietly disables the eviction budget.
+            # 注销也必须释放存储的固定。
+            #
+            # 委托每次重新绑定都会再次调用 `register`，因此无条件的 pin 每次调用泄漏一个引用，而
+            # `unregister` 只释放一个——动画计数回到零，路径却永久被固定，使淘汰预算悄悄失效。
+            # Re-register the SAME card, the way a delegate re-bind does. This is what turned the
+            # original pin into a leak: `register` pinned unconditionally while `unregister`
+            # released
+            # exactly one reference, so N re-binds left N-1 pins behind for ever. A test that
+            # registers
+            # only once cannot see that, which is why this calls it again deliberately.
+            # 重新注册"同一张"卡片，模拟委托重新绑定。这正是把固定变成泄漏的原因：`register` 无条件
+            # 固定，而 `unregister` 只释放一个引用，因此 N 次重绑会永久留下 N-1 个固定。只注册一次的
+            # 测试看不到这一点，所以这里刻意再调一次。
+            bridge.animator.register(sticker_id, path)
+            bridge.animator.register(sticker_id, path)
+            application.processEvents()
+            pinned_while_registered = len(animator.STORE._pin_counts)
+            print(f"  pins while registered   : {pinned_while_registered}")
+            if pinned_while_registered != 1:
+                problems.append(
+                    f"{pinned_while_registered} pins for ONE playing card; re-registering must be "
+                    f"idempotent or every delegate re-bind leaks a reference that can never be "
+                    f"released")
             bridge.animator.unregister(sticker_id)
+            settle = time.monotonic() + 0.3
+            while time.monotonic() < settle:
+                application.processEvents()
+                time.sleep(0.01)
+            leaked = len(animator.STORE._pin_counts)
+            print(f"  pinned after unregister : {leaked}")
+            if leaked:
+                problems.append(
+                    f"{leaked} pin(s) survived unregister, so those paths can never be evicted")
             bridge.detach()
             del engine
         finally:
             backend.close()
+
+    # ---- 5. a PLAYING animation survives eviction pressure -----------------
+    # ---- 5. 正在播放的动画在淘汰压力下存活 --------------------------------
+    #
+    # This is the regression guard for the warning flood reported while scrolling fast:
+    #
+    #     QML QQuickImage: Failed to get image from provider: image://gifframes/...
+    #
+    # Eviction is "oldest stored first", but a playing card keeps requesting frame N and never
+    # re-`put`s anything, so it was the best eviction candidate precisely while it was still on
+    # screen.
+    # Once its frames were gone every request returned a null image, one warning per frame per card.
+    # 这是"快速滚动时大量警告"的回归保护：
+    #
+    #     QML QQuickImage: Failed to get image from provider: image://gifframes/...
+    #
+    # 淘汰策略是"最久未被存入者先出"，但播放中的卡片会一直请求第 N 帧、从不再 `put` 任何东西，因此它
+    # 恰好会在仍处于屏幕上时成为最优先的淘汰对象。帧一旦消失，每次请求都返回空图像，每张卡片每帧一条警告。
+    print()
+    print("==== 5. pinning a playing animation ====")
+    store = animator.FrameStore(pixel_budget=2 * 100 * 100)
+
+    def frames_for():
+        image = QImage(100, 100, QImage.Format.Format_ARGB32)
+        image.fill(0xFF202020)
+        return [image]
+
+    playing = os.path.join(tempfile.mkdtemp(), "playing.gif")
+    scrolled = os.path.join(tempfile.mkdtemp(), "scrolled.gif")
+    arriving = os.path.join(tempfile.mkdtemp(), "arriving.gif")
+
+    store.put(playing, frames_for())
+    store.pin(playing)
+    store.put(scrolled, frames_for())
+    # A third animation arrives while scrolling; the budget holds two, so one is evicted.
+    # 滚动期间第三个动画到达；预算只装得下两个，因此有一个被淘汰。
+    store.put(arriving, frames_for())
+
+    print(f"  pinned survived    : {store.has(playing)}")
+    print(f"  unpinned evicted   : {not store.has(scrolled)}")
+    if not store.has(playing):
+        problems.append(
+            "a PINNED (still playing) animation was evicted under budget pressure, so its card "
+            "will request frames the store no longer has - that is the null-image warning flood")
+    if store.has(scrolled):
+        problems.append(
+            "an unpinned animation was kept while a newer one was stored, so eviction stopped "
+            "respecting the budget")
+
+    # Reference counting: two cards on one file, one leaving must not unpin it.
+    # 引用计数：两张卡片显示同一文件，其中一张离开不得解除固定。
+    store.pin(arriving)
+    store.pin(arriving)
+    store.unpin(arriving)
+    print(f"  refcount holds     : {store.pinned(arriving)}")
+    if not store.pinned(arriving):
+        problems.append(
+            "unpinning one of two references made the path evictable while another card still "
+            "plays it")
+    store.unpin(arriving)
+
+    # ---- 6. the decode queue must drop stale work and prefer the newest ----
+    # ---- 6. 解码队列必须丢弃陈旧任务并优先最新 ----------------
+    #
+    # The pool has two threads, and a fast scroll through a large library queues a decode for every
+    # card
+    # that passes. Under FIFO the cards that are on screen RIGHT NOW sat behind work for rows the
+    # user had
+    # already passed, which is the "1000 stickers, nothing animates for a long time" worry. Two
+    # properties
+    # are asserted here: a job nobody wants any more must not decode at all, and a job that had to
+    # wait
+    # must run newest-first.
+    # 线程池只有两个线程，而在大素材库里快速滚动会为每张经过的卡片排入一次解码。FIFO 下"此刻在屏幕上"
+    # 的卡片排在用户早已滚过的那些行之后，这正是"1000 张贴纸时很久都不渲染"的担忧。这里断言两个性质：
+    # 已经没有谁需要的任务不得解码，以及排过队的任务必须"最新优先"。
+    print()
+    print("==== 6. the decode queue ====")
+    import threading
+
+    real_decode = animation.decode_all
+    lock = threading.Lock()
+    calls = []
+
+    def fake_decode(path, pixels):
+        with lock:
+            calls.append(path)
+        time.sleep(0.05)
+        return None
+
+    try:
+        animation.decode_all = fake_decode
+
+        stale = animator._FrameDecoder()
+        drained = []
+        stale.ready.connect(lambda path: drained.append(path))
+        for name in ("s1.gif", "s2.gif", "s3.gif"):
+            stale.submit(name, 64, lambda path: False)
+        stale._pool.waitForDone(5000)
+        # `ready` is a QUEUED signal, so it only reaches the lambda once the event loop runs.
+        # `ready` 是"队列"信号，因此只有在事件循环运行后才会到达 lambda。
+        settle = time.monotonic() + 0.4
+        while time.monotonic() < settle:
+            application.processEvents()
+            time.sleep(0.01)
+        with lock:
+            stale_calls = list(calls)
+        print(f"  stale decoded      : {len(stale_calls)}")
+        print(f"  stale ready fired  : {len(drained)}")
+        if stale_calls:
+            problems.append(
+                f"stale decode jobs still ran ({stale_calls}), so a scroll-away holds "
+                f"the two workers for hundreds of milliseconds each")
+        if len(drained) != 3:
+            problems.append(
+                f"a dropped job fired {len(drained)} ready signals for 3 jobs; the "
+                f"pending set would never clear and the path could never be queued again")
+
+        with lock:
+            calls.clear()
+        order = []
+
+        def ordered_decode(path, pixels):
+            with lock:
+                order.append(path)
+            time.sleep(0.05)
+            return None
+
+        animation.decode_all = ordered_decode
+        fresh = animator._FrameDecoder()
+        fresh._pool.setMaxThreadCount(1)
+        for name in ("first.gif", "second.gif", "third.gif", "fourth.gif"):
+            fresh.submit(name, 64, lambda path: True)
+        fresh._pool.waitForDone(5000)
+        print(f"  decode order       : {order}")
+        if order[:1] != ["first.gif"]:
+            problems.append(f"the first submission should start at once, got {order}")
+        if order[1:] != ["fourth.gif", "third.gif", "second.gif"]:
+            problems.append(f"queued jobs are not newest-first: {order[1:]}")
+    finally:
+        animation.decode_all = real_decode
 
     print()
     if problems:
@@ -249,8 +431,8 @@ def main():
         return 1
     print("ANIMATION CHECK OK / 动画检查通过")
     print("  the decoder produces multiple frames, the animator serves each one by key,")
-    print("  and the index and key both advance")
-    print("  解码器产出多帧、动画器按键提供每一帧，且序号与键都会推进")
+    print("  the index and key both advance, and a playing animation is not evicted")
+    print("  解码器产出多帧、动画器按键提供每一帧、序号与键都会推进，且正在播放的动画不会被淘汰")
     return 0
 
 

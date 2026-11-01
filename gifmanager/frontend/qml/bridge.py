@@ -102,6 +102,50 @@ def _group_error_key(error):
     return mapping.get(str(error).strip().lower(), "group_rename_failed")
 
 
+class _HotkeyCaptureFilter(QObject):
+    # The application-wide key sink used while the settings window is recording a shortcut.
+    #
+    # Lives at module level rather than inside `beginHotkeyCapture` so it is a stable class: a
+    # filter
+    # defined inside a method is a fresh type on every call, which makes it impossible to compare
+    # and
+    # therefore impossible to be sure `removeEventFilter` targets the same object that was
+    # installed.
+    # 设置窗口录制快捷键期间使用的应用级按键接收器。
+    #
+    # 放在模块级而不是 `beginHotkeyCapture` 内部，是为了得到一个稳定的类：在方法内定义的过滤器每次
+    # 调用都是新类型，因而无法比较，也就无法保证 `removeEventFilter` 移除的是当初安装的那个对象。
+
+    def __init__(self, bridge):
+        super().__init__()
+        self._bridge = bridge
+
+    def eventFilter(self, obj, event):
+        from PySide6.QtCore import QEvent
+
+        if event.type() not in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+            return False
+        bridge = self._bridge
+        if not bridge._hotkey_field:
+            # Not armed: let everything through untouched.
+            # 未处于待捕获：一切原样通过。
+            return False
+        try:
+            if event.type() == QEvent.Type.KeyPress:
+                return bridge._capture_hotkey_event(event)
+            # While armed, key RELEASES are swallowed too. Otherwise the release of the very key
+            # that
+            # was just captured would reach whatever has focus and could activate a button.
+            # 待捕获期间，按键"释放"也一并吞掉。否则刚被捕获的那个键的释放事件会到达持有焦点者，
+            # 并可能激活某个按钮。
+            return True
+        except RuntimeError:
+            # The bridge was destroyed while the filter was still installed (window closed during a
+            # capture). Drop the filter rather than raising into Qt's event loop.
+            # 过滤器仍在安装状态时桥被销毁（捕获期间关闭了窗口）。丢弃过滤器，而不是向 Qt 事件循环抛出。
+            return False
+
+
 class BackendBridge(QObject):
     # Application state exposed to QML: navigation, the current view's data, the
     # status line, and the commands a menu or a palette can invoke.
@@ -157,6 +201,10 @@ class BackendBridge(QObject):
         # The Alt+wheel window filter, installed once with the root window.
         # 随根窗口安装一次的 Alt+滚轮过滤器。
         self._alt_wheel_filter = None
+        # Hotkey capture state: the armed field name and the installed event filter.
+        # 热键捕获状态：处于待捕获的字段名与已安装的事件过滤器。
+        self._hotkey_field = ""
+        self._hotkey_filter = None
         # Bumped on every language change; QML `trE` bindings read it as their
         # retranslation dependency.
         # 每次语言变更自增；QML 的 `trE` 绑定将其读取为重翻译依赖。
@@ -611,6 +659,22 @@ class BackendBridge(QObject):
     hideWindowRequested = Signal()
     openSettingsRequested = Signal()
 
+    # Hotkey capture, for the settings window's shortcut field.
+    #
+    # `hotkeyCaptured(field, text)` carries the STORED value so the field can display exactly what
+    # was
+    # recorded instead of re-deriving it; `hotkeyCaptureEnded` lets the field drop its armed styling
+    # whether the capture succeeded, was cancelled with Escape, or ended because the window was
+    # closed
+    # mid-capture.
+    # 热键捕获，供设置窗口的快捷键字段使用。
+    #
+    # `hotkeyCaptured(field, text)` 携带"已存储"的值，使字段显示实际记录的内容而不是重新推导；
+    # `hotkeyCaptureEnded` 让字段撤掉"已就绪"样式——无论捕获成功、被 Escape 取消，还是因为窗口在
+    # 捕获中途关闭而结束。
+    hotkeyCaptured = Signal(str, str)
+    hotkeyCaptureEnded = Signal()
+
     @Slot()
     def copySelectionRequested(self):
         # The tray's "copy" entry.
@@ -677,6 +741,21 @@ class BackendBridge(QObject):
                 # 调色板必须跟随主题，否则 Basic 绘制的控件（提示框、对话框内部件）
                 # 会保留上一套。
                 self.apply_theme_palette()
+            if "hotkey" in fields:
+                # Re-register the global shortcut the moment it is committed.
+                #
+                # `reapplyHotkey` existed but NOTHING called it, so a changed shortcut was written
+                # to
+                # the settings file and then ignored for the rest of the session: the old key kept
+                # working (it was still the one registered) and the new one never did, which reads
+                # as
+                # "changing the hotkey has no effect". Applying it here is the missing link.
+                # 在提交的那一刻重新注册全局快捷键。
+                #
+                # `reapplyHotkey` 存在，却"没有任何地方"调用它，因此改动后的快捷键被写进设置文件后在本
+                # 次会话里被忽略：旧键继续有效（注册的仍是它），新键永不生效，读起来就是"改快捷键没用"。
+                # 在此应用它就是缺失的那一环。
+                self.reapplyHotkey()
             if "language" in fields:
                 self._adapter.set_language(self._adapter.settings.language)
             # `_apply_animation_settings` pushes the render-mode cap into the animator.
@@ -1259,7 +1338,18 @@ class BackendBridge(QObject):
         scaled = max(minimum, min(maximum, current + float(delta) * CARD_SCALE_STEP))
         if scaled == current:
             return
-        self._settings_model.setValue("card_scale", round(scaled * 100))
+        # Commit the step IMMEDIATELY, not just buffer it.
+        #
+        # `setValue` only stages a draft for the settings dialog's 应用 button, so the old code
+        # adjusted a value that nothing ever applied: the grid reads the APPLIED setting, saw no
+        # change, and the gesture looked completely dead. `commitValue` coerces and applies this one
+        # field without disturbing any other draft.
+        # 立即提交这一步，而不只是暂存。
+        #
+        # `setValue` 只为设置对话框的"应用"按钮暂存草稿，因此旧代码调整了一个从未被应用的值：网格读的
+        # 是"已应用"的设置，看不到变化，手势看起来完全失效。`commitValue` 只强制转换并应用这一个字段，
+        # 不打扰任何其他草稿。
+        self._settings_model.commitValue("card_scale", round(scaled * 100))
 
     @Slot(int, str, result=bool)
     def renameSticker(self, sticker_id, new_name):
@@ -1657,7 +1747,38 @@ class BackendBridge(QObject):
 
     @Slot()
     def selectAll(self):
-        self._stickers.selectAll()
+        # A TOGGLE, exactly like the original's `_edit_select_all`.
+        #
+        # `target = selection_count() < len(data)`: if everything is already selected, clear;
+        # otherwise select everything. Selecting unconditionally made the button one-way - pressing
+        # it
+        # twice left the user fully selected with no way back through the same control.
+        #
+        # The comparison is against the WHOLE current data set, not the visible cards, for the
+        # reason
+        # the original documents: a lazily-built grid only materialises the visible band, so
+        # counting
+        # cards would clear the selection while the user is looking at a partially-scrolled list and
+        # believe they had selected everything.
+        # 与原版 `_edit_select_all` 完全一致的"切换"。
+        #
+        # `target = selection_count() < len(data)`：若已全选则清空，否则全选。无条件全选会让按钮变成
+        # 单向的——按两次之后用户处于全选状态，却无法通过同一个控件回去。
+        #
+        # 比较的是"整个"当前数据集而不是可见卡片，理由与原版所述相同：懒构建的网格只物化可见区间，按卡片
+        # 计数会在用户看着滚动到一半的列表时清空选择，而用户以为自己已全选。
+        total = self._stickers.count
+        if total and self._stickers.selectedCount < total:
+            self._stickers.selectAll()
+        else:
+            self._stickers.clearSelection()
+
+    @Slot(result=bool)
+    def allSelected(self):
+        # Whether every item in the current set is selected, so the button can label itself.
+        # 当前集合是否已全部选中，使按钮能自我标注。
+        total = self._stickers.count
+        return bool(total) and self._stickers.selectedCount >= total
 
     @Slot()
     def clearSelection(self):
@@ -1817,6 +1938,182 @@ class BackendBridge(QObject):
         from gifmanager.frontend.qt.widgets.hotkey_capture import key_from_qt
 
         return key_from_qt(qt_key) or ""
+
+    # ---- hotkey capture / 热键捕获 --------------------------------------
+    #
+    # # Why the capture lives in Python instead of in `Keys.onPressed`
+    #
+    # The QML version required the `TextField` to hold ACTIVE focus. Inside a `Loader` inside a
+    # `Repeater`, a field that is `readOnly` and only gets focus from an overlay `MouseArea`
+    # frequently
+    # does not have it at the moment a key arrives - the click focuses the overlay, the window loses
+    # activation, or focus moves on the next repaint. The result was the reported symptom: pressing
+    # a
+    # key changed nothing, with no error anywhere.
+    #
+    # An application-wide event filter has no such dependency: while the field is armed, EVERY key
+    # press in the process is seen, which is also what makes modifier combinations reliable - the
+    # filter reads `event.modifiers()` from the same event that carries the key, so Ctrl+Shift+F9 is
+    # one atom rather than three key presses racing each other.
+    #
+    # The extra keys are swallowed (returning True) only while armed, so arming cannot leak
+    # keystrokes
+    # into the rest of the interface.
+    #
+    # 捕获放在 Python 而不是 `Keys.onPressed` 里。
+    #
+    # # 为什么捕获放在 Python 而不是 `Keys.onPressed`
+    #
+    # QML 版本要求 `TextField` 持有"活动焦点"。在 `Repeater` 内的 `Loader` 里，一个 `readOnly` 且只能
+    # 通过覆盖的 `MouseArea` 获得焦点的字段，在按键到达时经常并没有焦点——点击把焦点给了覆盖层、窗口
+    # 失去激活、或焦点在下一次重绘时移走。结果就是用户报告的症状：按键毫无变化，且任何地方都没有报错。
+    #
+    # 应用级事件过滤器没有这个依赖：字段处于"待捕获"状态时，进程里的"每一次"按键都会被看到，这也正是
+    # 修饰键组合可靠的原因——过滤器从携带按键的"同一个事件"读取 `event.modifiers()`，因此 Ctrl+Shift+F9
+    # 是一个原子操作，而不是三次互相竞争的按键。
+    #
+    # 只有在待捕获期间才吞掉按键（返回 True），因此"待捕获"不会把击键泄漏到界面其余部分。
+
+    @Slot(str)
+    def beginHotkeyCapture(self, field):
+        # Arm the capture for one settings field.
+        # 为一个设置字段进入待捕获状态。
+        if not field:
+            return
+        self._hotkey_field = field
+        if self._hotkey_filter is None:
+            from PySide6.QtCore import QCoreApplication
+
+            application = QCoreApplication.instance()
+            if application is None:
+                return
+            self._hotkey_filter = _HotkeyCaptureFilter(self)
+            application.installEventFilter(self._hotkey_filter)
+
+    @Slot()
+    def endHotkeyCapture(self):
+        # Disarm, and say so, so the field can drop its "armed" styling.
+        # 解除待捕获并通知，使字段可以撤掉"已就绪"的样式。
+        self._end_hotkey_capture()
+        self.hotkeyCaptureEnded.emit()
+
+    def _end_hotkey_capture(self):
+        if self._hotkey_filter is not None:
+            from PySide6.QtCore import QCoreApplication
+
+            application = QCoreApplication.instance()
+            if application is not None:
+                application.removeEventFilter(self._hotkey_filter)
+            self._hotkey_filter = None
+        self._hotkey_field = ""
+
+    def _capture_hotkey_event(self, event):
+        # Handle one key event while armed. Returns True when the event was consumed.
+        # 待捕获期间处理一个按键事件。被消费时返回 True。
+        from PySide6.QtCore import Qt
+
+        from gifmanager.frontend.qt.widgets.hotkey_capture import key_from_qt
+
+        key = event.key()
+        # A bare modifier is not a hotkey: the user is on the way to a combination, so the event is
+        # swallowed (it must not reach the interface) but nothing is stored.
+        # 单独的修饰键不是热键：用户正在前往一个组合键，因此事件被吞掉（不能传到界面）但不存储任何东西。
+        if key in (Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt,
+                   Qt.Key.Key_Meta, Qt.Key.Key_AltGr):
+            return True
+        field = self._hotkey_field
+        if key == Qt.Key.Key_Escape:
+            # ESC clears, exactly as the original dialog did.
+            # ESC 清空，与原对话框完全一致。
+            self._settings_model.commitValue(field, "")
+            self.hotkeyCaptured.emit(field, "")
+            self._end_hotkey_capture()
+            self.hotkeyCaptureEnded.emit()
+            return True
+        name = key_from_qt(key)
+        if not name:
+            # An unmapped key is left alone: swallowing it would make the field feel broken while
+            # storing nothing, and letting it through means Escape still works.
+            # 未映射的按键不做处理：吞掉它会让字段"看起来坏了"却什么都没存，放它过去则意味着 ESC 仍然有效。
+            return True
+        parts = []
+        modifiers = event.modifiers()
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
+            parts.append("Ctrl")
+        if modifiers & Qt.KeyboardModifier.AltModifier:
+            parts.append("Alt")
+        if modifiers & Qt.KeyboardModifier.ShiftModifier:
+            parts.append("Shift")
+        if modifiers & Qt.KeyboardModifier.MetaModifier:
+            parts.append("Meta")
+        parts.append(name)
+        text = "+".join(parts)
+        # A SINGLE key is a valid shortcut, and it is the default one.
+        #
+        # The previous version refused a bare letter, digit or F-key on the theory that registering
+        # one
+        # would steal it from every application. That theory is wrong for this feature: the shipped
+        # default is F10 with `modifiers == 0`, the original project's dialog accepted a lone key,
+        # and
+        # `RegisterHotKey` is happy with one - so the extra rule rejected exactly the values the
+        # rest of
+        # the system already produces. Combinations remain fully supported; they are simply not
+        # required.
+        # "单个"按键是合法快捷键，而且它就是默认值。
+        #
+        # 上一版以"注册裸键会从系统上每个应用手里抢走它"为由，拒绝裸字母、数字与 F 键。对这个功能而言
+        # 那个理由不成立：随包默认值就是 `modifiers == 0` 的 F10，原项目的对话框接受单键，而
+        # `RegisterHotKey` 也完全接受单键——因此那条额外规则恰好拒绝了系统其余部分一直在产生的值。
+        # 组合键仍然被完整支持，只是不再"强制"要求。
+        # COMMIT, not draft.
+        #
+        # `setValue` only stages an edit for the settings dialog's 应用 button, so with it the new
+        # sequence sat in a buffer: the preview table kept the old one, the registered key kept the
+        # old
+        # one, and nothing changed until the user pressed a button they had no reason to press. The
+        # capture already knows the value is final, so it applies it.
+        #
+        # 提交，而不是草稿。
+        #
+        # `setValue` 只为设置对话框的"应用"按钮暂存编辑，因此用它时新序列停在缓冲里：预览表仍显示旧的、
+        # 已注册的键仍是旧的，直到用户按下一个他毫无理由去按的按钮。捕获本身已经知道该值就是最终值，
+        # 因此它直接应用。
+        self._settings_model.commitValue(field, text)
+        self.hotkeyCaptured.emit(field, text)
+        self._end_hotkey_capture()
+        self.hotkeyCaptureEnded.emit()
+        return True
+
+
+    # ---- settings apply / 设置应用 ---------------------------------------
+
+    @Slot()
+    def applySettings(self):
+        # Commit the settings dialog's pending edits, and NEVER raise.
+        #
+        # The QML 确定 button is `applyPending(); close()`. If `applyPending` raises - a coercion the
+        # schema rejects, a platform service that is unavailable, a registry write that fails - the
+        # exception propagates out of the QML statement and `close()` never runs, so the window
+        # stays
+        # open and NOTHING is saved. That is exactly the reported "clicking save does not close the
+        # settings window": the failure was in the apply step, and the close was its silent victim.
+        #
+        # Returning a bool instead of raising keeps the two operations independent at the call site.
+        # 提设置对话框的待定编辑，并且"绝不抛出"。
+        #
+        # QML 的"确定"按钮是 `applyPending(); close()`。如果 `applyPending` 抛异常——schema 拒绝的
+        # 强制转换、不可用的平台服务、失败的注册表写入——异常会从 QML 语句中传播出去，`close()` 永远
+        # 不会执行，于是窗口留在原地且"什么都没保存"。这正是用户报告的"点击保存后不会关闭设置窗口"：
+        # 失败发生在应用步骤，而关闭是它无声的受害者。
+        #
+        # 返回布尔值而不是抛出，使两个操作在调用点彼此独立。
+        try:
+            self._settings_model.applyPending()
+            return True
+        except Exception:
+            log.exception("settings: applying pending edits failed")
+            return False
+
 
     @Slot(str, result=bool)
     def supports(self, capability):
@@ -2227,6 +2524,53 @@ class BackendBridge(QObject):
             rows.insert(0, {"keys": hotkey,
                             "label": self.tr("hotkey_group")})
         return rows
+
+    @Property("QVariantList", notify=settingsChanged)
+    def shortcutList(self):
+        # The same rows as `shortcuts()`, exposed as a NOTIFYING property.
+        #
+        # The settings window's preview table bound `model: app.shortcuts()`, i.e. a method CALL. A
+        # binding that calls a method has no dependency to re-evaluate on, so the table was computed
+        # once when the row was built and never updated: changing the global hotkey left the preview
+        # showing the old sequence, which is the reported bug.
+        #
+        # A property with `notify=settingsChanged` gives the binding something to react to, and
+        # committing the hotkey already emits that signal.
+        # 与 `shortcuts()` 相同的行，但以"带通知"的属性暴露。
+        #
+        # 设置窗口的预览表绑定的是 `model: app.shortcuts()`，也就是一次"方法调用"。调用方法的绑定没有
+        # 可依赖的求值依据，因此该表在行构建时算过一次就再没更新：改掉全局热键后预览仍显示旧序列，
+        # 这正是用户报告的缺陷。
+        #
+        # 带 `notify=settingsChanged` 的属性给了绑定一个可响应的事件，而提交热键本身就会发出该信号。
+        return self.shortcuts()
+
+    @Slot(str, "QVariant", result=bool)
+    def setSettingNow(self, field, value):
+        # Write one setting and apply it IMMEDIATELY, without waiting for 应用/确定.
+        #
+        # Used by controls whose change has a visible, immediate consequence: the global hotkey (the
+        # preview list and the registered key should follow at once) and the colour scheme (the
+        # whole
+        # window should repaint at once). Drafting those and waiting for a button press means the
+        # user
+        # sees no feedback and assumes the change was ignored.
+        #
+        # It goes through `SettingsModel.commitValue`, which applies this single field while leaving
+        # any
+        # other pending edit untouched.
+        # 写入一个设置并"立即"应用，不等"应用/确定"。
+        #
+        # 供那些改动有可见即时后果的控件使用：全局热键（预览列表与已注册的键都该立刻跟随）与配色方案
+        # （整个窗口该立刻重绘）。把它们做成草稿等待按钮，会让用户看不到任何反馈、以为改动被忽略了。
+        #
+        # 它走 `SettingsModel.commitValue`，只应用这一个字段，不触碰任何其他待定编辑。
+        try:
+            self._settings_model.commitValue(field, value)
+            return True
+        except Exception:
+            log.exception("settings: applying %r immediately failed", field)
+            return False
 
     # ---- translation / 翻译 ----------------------------------------------
 

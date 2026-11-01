@@ -87,4 +87,12 @@ SpinBox {
         border.width: 1
         Behavior on border.color { ColorAnimation { duration: control.metrics.uiAnimationMs } }
     }
+    // No context menu: see `UiTextField` for why. Only right clicks are taken, so editing and
+    // selection are untouched.
+    // 不显示上下文菜单：理由见 `UiTextField`。只接管右键，因此编辑与选择不受影响。
+    MouseArea {
+        anchors.fill: parent
+        acceptedButtons: Qt.RightButton
+        onPressed: function (mouse) { mouse.accepted = true }
+    }
 }

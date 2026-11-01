@@ -71,7 +71,7 @@ Menu {
 
     background: Rectangle {
         radius: control.metrics.uiRadius
-        color: control.ui.popover
+        color: theme.surface
         border.color: control.ui.borderStrong
         border.width: 1
     }

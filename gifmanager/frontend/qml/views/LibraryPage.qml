@@ -22,6 +22,18 @@ import "../components/ui"
 
 Item {
     id: page
+    // Named so a check can drive the sweep state machine directly.
+    //
+    // The long-press semantics live entirely in `beginSweep`/`applySweep`/`endSweep` plus a timer, and
+    // verifying them through real mouse events would mean crossing the overlay's hit test - a different
+    // mechanism from the one under test. An explicit name lets the state machine be exercised on its
+    // own: hold -> armed, release before the hold -> toggle.
+    // 命名使检查能直接驱动扫选状态机。
+    //
+    // 长按语义完全住在 `beginSweep`/`applySweep`/`endSweep` 加一个定时器里，而用真实鼠标事件验证它们
+    // 还要穿过覆盖层的命中测试——那是与被测机制不同的另一套东西。显式名称让状态机可以被单独驱动：
+    // 按住 → 武装，未达按住即释放 → 切换。
+    objectName: "libraryPage"
     required property var app
 
     // ---- metrics ----------------------------------------------------------
@@ -82,6 +94,56 @@ Item {
     // 其他情况都是扫选，而扫选已经把锁定值应用到包括起点在内的每一张掠过的卡片。
     property bool sweepMoved: false
 
+
+    // Last grid index the sweep painted, so a fast drag can fill the gap.
+    // 扫选上次涂抹的网格索引，使快速拖动能填补空洞。
+    property int sweepLastIndex: -1
+
+    // Which stickers are ACTUALLY on screen, as an id list the cards test themselves against.
+    //
+    // Computed from `contentY`, the cell height and the column count - the same arithmetic the sweep's
+    // hit test uses - because the view does not expose delegate geometry usefully (every delegate
+    // reported `y == 0` in measurement) and does not hide off-screen delegates either (60 of 60 stayed
+    // `visible` and stayed registered, which is what starved the animator's cap and froze the top half).
+    //
+    // One extra row above and below is included so a card is already registered by the time it scrolls
+    // in, instead of appearing frozen for a frame.
+    // 真正在屏幕上的贴纸，作为 id 列表供卡片自测。
+    //
+    // 由 `contentY`、单元格高度与列数算出——与扫选命中测试同一套算术——因为视图既没有暴露可用的委托
+    // 几何（实测每个委托项的 `y` 都为 0），也不会隐藏离屏委托（60 个全部保持 `visible`、全部保持注册，
+    // 这才是饿死动画器上限、冻住上半屏的原因）。
+    //
+    // 上下各多含一行，使卡片在滚入之前就已注册，而不是入屏后先冻一帧。
+    readonly property var activeAnimIds: {
+        if (!page.app || page.isTextGroup)
+            return []
+        var rowsTotal = Math.ceil(page.app.stickers.count
+                                  / Math.max(1, page.gridColumns))
+        var first = Math.max(0, page.gridFirstVisibleRow - 1)
+        var last = Math.min(rowsTotal - 1, page.gridLastVisibleRow + 1)
+        if (last < first)
+            return []
+        var ids = []
+        var model = page.app.stickers
+        for (var row = first; row <= last; ++row) {
+            for (var col = 0; col < page.gridColumns; ++col) {
+                var index = row * page.gridColumns + col
+                if (index >= model.count)
+                    break
+                ids.push(model.data(model.index(index, 0), page.app.stickerIdRole))
+            }
+        }
+        return ids
+    }
+
+    readonly property int gridColumns: Math.max(1, Math.floor(
+        (grid.width - grid.leftMargin - grid.rightMargin + page.cardGap) / grid.cellWidth))
+    readonly property int gridFirstVisibleRow: Math.max(0, Math.floor(
+        (grid.contentY - grid.topMargin) / grid.cellHeight))
+    readonly property int gridLastVisibleRow: Math.floor(
+        (grid.contentY + grid.height - grid.topMargin) / grid.cellHeight)
+
     function beginSweep(stickerId) {
         if (!page.app || !page.editMode)
             return
@@ -89,6 +151,28 @@ Item {
         page.sweepLatch = !page.app.stickers.isSelected(stickerId)
         page.sweepActive = true
         page.sweepMoved = false
+        page.sweepLastIndex = -1
+        // Applied IMMEDIATELY, with no hold delay.
+        //
+        // A previous version waited 280 ms before arming the sweep, copying the original project's
+        // long-press timer. That timer exists there because the original also supports click-and-drag
+        // to REORDER in the same grid, so a press had to be disambiguated before it could mean
+        // "select". Here the two never compete: edit mode disables reordering, and a press in edit
+        // mode can only mean "select". Making the user wait for a gesture that has no alternative
+        // reading is pure latency - the press-and-drag IS the selection.
+        //
+        // Applying here is also what keeps a plain click correct: the latch is the OPPOSITE of the
+        // anchor's current state, which is precisely what a toggle does, so `endSweep` needs no
+        // separate toggle step.
+        // 立即应用，没有按住延迟。
+        //
+        // 上一版在武装扫选前等待 280 毫秒，照搬了原项目的长按定时器。那个定时器在原项目里存在，是因为原
+        // 项目同一网格里还支持"点击拖动排序"，因此按下必须先被消歧才能表示"选择"。这里两者从不竞争：编辑
+        // 模式会禁用重排，编辑模式下的按下只可能表示"选择"。让用户为一种没有第二种解释的手势等待，纯粹是
+        // 延迟——按下拖动"就是"选择。
+        //
+        // 在此应用也正是让普通单击保持正确的原因：锁定值是锚点当前状态的反面，那恰好就是切换所做的事，
+        // 因此 `endSweep` 不需要额外的切换步骤。
         page.app.stickers.setSelected(stickerId, page.sweepLatch)
     }
 
@@ -100,17 +184,97 @@ Item {
         page.app.stickers.setSelected(stickerId, page.sweepLatch)
     }
 
+    // Apply the sweep from a SCENE position, used by the pressed card's own move events.
+    //
+    // Converting to grid coordinates here instead of in the card keeps the hit test in one place: the
+    // card knows where the pointer is, the page knows which cell that is.
+    // 从"场景"坐标应用扫选，供被按下卡片的移动事件调用。
+    //
+    // 在这里而不是在卡片里换算成网格坐标，使命中测试只在一处：卡片知道指针在哪，页面知道那是哪一格。
+    function sweepAt(sceneX, sceneY) {
+        if (!page.sweepActive || !page.app || page.isTextGroup)
+            return
+        var local = grid.mapFromItem(null, sceneX, sceneY)
+        // CONTENT coordinates, not viewport coordinates.
+        //
+        // `GridView.indexAt` expects content coordinates, and passing viewport ones is off by
+        // `contentY`: with the grid scrolled 300 px the same point resolved to index 0 where the
+        // geometry says 15 - the reported "I drag downwards and the cards ABOVE get selected". It
+        // looked correct near the top of the list only because `contentY` is then ~0.
+        // 用"内容"坐标，而不是视口坐标。
+        //
+        // `GridView.indexAt` 期望内容坐标，传视口坐标会差一个 `contentY`：网格滚动 300px 时同一个点被
+        // 解析成 index 0，而几何上应为 15——正是用户报告的"我往下拖，选中的却是上面的卡片"。在列表顶部
+        // 附近看起来正常，只是因为那时 `contentY` 约为 0。
+        var index = grid.indexAt(local.x + grid.contentX, local.y + grid.contentY)
+        if (index < 0)
+            return
+        page.applySweepRange(index)
+    }
+
+    // Apply the latch to every index between the previous one and this one.
+    //
+    // A fast drag reports positions far apart - a move can jump several cells - so painting only the
+    // sampled index leaves gaps, which is the "high-frequency drag skips cards" half of the report.
+    // Filling the span is what the original's `apply_drag_selection` does with its remembered last
+    // position.
+    // 把锁定值应用到"上一个"索引与当前索引之间的每一个。
+    //
+    // 快速拖动上报的位置相距很远——一次移动可能跨过好几格——因此只涂抹采样的那个索引会留下空洞，这正是
+    // 用户报告里"高频拖动漏选"的那一半。填满这段区间，正是原版 `apply_drag_selection` 用它记住的上一个
+    // 位置所做的事。
+    function applySweepRange(index) {
+        if (!page.app || !grid.model)
+            return
+        var last = page.sweepLastIndex
+        // Fill the gap ONLY within one column.
+        //
+        // A contiguous index range looks tempting - a fast drag jumps several cells and painting just
+        // the sampled one leaves holes - but indices wrap across ROWS: filling 15..25 paints three
+        // whole rows, so dragging down one column would select every card beside it. That is its own
+        // version of "cards I never touched got selected".
+        //
+        // Same column means the indices differ by a whole number of rows, so the span between them is
+        // exactly the cells the pointer passed through.
+        // 只在"同一列"内填补空隙。
+        //
+        // 连续索引区间看起来很诱人——快速拖动会跳过好几个格子，只涂抹采样的那个会留下空洞——但索引是
+        // 跨"行"回绕的：填 15..25 会涂抹整整三行，于是沿一列向下拖动会选中它旁边的每一张卡片。那本身
+        // 就是另一种"我没碰过的卡片被选中"。
+        //
+        // 同一列意味着两个索引相差整数行，因此它们之间的跨度恰好是指针经过的那些格子。
+        var cols = Math.max(1, Math.floor((grid.width - grid.leftMargin - grid.rightMargin)
+                                          / grid.cellWidth))
+        var sameColumn = last >= 0 && (last % cols) === (index % cols)
+        var lo = sameColumn ? Math.min(last, index) : index
+        var hi = sameColumn ? Math.max(last, index) : index
+        // Step by a ROW (one column count), not by one.
+        //
+        // Adding one walks into the neighbouring columns - the same over-selection the block comment
+        // above warns about, reintroduced by the loop increment. One row is `cols` indices, which
+        // stays in the column the pointer is in.
+        // 按"一行"（一个列数）步进，而不是按一。
+        //
+        // 加一会在相邻列之间游走——正是上面块注释警告的那种过度选中，只是由循环增量重新引入。一行等于
+        // `cols` 个索引，那才停留在指针所在的那一列。
+        var step = sameColumn ? cols : 1
+        for (var i = lo; i <= hi; i += step) {
+            var id = grid.model.data(grid.model.index(i, 0), page.app.stickerIdRole)
+            if (id === undefined || id === null)
+                continue
+            page.app.stickers.setSelected(id, page.sweepLatch)
+        }
+        page.sweepLastIndex = index
+    }
+
     function endSweep() {
-        // A press and release on ONE card with no movement is a plain click. The press already
-        // applied the latch, so toggling here would undo it - and NOT toggling would break the
-        // click, because the latch applied the opposite of the card's state, which is exactly
-        // what a toggle does. So a click needs no further action; only the flags are cleared.
-        // 在"一张"卡片上按下并释放且无移动，就是普通单击。按下时已经应用了锁定值，因此这里再切换会
-        // 撤销它——而"不"切换又会破坏单击，因为锁定值应用的是该卡片状态的反面，那正是切换所做的事。
-        // 所以单击无需进一步动作，只清除标志。
+        // Nothing to undo and nothing to toggle: the press already applied the latch, which for a
+        // single card is exactly a toggle. Only the flags are cleared.
+        // 无需撤销也无需切换：按下时已经应用了锁定值，而对单张卡片而言那恰好就是切换。只清除标志。
         page.sweepActive = false
         page.sweepOriginId = -1
         page.sweepMoved = false
+        page.sweepLastIndex = -1
     }
 
     // Open the move picker for the edit-mode SELECTION.
@@ -271,6 +435,9 @@ Item {
         // ---- card grid (image groups and the All view) ---------------------
         GridView {
             id: grid
+            // Named so a check can map card coordinates and deliver real mouse events to the sweep.
+            // 命名使检查能映射卡片坐标并向扫选投递真实鼠标事件。
+            objectName: "stickerGrid"
             visible: !page.isTextGroup
             Layout.fillWidth: true
             Layout.fillHeight: true
@@ -291,6 +458,28 @@ Item {
             rightMargin: page.gridMargin
             bottomMargin: page.gridMargin
             boundsBehavior: Flickable.StopAtBounds
+            // NO FLICKING WHILE EDITING.
+            //
+            // This is the bug that made drag-selection feel broken in two ways at once. A `GridView` is a
+            // `Flickable`, and a `Flickable` steals a press-and-drag once it passes its threshold - so
+            // dragging across cards scrolled the PAGE instead of painting the selection, and the few
+            // events the sweep did receive arrived after the steal, which reads as "does not follow the
+            // pointer".
+            //
+            // In edit mode a press can only mean "select", and there is no second gesture to
+            // disambiguate against, so the flick is simply switched off. The wheel still scrolls
+            // (`WheelHandler` below is unaffected by `interactive`), which is how a list this dense is
+            // scrolled anyway once a drag belongs to selection.
+            // 编辑时不可滑动。
+            //
+            // 这正是让拖动选择以两种方式同时失效的那个缺陷。`GridView` 是 `Flickable`，而 `Flickable`
+            // 一旦超过阈值就会抢走按下拖动——于是跨卡片拖动滚的是"页面"而不是涂抹选择，而扫选真正收到
+            // 的那少数事件都在被抢之后才到，读起来就是"不跟手"。
+            //
+            // 编辑模式下按下只可能表示"选择"，也没有第二种手势需要消歧，因此直接关掉滑动。滚轮仍可滚动
+            // （下方的 `WheelHandler` 不受 `interactive` 影响）——而当拖动被划归选择之后，滚轮本来就是
+            // 这种密集列表的滚动方式。
+            interactive: !page.editMode
             // Plain wheel scrolling follows the hand: one notch moves the content
             // by the delta directly, instead of the Flickable's slow default
             // glide. Alt+wheel is handled by the window filter on the Python
@@ -382,14 +571,15 @@ Item {
                 function applyAt(px, py) {
                     if (!page.app || !grid.model)
                         return
-                    var index = grid.indexAt(px, py)
+                    // Same content-coordinate rule as `page.sweepAt`: these are VIEWPORT coordinates
+                    // and `indexAt` wants content ones, so the offsets must be added or a scrolled
+                    // grid resolves every point to a row near the top.
+                    // 与 `page.sweepAt` 相同的内容坐标规则：这里是"视口"坐标而 `indexAt` 要"内容"坐标，
+                    // 因此必须加上偏移，否则滚动后的网格会把每个点都解析成靠近顶部的一行。
+                    var index = grid.indexAt(px + grid.contentX, py + grid.contentY)
                     if (index < 0)
                         return
-                    var id = grid.model.data(grid.model.index(index, 0),
-                                             page.app.stickerIdRole)
-                    if (id === undefined || id === null)
-                        return
-                    page.app.stickers.setSelected(id, page.sweepLatch)
+                    page.applySweepRange(index)
                 }
 
                 onPositionChanged: function (mouse) {
@@ -439,6 +629,9 @@ Item {
                     anchors.top: parent.top
                     anchors.horizontalCenter: parent.horizontalCenter
                     app: page.app
+                    // Only the grid feeds a band; a card's y here is in its content space.
+                    // 只有网格提供区间；这里的卡片 y 处于其内容空间中。
+                    activeIds: page.activeAnimIds
                     stickerId: cardSlot.stickerId
                     name: cardSlot.name
                     source: cardSlot.source
@@ -477,6 +670,7 @@ Item {
                     }
                     onSweepBegin: function (id) { page.beginSweep(id) }
                     onSweepApply: function (id) { page.applySweep(id) }
+                    onSweepAt: function (sceneX, sceneY) { page.sweepAt(sceneX, sceneY) }
                     onSweepEnd: { page.endSweep() }
                 }
 
@@ -492,7 +686,7 @@ Item {
                     width: 3
                     height: parent.height
                     radius: 1
-                    color: theme.accent
+                    color: theme.uiColors.foreground
                     anchors.left: page.dropAfter ? undefined : parent.left
                     anchors.leftMargin: page.dropAfter ? 0 : -page.cardGap / 2 - 1
                     anchors.right: page.dropAfter ? parent.right : undefined
@@ -540,6 +734,9 @@ Item {
             contentWidth: masonryRow.width + 2 * page.gridMargin
             contentHeight: masonryRow.height + 2 * page.gridMargin
             boundsBehavior: Flickable.StopAtBounds
+            // Same rule as the grid: a drag in edit mode belongs to the selection, not to the scroll.
+            // 与网格同一条规则：编辑模式下的拖动属于选择，不属于滚动。
+            interactive: !page.editMode
             WheelHandler {
                 acceptedModifiers: Qt.NoModifier
                 onWheel: function (event) {
@@ -637,6 +834,7 @@ Item {
                                     }
                                     onSweepBegin: function (id) { page.beginSweep(id) }
                                     onSweepApply: function (id) { page.applySweep(id) }
+                                    onSweepAt: function (sceneX, sceneY) { page.sweepAt(sceneX, sceneY) }
                                     onSweepEnd: { page.endSweep() }
                                 }
 
@@ -649,7 +847,7 @@ Item {
                                     width: parent.width
                                     height: 3
                                     radius: 1
-                                    color: theme.accent
+                                    color: theme.uiColors.foreground
                                     anchors.top: page.dropAfter
                                                  ? undefined : parent.top
                                     anchors.topMargin: page.dropAfter
@@ -742,8 +940,21 @@ Item {
                                                  groupTab.isBuiltin)
                         }
                     }
-                    ToolTip.visible: hovered && groupTab.count > 0
-                    ToolTip.text: name + "  (" + groupTab.count + ")"
+                    // An explicit `UiToolTip`, not the attached `ToolTip.*` properties.
+                    //
+                    // The attached form creates a `QtQuick.Controls.Basic` tooltip whose frame
+                    // and surface come from that style, and no amount of `QPalette` work made it
+                    // belong to this interface. `UiToolTip` draws our own surface, so the hover
+                    // preview on a group tab looks like the menus and controls around it.
+                    // 显式的 `UiToolTip`，而非附加属性 `ToolTip.*`。
+                    //
+                    // 附加形式创建的是 `QtQuick.Controls.Basic` 的提示框，其边框与表面来自该
+                    // 样式，无论怎么调 `QPalette` 都无法让它属于本界面。`UiToolTip` 自绘表面，
+                    // 因此分组标签上的悬停预览与周围的菜单和控件看起来是一套。
+                    UiToolTip {
+                        text: groupTab.name + "  (" + groupTab.count + ")"
+                        visible: groupTab.hovered && groupTab.count > 0
+                    }
 
                     background: Rectangle {
                         // shadcn semantics rather than the original QSS accent: the SELECTED tab is
@@ -1089,13 +1300,13 @@ Item {
                 id: nameField
                 Layout.fillWidth: true
                 selectByMouse: true
-                color: theme.text
-                background: Rectangle {
-                    color: theme.surfaceAlt
-                    border.color: nameField.activeFocus ? theme.accent : theme.border
-                    border.width: 1
-                    radius: theme.radius
-                }
+                // NO `background` override: it drew a `theme.surfaceAlt` rectangle with a
+                // `theme.accent` focus border, which replaced `UiTextField`'s shell and put the legacy
+                // BLUE back on a field the design system had already restyled. Same defect as the one
+                // in `GroupDialog`, which is why it looked fixed there and not here.
+                // 不覆写 `background`：它自绘 `theme.surfaceAlt` 矩形并用 `theme.accent` 作聚焦边框，
+                // 替换了 `UiTextField` 的外壳，并把旧"蓝色"重新加到一个设计系统已经重做过样式的字段上。
+                // 与 `GroupDialog` 里的缺陷相同——所以那边看起来修好了，这里却没有。
                 onAccepted: editDialog.accept()
             }
         }

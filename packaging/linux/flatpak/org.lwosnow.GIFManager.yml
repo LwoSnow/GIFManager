@@ -1,0 +1,77 @@
+# Flatpak manifest for GIFManager Next.
+#
+# # Why this manifest ships a PREBUILT bundle
+#
+# Building the application inside the sandbox would mean fetching PySide6 (about 300 MB of wheels) and
+# running PyInstaller with no network, which the sandbox forbids - and the result would be a second,
+# differently-built copy of what the other packages already ship. Instead, CI builds the bundle once and
+# this manifest installs it into `/app`, which keeps one build pipeline and one binary to reason about.
+#
+# The consequence is that the Flatpak is tied to `x86_64` and to the freedesktop runtime's glibc. That is
+# the same constraint the AppImage and the Arch package already carry, so it is stated rather than hidden.
+#
+# GIFManager Next 的 Flatpak 清单。
+#
+# # 为什么本清单安装"预构建"包
+#
+# 在沙箱内构建程序意味着抓取 PySide6（约 300 MB 的 wheel）并在无网络下运行 PyInstaller，而沙箱禁止联网
+# ——而且产物会与其他包已经发布的、用不同方式构建的第二份副本。改为由 CI 统一构建一次，本清单把它装进
+# `/app`，使"只有一条构建流水线、只有一个二进制需要推理"。
+#
+# 代价是本 Flatpak 绑定 `x86_64` 与 freedesktop 运行时的 glibc。这与 AppImage 和 Arch 包已经承担的约束
+# 相同，因此明确写出而不是隐藏。
+
+app-id: org.lwosnow.GIFManager
+runtime: org.freedesktop.Platform
+runtime-version: "24.08"
+sdk: org.freedesktop.Sdk
+command: gifmanager
+
+# The Qt Wayland and X11 platform plugins need the session socket and the display socket; nothing else is
+# shared. `--device=dri` is included because Qt Quick falls back to software rendering without it on some
+# drivers, and a sticker grid is exactly the case software rendering handles badly.
+# Qt 的 Wayland 与 X11 平台插件需要会话套接字与显示套接字；其余一概不共享。包含 `--device=dri` 是因为
+# 在部分驱动上缺少它会退回软件渲染，而贴纸网格正是软件渲染处理得很糟的场景。
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --device=dri
+  # The application writes its database and stickers under $XDG_DATA_HOME, which is already private to the
+  # app; no host filesystem access is granted, so "send to any application" uses the clipboard only.
+  # 程序把数据库与贴纸写到 $XDG_DATA_HOME，那本就属于本应用；不授予任何宿主文件系统访问，因此"发送到任意
+  # 应用"只通过剪贴板完成。
+  - --filesystem=xdg-download:ro
+  - --talk-name=org.freedesktop.portal.Desktop
+  - --talk-name=org.freedesktop.Notifications
+
+modules:
+  - name: gifmanager
+    buildsystem: simple
+    build-commands:
+      # `payload/` is dropped in by CI next to this manifest.
+      # `payload/` 由 CI 放在本清单旁边。
+      - mkdir -p /app/lib/gifmanager
+      - cp -R payload/. /app/lib/gifmanager/
+      - chmod +x /app/lib/gifmanager/GIFManager
+      - |
+        cat > /app/bin/gifmanager <<'EOF'
+        #!/bin/sh
+        exec /app/lib/gifmanager/GIFManager "$@"
+        EOF
+        chmod +x /app/bin/gifmanager
+      # The desktop file is installed under the name Qt registers as its app id, because the portal looks
+      # the entry up BY THAT NAME. It is ALSO installed under the flatpak app id, which is what `flatpak`
+      # and software centres list.
+      # 桌面文件以 Qt 注册的 app id 为名安装，因为门户"按那个名字"查找条目。它"同时"以 flatpak 应用
+      # id 安装一份，供 `flatpak` 与软件中心列出。
+      - install -Dm644 gifmanager.desktop /app/share/applications/gifmanager.desktop
+      - install -Dm644 org.lwosnow.GIFManager.desktop /app/share/applications/org.lwosnow.GIFManager.desktop
+      - install -Dm644 org.lwosnow.GIFManager.metainfo.xml /app/share/metainfo/org.lwosnow.GIFManager.metainfo.xml
+      - install -Dm644 gifmanager.png /app/share/icons/hicolor/256x256/apps/gifmanager.png
+      - install -Dm644 gifmanager.png /app/share/icons/hicolor/256x256/apps/org.lwosnow.GIFManager.png
+      - install -Dm644 LICENSE /app/share/licenses/org.lwosnow.GIFManager/LICENSE
+    sources:
+      - type: dir
+        path: .

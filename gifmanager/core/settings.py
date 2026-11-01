@@ -412,8 +412,38 @@ def from_mapping(mapping):
     values["autostart"] = coerce_bool(raw("autostart"), False)
     values["auto_update"] = coerce_bool(raw("auto_update"), False)
 
-    values["hotkey"] = hotkey_core.HotkeyBinding.from_storage(
-        raw("hotkey") if isinstance(raw("hotkey"), dict) else None)
+    # The hotkey arrives in one of THREE shapes, and all three must work:
+    #
+    #   * a mapping {"modifiers": int, "key": str} - what `to_storage()` writes, and what older
+    #     settings files contain;
+    # * a portable string "Ctrl+Alt+F8" - what the QML capture produces, because the platform
+    # layer's
+    # `register(sequence)` takes exactly this form, so storing it verbatim keeps ONE representation
+    #     on the wire instead of translating between two;
+    #   * anything else (missing, empty, garbage) - the default binding.
+    #
+    # Only the mapping used to be accepted. A string fell through to `from_storage(None)`, i.e. the
+    # DEFAULT, so capturing a new shortcut appeared to do nothing at all: the value was written,
+    # then
+    # silently replaced by F10 on the way back in. That is why "changing the global hotkey has no
+    # effect" survived even after the capture itself was fixed.
+    # 热键有三种到达形态，且三种都必须可用：
+    #
+    #   * 映射 {"modifiers": int, "key": str}——`to_storage()` 写出的形态，也是旧设置文件里的形态；
+    #   * 可移植字符串 "Ctrl+Alt+F8"——QML 捕获产生的形态，因为平台层的 `register(sequence)` 恰好接受
+    #     这一形式，逐字存储它就使链路上只有"一种"表示，而不必在两种之间翻译；
+    #   * 其他任何情况（缺失、空、垃圾）——默认绑定。
+    #
+    # 过去只接受映射。字符串会落到 `from_storage(None)`，也就是"默认值"，因此捕获一个新快捷键看起来
+    # 毫无作用：值被写入，然后在读回时被静默替换成 F10。这就是为什么即使修好了捕获，
+    # "改全局快捷键没有效果"依然存在。
+    raw_hotkey = raw("hotkey")
+    if isinstance(raw_hotkey, dict):
+        values["hotkey"] = hotkey_core.HotkeyBinding.from_storage(raw_hotkey)
+    elif isinstance(raw_hotkey, str):
+        values["hotkey"] = hotkey_core.HotkeyBinding.parse(raw_hotkey)
+    else:
+        values["hotkey"] = hotkey_core.HotkeyBinding.from_storage(None)
 
     values["window_geometry"] = coerce_bytes(data.get("window_geometry"))
     values["last_group_name"] = coerce_text(data.get("last_group_name"), "")

@@ -224,6 +224,36 @@ class FrameStore:
         self._frames = {}
         self._pixels = {}
         self._order = []
+        # Paths that must not be evicted, with a reference count per path.
+        #
+        # # Why pinning is the fix for the scrolling warnings
+        #
+        # Eviction is "oldest stored first", which is right for animations that have scrolled away -
+        # but
+        # it also evicted animations that were STILL PLAYING, because a playing card keeps asking
+        # for
+        # frame N while never re-`put`ting anything. Once its frames were gone, every request
+        # returned a
+        # null image and Qt logged
+        #     QML QQuickImage: Failed to get image from provider: image://gifframes/...
+        # once per frame per card, which is the flood of warnings reported while scrolling fast.
+        #
+        # A reference count, not a flag: several cards can show the same file, and unpinning on the
+        # first
+        # unregister would make it evictable while the others still play.
+        # 不得被淘汰的路径，每条路径带一个引用计数。
+        #
+        # # 为什么"固定"才是滚动警告的修法
+        #
+        # 淘汰策略是"最久未被存入者先出"，对已经滚出视野的动画是正确的——但它也会淘汰"仍在播放"的
+        # 动画，因为播放中的卡片会一直请求第 N 帧，却从不再 `put` 任何东西。帧一旦被清掉，每次请求都返回
+        # 空图像，Qt 于是记录
+        #     QML QQuickImage: Failed to get image from provider: image://gifframes/...
+        # 每张卡片每帧一条——这就是快速滚动时被报告的那一大片警告。
+        #
+        # 用引用计数而不是布尔标记：多张卡片可能显示同一个文件，在第一次注销时就解除固定，会让它在其
+        # 余卡片仍在播放时变得可淘汰。
+        self._pin_counts = {}
         self._budget = int(self.DEFAULT_PIXEL_BUDGET if pixel_budget is None
                            else pixel_budget)
         self._used = 0
@@ -241,16 +271,54 @@ class FrameStore:
         self._used += pixels
         self._evict()
 
+    def pin(self, path):
+        # Protect `path` from eviction (reference counted).
+        # 保护 `path` 不被淘汰（引用计数）。
+        if not path:
+            return
+        self._pin_counts[path] = self._pin_counts.get(path, 0) + 1
+
+    def unpin(self, path):
+        # Drop one reference; the path becomes evictable at zero.
+        # 释放一个引用；计数归零后该路径变为可淘汰。
+        remaining = self._pin_counts.get(path, 0) - 1
+        if remaining > 0:
+            self._pin_counts[path] = remaining
+        else:
+            self._pin_counts.pop(path, None)
+
+    def pinned(self, path):
+        return path in self._pin_counts
+
     def _evict(self):
         # Oldest first. Frames are decoded on demand, so evicting the least recently
         # STORED animation is the right policy: the ones still on screen were
         # re-put or re-requested most recently.
         # 最旧优先。帧是按需解码的，因此淘汰"最久未被存入"的动画是正确策略：仍在屏幕上的
         # 那些最近被重新存入或请求过。
-        while self._used > self._budget and len(self._order) > 1:
-            oldest = self._order.pop(0)
-            self._used -= self._pixels.pop(oldest, 0)
-            self._frames.pop(oldest, None)
+        # Unpinned first, oldest first within each class. A pinned animation is one that is playing
+        # right now, so evicting it guarantees the null-image flood above.
+        # 先淘汰未固定的，类内仍按最旧优先。被固定的动画正是此刻正在播放的，淘汰它必然导致上述空图像
+        # 洪水。
+        while self._used > self._budget:
+            candidate = None
+            for entry in self._order:
+                if not self.pinned(entry):
+                    candidate = entry
+                    break
+            if candidate is None:
+                # Everything is pinned. Respect the ceiling anyway rather than growing without
+                # bound:
+                # the oldest pinned entry goes, because an out-of-memory crash is worse than one
+                # blank card.
+                # 所有条目都被固定。仍然服从上限而不是无界增长：最旧的被固定条目出局，因为崩溃比一张空白
+                # 卡片更糟。
+                if len(self._order) <= 1:
+                    break
+                candidate = self._order[0]
+            self._order.remove(candidate)
+            self._used -= self._pixels.pop(candidate, 0)
+            self._frames.pop(candidate, None)
 
     def frames(self, path):
         frames = self._frames.get(path)
@@ -269,6 +337,7 @@ class FrameStore:
         self._frames.clear()
         self._pixels.clear()
         self._order.clear()
+        self._pin_counts.clear()
         self._used = 0
 
     @property
@@ -347,17 +416,75 @@ class _FrameDecoder(QObject):
         self._pool.setMaxThreadCount(2)
         self._results = {}
         self._results_lock = threading.Lock()
+        # Monotonic submission counter, used as the thread-pool priority (see `submit`).
+        # 单调递增的提交计数，用作线程池优先级（见 `submit`）。
+        self._priority = 0
 
-    def submit(self, path, card_pixels):
+    def submit(self, path, card_pixels, is_wanted=None):
         from PySide6.QtCore import QRunnable
 
         decoder = self
+        # Ascending priority, so the NEWEST request runs first.
+        #
+        # # Why FIFO was the wrong order here
+        #
+        # The pool is two threads. Every card that scrolls into view queues a decode, and a fast
+        # scroll
+        # through a large library queues hundreds of them while the user keeps moving. Under FIFO
+        # the
+        # cards that are on screen RIGHT NOW sit at the BACK of that queue, behind work for rows the
+        # user
+        # already scrolled past, so the visible animations start seconds later - the reported worry
+        # about
+        # a 1000-sticker library.
+        #
+        # Qt runs the highest priority first, so a counter turns the queue into "most recently asked
+        # first": whatever is on screen now was asked for last and is therefore decoded next. Stale
+        # jobs
+        # are not starved by this, because they are dropped outright (see `is_wanted` below).
+        # 递增优先级，使"最新"的请求先执行。
+        #
+        # # 为什么 FIFO 在这里是错的顺序
+        #
+        # 线程池只有两个线程。每张滚入视野的卡片都会排入一次解码，而在大素材库里快速滚动会在用户仍在移动
+        # 时排入数百个——FIFO 下"此刻在屏幕上"的卡片排在这条队列的"末端"，排在用户早已滚过的那些行之
+        # 后，于是可见动画要等数秒才开始，正是用户对 1000 张贴纸素材库的担忧。
+        #
+        # Qt 优先执行高优先级，因此一个计数器把队列变成"最近请求的最先做"：此刻在屏幕上的卡片是最后被
+        # 请求的，因而下一个就解码它。陈旧任务不会因此饿死，因为它们是"被直接丢弃"的（见下方
+        # `is_wanted`）。
+        self._priority += 1
 
         class _Job(QRunnable):
             # One decode. `run` executes on a pool thread.
             # 一次解码。`run` 在线程池的线程上执行。
 
             def run(self):
+                # Drop the job if nothing wants this path any more.
+                #
+                # A scroll-away leaves its decode queued, and each one costs 231-383 ms of CPU
+                # measured
+                # on this machine. Skipping here is what lets the queue collapse: a hundred stale
+                # jobs
+                # exit in microseconds instead of holding the two workers hostage for half a minute
+                # while
+                # the on-screen cards wait.
+                # 如果已经没有谁需要这个路径，就丢弃该任务。
+                #
+                # 滚走的卡片会留下排队的解码，而在这台机器上实测每个耗时 231-383 毫秒的 CPU。正是这里的
+                # 跳过让队列得以坍缩：一百个陈旧任务在微秒级退出，而不是霸占那两个工作线程半分钟、让屏幕上
+                # 的卡片干等。
+                if is_wanted is not None:
+                    try:
+                        if not is_wanted(path):
+                            # Still emit, so the pending bookkeeping is cleared and a later request
+                            # can
+                            # queue the path again.
+                            # 仍然发出，使待定记账被清除，后续请求可以重新排入该路径。
+                            decoder.ready.emit(path)
+                            return
+                    except Exception:
+                        log.exception("animator: the wanted-check failed for %s", path)
                 try:
                     from gifmanager.frontend.qt import animation
 
@@ -372,7 +499,7 @@ class _FrameDecoder(QObject):
                 # 队列发出，使接收方在 GUI 线程上运行。
                 decoder.ready.emit(path)
 
-        self._pool.start(_Job())
+        self._pool.start(_Job(), self._priority)
 
     def take(self, path):
         with self._results_lock:
@@ -384,7 +511,7 @@ class _FrameDecoder(QObject):
             self._results.clear()
 
 
-def animation_decode_async(path, card_pixels, owner):
+def animation_decode_async(path, card_pixels, owner, is_wanted=None):
     # Queue a decode and return the frames ONLY if they are already in the store.
     #
     # Returning `None` is the normal case for an undecoded GIF: the caller (`register`) then
@@ -406,7 +533,7 @@ def animation_decode_async(path, card_pixels, owner):
         decoder.ready.connect(owner._on_decoded)
         owner._decoder_hooked = True
         _ = key
-    decoder.submit(path, card_pixels)
+    decoder.submit(path, card_pixels, is_wanted)
     return None
 
 
@@ -519,9 +646,38 @@ class PreviewProvider(QQuickImageProvider):
         self._order.clear()
 
 
-# The provider the engine registers. Module-level for the same reason `STORE` is.
-# 引擎注册的提供器。与 `STORE` 同样的理由放在模块级。
-PREVIEWS = PreviewProvider()
+# The provider is created PER ENGINE, not kept in a module-level singleton.
+#
+# # Why the singleton broke a second engine
+#
+# `addImageProvider` takes OWNERSHIP of the provider: the engine deletes it when the engine is
+# destroyed. A module-level instance therefore becomes a dangling Python wrapper around a deleted
+# C++
+# object, and the next engine to be created died with
+#
+#     RuntimeError: libshiboken: Internal C++ object (PreviewProvider) already deleted
+#
+# That is exactly what a restart (or any code that builds a second engine in one process - a test, a
+# theme reload) hits. The frame provider was already created per registration for this reason; the
+# preview provider was not.
+#
+# Nothing is lost by creating it fresh: the cache lives in the instance, so it is per-engine, which
+# is
+# the correct lifetime - and `STORE`/`_KEYS` (the genuinely shared state) stay module-level.
+# 提供器"按引擎"创建，而不是留在模块级单例里。
+#
+# # 为什么单例会破坏第二个引擎
+#
+# `addImageProvider` 会"接管"提供器的所有权：引擎析构时会删除它。因此模块级实例会变成一个指向已删除
+# C++ 对象的悬空 Python 包装，而下一个被创建的引擎会以
+#
+#     RuntimeError: libshiboken: Internal C++ object (PreviewProvider) already deleted
+#
+# 死亡。这正是重启（或在同一进程里构建第二个引擎的任何代码——测试、主题重载）会遇到的情形。帧提供器
+# 出于同样原因早已按注册创建，而预览提供器没有。
+#
+# 新建不会损失什么：缓存住在实例里，因此按引擎隔离，而那正是正确的生命周期——真正共享的状态
+# `STORE`/`_KEYS` 仍留在模块级。
 
 
 def preview_url(path, edge):
@@ -565,7 +721,7 @@ def register_preview_provider(engine):
     # image and reports it only as a warning.
     # 安装预览提供器。在文档加载"之前"调用，理由与帧提供器相同：source 指向未知提供器的 `Image`
     # 会解析为空图像，且只报为警告。
-    engine.addImageProvider("preview", PREVIEWS)
+    engine.addImageProvider("preview", PreviewProvider())
 
 
 def path_for_prefix(prefix):
@@ -662,6 +818,22 @@ class StickerAnimator(QObject):
         # Paths with a decode in flight or queued, so the same GIF is not decoded twice.
         # 解码进行中或已排队的路径，使同一个 GIF 不会被解码两次。
         self._pending = set()
+        # Paths some card is currently registered for, readable from a POOL THREAD.
+        #
+        # `_paths` is GUI-thread state and reading it from a worker would be a data race. This
+        # mirror is
+        # guarded by its own lock and updated wherever `_paths` is, so a job can ask "is anyone
+        # still
+        # waiting for me?" without touching the GUI-thread structures.
+        # 当前有卡片注册的路径，可被"线程池线程"读取。
+        #
+        # `_paths` 是 GUI 线程状态，从工作线程读取会构成数据竞争。这份镜像由自己的锁保护，并与
+        # `_paths` 同步更新，使任务可以询问"还有谁在等我？"而不触碰 GUI 线程的结构。
+        # sticker_id -> path, for every card that has ASKED for a path, decoded or not.
+        # sticker_id -> path，覆盖每一张"请求过"路径的卡片，无论是否已解码。
+        self._requests = {}
+        self._wanted = set()
+        self._wanted_lock = threading.Lock()
         # sticker id -> file path / 贴纸 id -> 文件路径
         self._paths = {}
         # sticker id -> key prefix / 贴纸 id -> 键前缀
@@ -772,8 +944,31 @@ class StickerAnimator(QObject):
         sticker_id = int(sticker_id)
         path = str(path or "")
         if not path or not os.path.isfile(path):
+            self._forget_request(sticker_id)
             self.unregister(sticker_id)
             return 0
+        # The REQUEST is recorded before any decoding happens.
+        #
+        # # Why the request cannot be derived from `_paths`
+        #
+        # A card first asks for a path that has not been decoded yet, so `register` returns 0 and
+        # the card
+        # is not entered into `_paths` - `_paths` only ever holds animations that are actually
+        # playing.
+        # Deriving "does anyone still want this decode?" from `_paths` therefore answered NO for
+        # every
+        # card that was still waiting, and the pending decode was dropped as stale: the card stayed
+        # frozen
+        # for ever, which is exactly what the first version of this fix did.
+        # 请求在任何解码发生"之前"就被记录。
+        #
+        # # 为什么请求不能从 `_paths` 推导
+        #
+        # 卡片第一次请求的是一个尚未解码的路径，于是 `register` 返回 0、卡片不进入 `_paths`——`_paths`
+        # 只保存真正在播放的动画。因此从 `_paths` 推导"还有谁需要这次解码"对每个仍在等待的卡片都回答
+        # "没有"，待定的解码就被当作陈旧任务丢弃：卡片永远冻住，而这正是本修复第一版造成的后果。
+        self._requests[sticker_id] = path
+        self._remember_wanted()
         # Frames may already be in the store from the thumbnail path or a previous
         # card, so check before queueing a decode.
         # 帧可能已经因缩略图路径或先前卡片而在存储中，因此先检查再排队解码。
@@ -781,9 +976,49 @@ class StickerAnimator(QObject):
         if frames is None:
             frames = self._decode_now(path)
         if not frames or len(frames) < 2:
-            self.unregister(sticker_id)
+            # Still decoding (frames is None): the request stays, so the job is not dropped.
+            # Decoded and single-frame: this is a still, so the request is dropped.
+            # 仍在解码（frames 为 None）：保留请求，使任务不被丢弃。
+            # 已解码且只有一帧：这是静态图，丢弃请求。
+            if frames is not None:
+                # Decoded and single-frame: a still, so nothing to keep.
+                # 已解码且只有一帧：静态图，无需保留任何东西。
+                self._forget_request(sticker_id)
+                self.unregister(sticker_id)
+            else:
+                # Still decoding. Only the PLAYBACK bookkeeping is cleared; the request must
+                # survive,
+                # or the queued job would be judged unwanted and the card would never animate.
+                # 仍在解码。只清除"播放"记账，请求必须存活，否则排队的任务会被判为无人需要、卡片永不
+                # 动画。
+                self._drop_registration(sticker_id)
             return 0
-        self._paths[sticker_id] = path
+        # Pin ONCE per (card, path) pair, not once per `register` call.
+        #
+        # `register` is called again whenever a delegate re-binds, so an unconditional `pin` leaked
+        # a
+        # reference on every call while `unregister` released exactly one: after deleting every card
+        # the animation count was correctly 0 but the store still considered three paths pinned, and
+        # a
+        # path that is always pinned is never evictable - the budget quietly stops applying.
+        #
+        # Re-recording the SAME path is idempotent; switching to a different path releases the old
+        # pin
+        # (only if no other card still shows that file).
+        # 每对 (卡片, 路径) 只固定"一次"，而不是每次 `register` 调用都固定。
+        #
+        # 委托重新绑定时会再次调用 `register`，因此无条件的 `pin` 会在每次调用时泄漏一个引用，而
+        # `unregister` 只释放一个：删掉所有卡片后动画计数正确地归零，但存储仍认为有三条路径被固定，
+        # 而永远被固定的路径永不可淘汰——预算就这样悄悄失效了。
+        #
+        # 重新记录"同一"路径是幂等的；切换到不同路径时才释放旧的固定（且仅在没有其他卡片仍显示该文件时）。
+        previous = self._paths.get(sticker_id)
+        if previous != path:
+            STORE.pin(path)
+            self._paths[sticker_id] = path
+            self._remember_wanted()
+            if previous and previous not in self._paths.values():
+                STORE.unpin(previous)
         self._counts[sticker_id] = len(frames)
         self._indices.setdefault(sticker_id, 0)
         self._started.setdefault(sticker_id, time.monotonic())
@@ -798,13 +1033,41 @@ class StickerAnimator(QObject):
     @Slot(int)
     def unregister(self, sticker_id):
         sticker_id = int(sticker_id)
+        # The request is dropped even when the card never reached `_paths`, because a card that is
+        # still
+        # waiting for its decode must stop counting as "wanted" the moment it scrolls away -
+        # otherwise its
+        # queued job would decode frames nobody displays.
+        # 即使卡片从未进入 `_paths` 也要丢弃请求，因为仍在等待解码的卡片一旦滚出视野就必须停止计入
+        # "被需要"——否则它排队的任务会解码出没人显示的帧。
+        self._forget_request(sticker_id)
+        self._drop_registration(sticker_id)
+
+    def _drop_registration(self, sticker_id):
+        # Clear the PLAYBACK state for a card, without touching its request.
+        #
+        # The two are deliberately separate: `unregister` means "this card is gone", while the
+        # pending
+        # decode path means "this card is still waiting, forget any playback state it had".
+        # Conflating
+        # them is what made the first version drop the request it had just recorded.
+        # 清除某张卡片的"播放"状态，不触碰它的请求。
+        #
+        # 两者刻意分开：`unregister` 表示"这张卡片走了"，而待解码路径表示"这张卡片仍在等待，但它此前
+        # 的播放状态可以丢弃"。把它们混为一谈，正是第一版丢掉自己刚记录的请求的原因。
         if sticker_id not in self._paths:
             return
-        self._paths.pop(sticker_id, None)
+        path = self._paths.pop(sticker_id, None)
         self._counts.pop(sticker_id, None)
         self._delays.pop(sticker_id, None)
         self._indices.pop(sticker_id, None)
         self._started.pop(sticker_id, None)
+        # Only when no OTHER card still shows the same file - the pin is reference counted, and
+        # unpinning early would let an animation still on screen be evicted.
+        # 仅当"没有其他"卡片仍显示同一文件时——固定是引用计数的，提前解除会让仍在屏幕上的动画被淘汰。
+        if path and path not in self._paths.values():
+            STORE.unpin(path)
+            self._remember_wanted()
         if sticker_id in self._registrations:
             self._registrations.remove(sticker_id)
         if not self._paths:
@@ -815,7 +1078,14 @@ class StickerAnimator(QObject):
     def clear(self):
         # Drop every registration, for a group change or a search.
         # 丢弃所有注册，用于分组切换或搜索。
+        # Release the pins this animator holds, or the store would consider every previously playing
+        # animation permanently un-evictable and the budget would stop meaning anything.
+        # 释放本动画器持有的固定，否则存储会认为每个曾播放过的动画都永久不可淘汰，预算将失去意义。
+        for held in set(self._paths.values()):
+            STORE.unpin(held)
         self._paths.clear()
+        self._requests.clear()
+        self._remember_wanted()
         self._counts.clear()
         self._delays.clear()
         self._indices.clear()
@@ -825,6 +1095,33 @@ class StickerAnimator(QObject):
         self.frameChanged.emit()
 
     # ---- playback / 播放 -------------------------------------------------
+
+    def _remember_wanted(self):
+        # Rebuild the pool-thread mirror of "paths someone is waiting for".
+        #
+        # A rebuild rather than an increment/decrement pair: `_paths` is at most a viewport of
+        # entries, so
+        # the copy is trivial, and a counter would have to be kept correct at four separate mutation
+        # sites
+        # - exactly the kind of bookkeeping that drifts and then leaks pins or drops live work.
+        # 重建"有谁在等这些路径"的线程池镜像。
+        #
+        # 用重建而不是增减计数：`_paths` 最多只有一个视口的条目，复制代价可忽略；而计数器需要在四处
+        # 修改点保持正确——那正是会漂移、进而泄漏固定或丢掉活任务的记账方式。
+        with self._wanted_lock:
+            self._wanted = set(self._requests.values())
+
+    def _forget_request(self, sticker_id):
+        # Drop a card's claim on its path, and refresh the pool-thread mirror.
+        # 丢弃某张卡片对路径的占用，并刷新线程池镜像。
+        if self._requests.pop(sticker_id, None) is not None:
+            self._remember_wanted()
+
+    def _is_wanted(self, path):
+        # Called from a pool thread by `_FrameDecoder`.
+        # 由 `_FrameDecoder` 在工作线程中调用。
+        with self._wanted_lock:
+            return path in self._wanted
 
     def _decode_now(self, path):
         # Decode OFF the GUI thread, and return whatever the store already has.
@@ -864,7 +1161,7 @@ class StickerAnimator(QObject):
         if path in self._pending:
             return None
         self._pending.add(path)
-        decoded = animation_decode_async(path, self._card_pixels(), self)
+        decoded = animation_decode_async(path, self._card_pixels(), self, self._is_wanted)
         return decoded
 
     def _card_pixels(self):

@@ -542,6 +542,45 @@ class SettingsRowModel(QAbstractListModel):
         self.valueEdited.emit(field, value)
 
     @Slot()
+    def commitValue(self, field, value):
+        # Write ONE field and apply it immediately, without touching other drafts.
+        #
+        # # Why `setValue` alone is not enough
+        #
+        # `setValue` deliberately only buffers into `_pending` - that is the whole contract behind
+        # the
+        # settings dialog's 应用/取消 buttons. The Ctrl+wheel card zoom called `setValue` and stopped
+        # there, so the gesture wrote a DRAFT that nothing ever committed: the grid reads the
+        # APPLIED
+        # setting, saw no change, and the feature looked completely dead even though the value was
+        # being adjusted correctly under the hood.
+        #
+        # # Why not just call `applyPending`
+        #
+        # Because that commits EVERY draft, including unsaved edits in an open settings window - a
+        # wheel scroll over the library would silently apply them. So the other drafts are saved,
+        # this one field is coerced and committed on its own, and the rest are put back.
+        #
+        # 写入"一个"字段并立即应用，不触碰其他草稿。
+        #
+        # # 为什么只用 `setValue` 不够
+        #
+        # `setValue` 刻意只写入 `_pending` 缓冲——那正是设置对话框"应用/取消"按钮的全部契约。
+        # Ctrl+滚轮缩放调用了 `setValue` 就停在那里，于是这个手势写下一份从未被提交的"草稿"：网格
+        # 读的是"已应用"的设置，看不到变化，功能看起来完全失效——尽管底层数值其实被正确调整了。
+        #
+        # # 为什么不直接调用 `applyPending`
+        #
+        # 因为那会提交"所有"草稿，包括打开的设置窗口里未保存的编辑——在素材库上滚一下滚轮就会静默
+        # 应用它们。因此这里先保存其他草稿，只对这一个字段做强制转换并提交，然后把其余放回。
+        saved = dict(self._pending)
+        self._pending = {}
+        self.setValue(field, value)
+        self.applyPending()
+        self._pending = saved
+        self._effective = schema.from_mapping(self._current_values())
+        self._revision += 1
+
     def applyPending(self):
         # Commit every pending edit to the store in ONE pass, so the backend sees
         # a single settings change (and fires one notification) for 确认/应用.
