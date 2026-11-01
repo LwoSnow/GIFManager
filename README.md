@@ -1,3 +1,6 @@
+The 2.0.0 version of the program is still under development. The old README file is currently displayed.
+
+---
 # GIFManager
 
 A lightweight sticker (emoji/GIF) manager for Windows, built with **PySide6 (Qt 6)**.
