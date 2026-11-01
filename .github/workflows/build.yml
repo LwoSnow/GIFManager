@@ -1,82 +1,113 @@
-# GitHub Actions — 手动构建 Windows 发布包
-#
-# 触发方式：
-#   GitHub 仓库页面 → Actions → "Build Windows Package" → Run workflow
-#   （可在输入框中指定版本号，默认 1.0.2）
-#
-# 产物（在 workflow 运行结果页的 Artifacts 中下载）：
-#   - release/GIFManager-<version>-win64.zip        便携压缩包（解压即用）
-#   - release/GIFManager-Setup-<version>.exe        Inno Setup 安装包
-#
-# 本地复现：
-#   pip install -r requirements.txt pyinstaller
-#   pyinstaller --noconfirm --clean GIFManager.spec
+name: build
 
-name: Build Windows Package
+# Build and check on all three target systems.
+#
+# The whole point of this refactor is that the non-Qt layers run everywhere, so
+# the matrix runs the LAYER CHECK and the pure-Python tests on every platform.
+# Only the Qt shell needs a display, and it uses the offscreen platform plugin so
+# no virtual framebuffer is required.
+#
+# 在三个目标系统上构建并检查。
+#
+# 这次重构的全部意义就在于非 Qt 各层可以在任何系统上运行，因此矩阵在每个平台上都跑
+# 分层检查与纯 Python 测试。只有 Qt 外壳需要显示器，而它使用离屏平台插件，因此无需
+# 虚拟帧缓冲。
 
 on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Release version used to name the artifacts, e.g. 1.0.2"
-        required: false
-        default: "1.0.2"
 
-permissions:
-  contents: read
+env:
+  PYTHONUTF8: "1"
+  QT_QPA_PLATFORM: offscreen
 
 jobs:
-  build-windows:
-    name: Build installer + zip (Windows)
-    runs-on: windows-latest
+  check:
+    name: check (${{ matrix.os }} / py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            python: "3.12"
+            artifact: GIFManager-windows
+          - os: macos-latest
+            python: "3.12"
+            artifact: GIFManager-macos
+          - os: ubuntu-latest
+            python: "3.12"
+            artifact: GIFManager-linux
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python / 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install dependencies / 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      # Runs FIRST because it needs no dependencies at all: a layering violation
+      # is a design error, not a runtime one, and catching it before a three-minute
+      # Qt install gives faster feedback.
+      # 最先运行，因为它完全不需要依赖：分层违规是设计错误而非运行时错误，在耗时数分钟
+      # 的 Qt 安装之前发现它能更快给出反馈。
+      - name: Verify layering / 校验分层
+        run: python tools/check_layers.py
+
+      - name: Verify style / 校验风格
+        run: python tools/check_style.py gifmanager apps tests tools
+
+      - name: Run tests / 运行测试
+        run: python -m unittest discover -s tests -t . -p "test_*.py"
+
+      - name: Smoke-test the Qt shell / Qt 外壳冒烟测试
+        run: python tests/smoke_qt.py
+
+  package:
+    name: package (${{ matrix.os }})
+    needs: check
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: GIFManager-windows
+          - os: macos-latest
+            artifact: GIFManager-macos
+          - os: ubuntu-latest
+            artifact: GIFManager-linux
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python / 配置 Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install dependencies / 安装依赖
         run: |
-          pip install -r requirements.txt
-          pip install pyinstaller
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
 
-      - name: Build with PyInstaller (onedir)
-        run: pyinstaller --noconfirm --clean GIFManager.spec
+      - name: Build the bundle / 构建打包产物
+        run: python -m PyInstaller --noconfirm --clean packaging/GIFManagerNext.spec
 
-      - name: Prepare release directory
-        shell: pwsh
-        run: New-Item -ItemType Directory -Force release | Out-Null
-
-      - name: Create portable ZIP
-        shell: pwsh
-        run: |
-          Compress-Archive -Path "dist\GIFManager" `
-            -DestinationPath "release\GIFManager-${{ inputs.version }}-win64.zip" -Force
-
-      - name: Install Inno Setup
-        run: choco install innosetup -y --no-progress
-
-      - name: Build installer (Inno Setup)
-        shell: pwsh
-        run: |
-          $iscc = Get-ChildItem "C:\Program Files*\Inno Setup*\ISCC.exe" -ErrorAction SilentlyContinue |
-                  Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
-          if (-not $iscc) {
-            Write-Error "ISCC.exe not found under C:\Program Files*\Inno Setup*"
-            exit 1
-          }
-          & $iscc "/DMyAppVersion=${{ inputs.version }}" "installer\GIFManager.iss"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Upload artifacts
+      - name: Upload the bundle / 上传打包产物
         uses: actions/upload-artifact@v4
         with:
-          name: GIFManager-${{ inputs.version }}
-          path: |
-            release/GIFManager-${{ inputs.version }}-win64.zip
-            release/GIFManager-Setup-${{ inputs.version }}.exe
+          name: ${{ matrix.artifact }}
+          path: dist/GIFManager
           if-no-files-found: error

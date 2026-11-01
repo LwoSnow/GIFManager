@@ -1,0 +1,76 @@
+[package]
+name = "gifmanager_native"
+version = "1.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Native image pipeline for GIFManager: GIF frame decoding and thumbnail scaling"
+license = "MIT"
+
+# `cdylib` produces a plain shared library (DLL/SO/dylib) with a C ABI, which the
+# Python side loads through `ctypes`.
+#
+# `cdylib` 产出带 C ABI 的普通共享库（DLL/SO/dylib），Python 侧通过 `ctypes` 加载。
+#
+# Why a C ABI rather than PyO3: the binding would otherwise be tied to one CPython
+# ABI, which would make the library useless to the other Python versions the
+# project supports and would add a build-time dependency on `maturin`. A C ABI
+# keeps the boundary explicit, lets the same binary serve any 3.10+ interpreter,
+# and means a contributor without the Rust toolchain simply runs the pure-Python
+# fallback path instead of being unable to start the application.
+#
+# 为什么用 C ABI 而非 PyO3：否则绑定会被绑到某一个 CPython ABI 上，使本库对项目支持的
+# 其他 Python 版本无用，并引入对 `maturin` 的构建期依赖。C ABI 让边界保持显式，使同一
+# 个二进制服务于任意 3.10+ 解释器，也意味着没有 Rust 工具链的贡献者只需运行纯 Python
+# 回退路径，而不是无法启动程序。
+[lib]
+name = "gifmanager_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+# GIF container parsing: LZW, palettes, interlacing, local colour tables.
+# GIF 容器解析：LZW、调色板、隔行、局部色彩表。
+gif = "0.13"
+
+# Decoding for the formats a thumbnail may arrive in. The `image` crate's
+# decoders are not faster than Qt's, but they let the whole path — decode, scale,
+# encode — happen in one process without a per-frame copy across the FFI
+# boundary.
+# 缩略图可能遇到的格式的解码。`image` crate 的解码器不比 Qt 快，但它让整条路径
+# ——解码、缩放、输出——在一个进程内完成，且每帧不跨 FFI 边界复制。
+image = { version = "0.25", default-features = false, features = [
+    "gif", "jpeg", "png", "webp", "bmp", "tiff", "ico",
+] }
+
+# SIMD-accelerated resampling (AVX2 / SSE4.1 / NEON). This is the part that is
+# genuinely faster than `QImage.scaled(..., SmoothTransformation)`, which is why
+# scaling lives here rather than staying on the Qt side.
+# SIMD 加速的重采样（AVX2 / SSE4.1 / NEON）。这正是真正比
+# `QImage.scaled(..., SmoothTransformation)` 快的部分，也是缩放放在这里而不是留在
+# Qt 侧的原因。
+fast_image_resize = "5"
+
+# Data-parallel frame scaling. A GIF with 120 frames decodes serially (LZW is
+# inherently sequential) but scales on every core, and the old code did that
+# scaling one frame at a time on one Python thread.
+# 数据并行的逐帧缩放。120 帧的 GIF 串行解码（LZW 本就顺序），但缩放跑满所有核心，
+# 而旧代码在单个 Python 线程上逐帧缩放。
+rayon = "1"
+
+[profile.release]
+# Size and speed together: `lto` removes the cross-crate call overhead that would
+# otherwise sit in the per-frame scaling loop.
+# 体积与速度兼顾：`lto` 去掉否则会留在逐帧缩放循环里的跨 crate 调用开销。
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
+
+# `panic = "unwind"` (the default) is deliberate and must NOT be changed to
+# `abort`: an `abort` inside a library loaded into a Python process kills the
+# interpreter with no traceback and no chance to fall back. Each exported
+# function wraps its body in `catch_unwind`, so a panic becomes a normal error
+# the Python side can log and recover from.
+#
+# `panic = "unwind"`（默认值）是刻意的，绝不可改为 `abort`：在被加载进 Python
+# 进程的库里 `abort` 会杀死解释器，既没有回溯也无法回退。每个导出函数都用
+# `catch_unwind` 包住函数体，使 panic 变成 Python 侧可以记录并恢复的普通错误。

@@ -1,0 +1,47 @@
+// GIFManager Next — niri key binding for showing / hiding the window
+// GIFManager Next——niri 显示/隐藏窗口的键绑定
+//
+// # Why this is the Wayland answer to "global hotkey"
+//
+// Wayland forbids a client from grabbing a key system-wide, and the sanctioned alternative — the
+// XDG `GlobalShortcuts` portal — cannot be driven from PySide6: `BindShortcuts` takes an
+// `a(sa{sv})` argument (array of `(string, dict)` structs) and PySide6 has no way to construct
+// that type (there is no `QMetaType.QDBusArgument`, so `QDBusArgument.beginArray` cannot be given
+// a struct element type). The call fails to marshal before the portal ever sees it.
+//
+// So the compositor owns the binding, exactly as niri's own documentation intends: a key binding
+// runs a command, and that command asks the RUNNING instance to act. Launching with `--toggle`
+// sends one word over the single-instance socket instead of starting a second copy — a second copy
+// would fight over the database.
+//
+// Measured on Arch + niri: with the first instance running, `gifmanager --toggle` hides it and a
+// second `--toggle` shows it again.
+//
+// # 为什么这是 Wayland 上"全局热键"的答案
+//
+// Wayland 禁止客户端系统级抓取按键，而被认可的替代品——XDG `GlobalShortcuts` 门户——无法从
+// PySide6 驱动：`BindShortcuts` 需要 `a(sa{sv})` 参数（`(string, dict)` 结构体的数组），而
+// PySide6 无法构造该类型（没有 `QMetaType.QDBusArgument`，因此 `QDBusArgument.beginArray` 拿不到
+// 结构体元素类型）。该调用在门户看到它之前就编组失败了。
+//
+// 因此绑定归合成器所有，正如 niri 自身文档的意图：一条键绑定运行一条命令，而该命令请"运行中"的实例
+// 行动。以 `--toggle` 启动会经单实例套接字发送一个单词，而不是启动第二份拷贝——第二份会争抢数据库。
+//
+// 在 Arch + niri 上实测：第一个实例运行时，`gifmanager --toggle` 将其隐藏，再 `--toggle` 又显示。
+//
+// ---------------------------------------------------------------------------
+// Add the block below to ~/.config/niri/binds.kdl (or wherever your `binds { ... }` lives).
+// 把下面这块加进 ~/.config/niri/binds.kdl（或你放置 `binds { ... }` 的地方）。
+// Validate with: niri validate -c ~/.config/niri/config.kdl
+// 用 `niri validate -c ~/.config/niri/config.kdl` 校验。
+// ---------------------------------------------------------------------------
+
+binds {
+    // `spawn` runs the command directly, with no shell. That matters here: the executable path
+    // contains a non-ASCII directory name and, in a source checkout, spaces are possible, so
+    // passing the program and its argument as SEPARATE arguments avoids any quoting/word-splitting
+    // question entirely.
+    // `spawn` 直接运行命令、不经 shell。这在此处要紧：可执行文件路径含非 ASCII 目录名，而在源码
+    // 检出里还可能有空格，因此把程序与其参数作为"分开的"参数传递，彻底避开引号与分词问题。
+    Mod+Shift+G { spawn "gifmanager" "--toggle"; }
+}

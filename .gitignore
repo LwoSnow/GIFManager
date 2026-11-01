@@ -1,31 +1,82 @@
-# Python
+# GIFManager Next — ignore rules
+# GIFManager Next——忽略规则
+
+# Byte-compiled / 字节码
 __pycache__/
 *.py[cod]
-.venv/
-venv/
+*$py.class
+*.so
 
-# 构建产物
+# Distribution and packaging / 分发与打包
 build/
 dist/
-release/
-*.spec.bak
+*.egg-info/
+.eggs/
+packaging/build/
+packaging/dist/
 
-# 运行时数据（由程序自动创建）
-data/
-logs/
+# Virtual environments / 虚拟环境
+.venv/
+venv/
+env/
+ENV/
 
-# IDE
+# Editors and IDEs / 编辑器与 IDE
 .idea/
 .vscode/
+*.swp
+*.swo
+*~
 
-# 测试输出
+# Test output / 测试输出
 tests/output/
+.coverage
+htmlcov/
+.pytest_cache/
 
-# QQ 表情测试源（用户数据，不入库）
-Ori/
+# NOTA BENE: the DATA directory, the log directory and the settings file are
+# deliberately NOT listed here. They live in the per-user application data
+# directory (see `core.paths`), not in the tree, so a stray `data/` in a working
+# copy is a bug report worth seeing rather than something to hide.
+# 注意：数据目录、日志目录与设置文件"刻意"不列在此处。它们位于按用户的应用数据目录
+#（见 `core.paths`）而非源码树中，因此工作副本里出现零散的 `data/` 是值得一看的
+# 缺陷线索，而不是应该藏起来的东西。
 
-# 内置二进制（体积大，不入库）
-ffmpeg/
+# A local data directory IS ignored, because `GIFMANAGER_DATA_DIR` can point one
+# here deliberately for a portable run.
+# 本地的数据目录"会"被忽略，因为 `GIFMANAGER_DATA_DIR` 可以为便携运行刻意指向此处。
+/data/
 
-# 其他本地配置
-.reasonix/
+# Optional bundled binaries: large, licensed separately, and platform specific.
+# 可选的内置二进制：体积大、许可独立且与平台相关。
+resources/ffmpeg/
+resources/*.exe
+resources/libgifdec.so
+resources/libgifdec.dylib
+resources/gifdec.dll
+
+# Cargo's build cache / Cargo 构建缓存
+#
+# The native pipeline is an OPTIONAL build artefact, so its `target` directory is
+# machine-generated intermediate output — hundreds of megabytes of it, including
+# the compiled dependencies. The `.dll`/`.dylib`/`.so` a build produces is found at
+# run time from `native/target/release`, so nothing here needs committing; a
+# release copies the library into `resources/`, which the rules above already
+# ignore for the platform-specific C decoder and would ignore for the Rust one too
+# once it is copied there.
+# 原生管线是"可选"的构建产物，因此其 `target` 目录是机器生成的中间输出——数百 MB，
+# 其中含已编译的依赖。构建产出的 `.dll`/`.dylib`/`.so` 在运行时从
+# `native/target/release` 找到，因此这里没有任何东西需要提交；发布时会把库复制进
+# `resources/`，上面针对平台相关 C 解码器的规则已经忽略它，Rust 的那个一旦被复制过去
+# 同样会被忽略。
+native/target/
+
+# OS noise / 系统噪音
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# The Linux/macOS virtual environment, kept alongside the Windows one when a
+# checkout is shared between operating systems on the same NTFS volume.
+# 与 Windows 那份并存的 Linux/macOS 虚拟环境，用于同一 NTFS 卷被多个操作系统共享的检出。
+.venv-*/

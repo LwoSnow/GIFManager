@@ -1,0 +1,49 @@
+# GIFManager Next — desktop entry
+# GIFManager Next——桌面条目
+#
+# # The file name is load bearing
+#
+# This file MUST be installed as `gifmanager.desktop`, matching `gifmanager.APP_ID`. Three things
+# read that name:
+#
+#   * the XDG portal, to obtain "app info" before it will register the app id. Without it
+#     `Registry.Register` answers "App info not found for 'gifmanager'" and the global-hotkey
+#     session is refused with "An app id is required".
+#   * the compositor, which matches this entry's `StartupWMClass`/app id with the window's
+#     Wayland `app_id`.
+#   * desktop shells, for the launcher icon and the window's grouping.
+#
+# `Exec` is filled in by `scripts/install-desktop-entry.sh`, because an absolute path to the
+# interpreter and the checkout is the only thing that works for a source run.
+#
+# 文件名是承重的。
+#
+# 本文件必须以 `gifmanager.desktop` 安装，与 `gifmanager.APP_ID` 一致。有三处会读这个名字：
+#
+#   * XDG 门户，在注册 app id 之前用它获得"应用信息"。没有它 `Registry.Register` 会回答
+#     "App info not found for 'gifmanager'"，而全局热键会话会以 "An app id is required" 被拒。
+#   * 合成器，用本条目的 `StartupWMClass`/app id 与窗口的 Wayland `app_id` 匹配。
+#   * 桌面外壳，用于启动器图标与窗口分组。
+#
+# `Exec` 由 `scripts/install-desktop-entry.sh` 填入，因为对源码运行而言，解释器与检出目录的
+# 绝对路径是唯一可行的选择。
+
+[Desktop Entry]
+Type=Application
+Name=GIFManager
+GenericName=Emoji and Sticker Manager
+Comment=Send emoji, stickers and animated GIFs to any application
+Keywords=emoji;sticker;gif;gifmanager;
+Exec=gifmanager
+Icon=gifmanager
+Terminal=false
+# One main category only: `desktop-file-validate` warns that "Utility;Graphics;" makes the
+# application appear twice in a menu.
+# 只保留一个主分类：`desktop-file-validate` 提示 "Utility;Graphics;" 会让应用在菜单里出现两次。
+Categories=Utility;
+StartupNotify=true
+StartupWMClass=gifmanager
+# A single main window that hides rather than exits, so it must not be treated as a
+# quit-on-close application by the shell.
+# 一个隐藏而非退出的主窗口，因此外壳不应把它当作"关闭即退出"的应用。
+X-GNOME-UsesNotifications=true

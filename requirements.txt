@@ -1,8 +1,21 @@
-# Runtime dependencies (required for both packaging and running) / 运行时依赖（打包与运行均需要）
-# Versions are pinned: Qt patch releases may change behavior, so avoid pulling
-# inconsistent versions across environments / 锁定版本：Qt 补丁版本可能引入行为变化，避免不同环境拉到不一致版本
+# GIFManager Next — runtime dependencies
+# GIFManager Next——运行时依赖
+#
+# Versions are pinned because Qt patch releases may change behaviour, and an
+# inconsistent Qt version between environments is the hardest class of bug to
+# reproduce. The core, platform and backend layers need NONE of these: they are
+# standard library only, which is what makes them testable without a toolkit.
+# 锁定版本，因为 Qt 补丁版本可能引入行为变化，而环境之间 Qt 版本不一致是最难复现的
+# 一类问题。核心层、平台层与后端层"不需要"其中任何一项：它们只用标准库，这正是它们
+# 能在没有界面工具包的情况下被测试的原因。
+
 PySide6==6.11.1
 shiboken6==6.11.1
-# Pillow: fallback for image-to-GIF conversion when ffmpeg is absent / 无 ffmpeg 时导入图片转 GIF 的回退方案
-# (see app/utils/gif_converter.py) / （见 app/utils/gif_converter.py）
+
+# Pillow: fallback for image-to-GIF conversion when ffmpeg is absent.
+# Core also uses it for format probing and frame counting; without it those paths
+# fall back to an ffmpeg probe, or report "unknown" rather than failing.
+# Pillow：缺少 ffmpeg 时图片转 GIF 的回退方案。
+# 核心层也用它做格式探测与帧数统计；缺少时这些路径回退到 ffmpeg 探测，或如实报告
+# "未知"而不是失败。
 Pillow==12.3.0

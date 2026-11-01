@@ -1,0 +1,35 @@
+# Line-ending policy, so a checkout on any OS round-trips byte-identically.
+#
+# # Why .bat and .cmd MUST be CRLF
+#
+# `cmd.exe` parses a batch file line by line and a LONE LF breaks it: the whole
+# file is read as one line. `tools/check_batch_encoding.py` enforces "pure ASCII +
+# CRLF" for exactly that reason, and it failed intermittently when a checkout on
+# Linux wrote LF endings into `Run.bat` - the diff then showed every line as
+# changed while the content was identical.
+#
+# 行尾策略，使任何操作系统上的检出都能逐字节往返。
+#
+# # 为什么 .bat 与 .cmd 必须是 CRLF
+#
+# `cmd.exe` 逐行解析批处理文件，而"单独的" LF 会让它失效：整个文件被当成一行读取。
+# `tools/check_batch_encoding.py` 正是因此强制"纯 ASCII + CRLF"，而当 Linux 上的检出把 LF
+# 写进 `Run.bat` 时它会间歇性失败——此时 diff 会显示每一行都变了，而内容完全相同。
+
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary artefacts must never be normalised.
+# 二进制产物绝不能做行尾规范化。
+*.png binary
+*.ico binary
+*.jpg binary
+*.gif binary
+*.webp binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.pdb binary

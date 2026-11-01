@@ -1,0 +1,69 @@
+// GIFManager Next — niri window rules
+// GIFManager Next——niri 窗口规则
+//
+// # Why this file exists
+//
+// niri is a SCROLLABLE TILING compositor: a new window joins the scrolling column layout and is
+// sized to fill it. GIFManager is a small, frameless picker with its own toolbar, so being tiled
+// to full height is wrong — it should appear as a floating palette over whatever the user is
+// doing.
+//
+// Wayland deliberately gives a client NO way to ask for this: there is no protocol for "float me",
+// no way to set your own position, and no way to raise yourself above other windows. The policy
+// belongs to the compositor, so it is expressed in the compositor's configuration — this file.
+//
+// The `app-id` this matches comes from `gifmanager.APP_ID`, which the application publishes with
+// `QGuiApplication.setDesktopFileName()` (`frontend/qml/app.py`). Before that call existed the
+// window had an EMPTY app id and NO rule could match it, which is the actual reason the window was
+// always tiled.
+//
+// Install with `scripts/niri-window-rule.sh`, or copy the block below into `~/.config/niri/rules.kdl`
+// by hand. Validate a change with `niri validate -c ~/.config/niri/config.kdl`.
+//
+// # 为什么存在本文件
+//
+// niri 是"可滚动平铺"合成器：新窗口加入滚动列布局并被撑满。GIFManager 是一个带自己工具栏的小型
+// 无边框选取器，被平铺到整屏高度是错的——它应当作为浮动的调色板出现在用户正在做的事情之上。
+//
+// Wayland 刻意不提供让客户端请求此事的途径：没有"让我浮动"的协议，无法设置自身位置，也无法把
+// 自己提升到其他窗口之上。策略属于合成器，因此写在合成器的配置里——也就是本文件。
+//
+// 这里匹配的 `app-id` 来自 `gifmanager.APP_ID`，由应用经
+// `QGuiApplication.setDesktopFileName()` 发布（`frontend/qml/app.py`）。在该调用存在之前，窗口的
+// app id 是"空"的，任何规则都无法匹配——那正是窗口此前总被平铺的真实原因。
+//
+// 用 `scripts/niri-window-rule.sh` 安装，或把下面这段手动复制进 `~/.config/niri/rules.kdl`。
+// 用 `niri validate -c ~/.config/niri/config.kdl` 校验改动。
+
+window-rule {
+    // Anchored so a future `gifmanager-*` helper window is not caught by accident.
+    // 用锚定匹配，使将来可能出现的 `gifmanager-*` 辅助窗口不会被误捕获。
+    match app-id=r"^gifmanager$"
+
+    // Open in the floating layout instead of joining the scrolling column.
+    // 在浮动布局中打开，而不是加入滚动列。
+    open-floating true
+
+    // The application's own default geometry (620x520 in `shell/Main.qml`). Fixed rather than a
+    // proportion so the palette is the same size on every monitor.
+    // 应用自身的默认几何（`shell/Main.qml` 中 620x520）。用固定值而非比例，使调色板在每个显示器上
+    // 尺寸一致。
+    default-column-width { fixed 620; }
+    default-window-height { fixed 520; }
+
+    // Focused, because it was just asked for; not fullscreen or maximised for the same reason the
+    // window floats at all.
+    // 获得焦点，因为它刚被请求打开；不进入全屏或最大化，理由与它之所以浮动相同。
+    open-focused true
+    open-fullscreen false
+}
+
+// Optional: open it near the pointer instead of the centre, which suits a palette better. Uncomment
+// only if you want it — the position is in logical pixels from the chosen reference edge.
+// 可选：在指针附近而非中央打开，更适合调色板。仅在需要时取消注释——位置是相对于所选框的参考边的
+// 逻辑像素。
+//
+// window-rule {
+//     match app-id=r"^gifmanager$"
+//     default-floating-position x=32 y=32 relative-to="bottom-right"
+// }
