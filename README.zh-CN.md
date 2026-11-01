@@ -6,6 +6,8 @@
 
 **[English](README.md)**
 
+<p align="center"><img src="https://count.getloli.com/@Lwogifmanagerreadnums?theme=moebooru" alt="ReadNums"></p>
+
 ---
 
 ## 功能特性
