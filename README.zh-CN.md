@@ -1,3 +1,6 @@
+2.0.0版本程序还在编写中，现展示旧版README文件
+
+---
 # GIFManager
 
 一个轻量的 Windows 表情包管理器，使用 **PySide6（Qt 6）** 构建。
