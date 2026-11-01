@@ -6,6 +6,8 @@ manage them in groups, and send them to any chat window in one click.
 
 **[简体中文](README.zh-CN.md)**
 
+<p align="center"><img src="https://count.getloli.com/@Lwogifmanagerreadnums?theme=moebooru" alt="ReadNums"></p>
+
 ---
 
 ## Features
