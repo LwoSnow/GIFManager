@@ -8,6 +8,7 @@ exercisable without a GUI toolkit.
 此处不导入 PySide6，这正是重点：核心层必须能在没有界面工具包的情况下被演练。
 """
 import os
+import pathlib
 import sys
 import unittest
 
@@ -412,8 +413,19 @@ class FileOpsTests(unittest.TestCase):
             with open(src, "wb") as handle:
                 handle.write(b"GIF89a" + b"\x11" * 10)
             fileops.copy_upgrading_gif(src, dst)
-            self.assertEqual(open(dst, "rb").read(),
-                             open(src, "rb").read())
+            # `Path.read_bytes()` rather than a bare `open(...).read()`. The bare form leaves the
+            # file object
+            # to the garbage collector, and CPython reports it as
+            #     ResourceWarning: unclosed file <_io.BufferedReader name='.../b.gif'>
+            # which puts two warnings in the CI log on every run. A test that leaks handles is also
+            # a poor
+            # example in a project whose point is careful resource handling.
+            # 用 `Path.read_bytes()` 而不是裸的 `open(...).read()`。后者把文件对象交给垃圾回收，CPython 会报
+            #     ResourceWarning: unclosed file <_io.BufferedReader name='.../b.gif'>
+            # 每跑一次就在 CI 日志里留两条警告。一个泄漏句柄的测试，在一个以谨慎处理资源为宗旨的项目里也是
+            # 坏示范。
+            self.assertEqual(pathlib.Path(dst).read_bytes(),
+                             pathlib.Path(src).read_bytes())
 
     def test_remove_dir_retry(self):
         import tempfile

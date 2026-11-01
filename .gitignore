@@ -80,3 +80,6 @@ Desktop.ini
 # checkout is shared between operating systems on the same NTFS volume.
 # 与 Windows 那份并存的 Linux/macOS 虚拟环境，用于同一 NTFS 卷被多个操作系统共享的检出。
 .venv-*/
+
+# CI build logs dropped here for inspection / 放进来查看的 CI 构建日志
+gitwork/

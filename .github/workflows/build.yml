@@ -92,6 +92,33 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
 
+      # The Qt runtime libraries, BEFORE anything imports Qt.
+      #
+      # The first CI run of this job failed on
+      #
+      #     ImportError: libEGL.so.1: cannot open shared object file: No such file or directory
+      #
+      # because `ubuntu-latest` does not ship the GL stack PySide6 links against. The `linux` packaging job
+      # already installed these; this job did not, and it is the one that runs the test suite and the QML
+      # smoke check - both of which import Qt. Installing them here keeps the tests honest instead of relying
+      # on the test class skipping itself.
+      # Qt 运行时库，必须在"任何东西导入 Qt 之前"安装。
+      #
+      # 本任务的第一次 CI 运行失败于
+      #
+      #     ImportError: libEGL.so.1: cannot open shared object file: No such file or directory
+      #
+      # 因为 `ubuntu-latest` 不自带 PySide6 链接的 GL 栈。`linux` 打包任务早已安装这些；本任务没有，而它正是
+      # 跑测试套件与 QML 冒烟检查的那一个——两者都会导入 Qt。在此安装让测试保持"真正跑起来"，而不是依赖测试
+      # 类自我跳过。
+      - name: Install the Qt runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 \
+            libxcb-xkb1 libxcb-render-util0 libxcb-image0 libxi6
+
       # Layering first: it needs no dependencies, so a design error is reported before the Qt install.
       # 先跑分层检查：它不需要任何依赖，因此设计错误会在 Qt 安装之前被报告。
       - name: Verify layering
@@ -371,9 +398,15 @@ jobs:
       # is installed BEFORE the checkout, not after.
       # `archlinux:latest` 是只有 pacman 的裸镜像，而 `actions/checkout` 需要 git，因此工具链要在
       # checkout "之前"安装，而不是之后。
+      # `mesa` provides libEGL, which PySide6's GL integration needs while PyInstaller collects the Qt files.
+      # Without it the bundle step fails inside the container for a reason that has nothing to do with the
+      # package being built.
+      # `mesa` 提供 libEGL，PySide6 的 GL 集成在 PyInstaller 收集 Qt 文件时需要它。缺了它，容器里的打包步骤会
+      # 因为一个与被构建的包毫无关系的原因失败。
       - name: Install the toolchain
         run: |
-          pacman -Syu --noconfirm --needed git python python-pip base-devel
+          pacman -Syu --noconfirm --needed git python python-pip base-devel \
+            mesa libxkbcommon fontconfig dbus libxcb
 
       - uses: actions/checkout@v4
 

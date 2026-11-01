@@ -484,7 +484,41 @@ class QtShellTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        from PySide6.QtWidgets import QApplication
+        # A MISSING SYSTEM LIBRARY IS A SKIP, NOT AN ERROR.
+        #
+        # Importing QtWidgets loads Qt's GL integration, which needs `libEGL.so.1`. A bare Linux
+        # runner does
+        # not ship it, and the first CI run of this suite reported
+        #
+        #     ERROR: setUpClass (tests.integration.test_store_backend_qt.QtShellTests)
+        #     ImportError: libEGL.so.1: cannot open shared object file
+        #
+        # as a test ERROR - which is both wrong (the code is fine) and unhelpful, because an error
+        # in
+        # `setUpClass` hides the other 117 results behind one environment problem. CI installs the
+        # libraries
+        # now, but any developer machine without GL would hit the same thing, so the import is
+        # attempted and
+        # the class skipped with a message that names the culprit.
+        #
+        # 缺系统库应当"跳过"，而不是报错。
+        #
+        # 导入 QtWidgets 会加载 Qt 的 GL 集成，它需要 `libEGL.so.1`。裸 Linux 运行器不带它，本套件第一次在
+        # CI 上运行时报的是
+        #
+        #     ERROR: setUpClass (tests.integration.test_store_backend_qt.QtShellTests)
+        #     ImportError: libEGL.so.1: cannot open shared object file
+        #
+        # 作为一个测试"错误"——这既是错的（代码没问题），也无益，因为 `setUpClass` 出错会把其余 117 个结果
+        # 藏在一个环境问题后面。CI 现在会安装这些库，但任何没有 GL 的开发机都会遇到同一件事，因此这里尝试
+        # 导入，并在失败时跳过整个类，且消息里点名缺的是什么。
+        try:
+            from PySide6.QtWidgets import QApplication
+        except ImportError as error:
+            raise unittest.SkipTest(
+                f"Qt cannot be imported in this environment ({error}); "
+                f"on Debian/Ubuntu install: libegl1 libgl1 libxkbcommon0 libdbus-1-3"
+            ) from error
 
         cls.app = QApplication.instance() or QApplication([])
 
