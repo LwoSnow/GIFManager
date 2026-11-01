@@ -23,6 +23,13 @@
 
 app-id: org.lwosnow.GIFManager
 runtime: org.freedesktop.Platform
+# NOTE: Flathub reports this runtime as end-of-life ("no longer receiving fixes and security
+# updates"). It is kept because it is the version this manifest is known to install with, and the
+# Flatpak job is DISABLED by default (see `.github/workflows/build.yml`). Move to a supported
+# runtime before enabling that job for a release.
+# 注意：Flathub 已把该运行时标记为生命周期结束（"不再接收修复与安全更新"）。保留它是因为本清单
+# 确认能装上的就是这个版本，而 Flatpak 任务是"默认关闭"的（见 workflow）。在为发布启用该任务之前，
+# 请先迁移到受支持的运行时。
 runtime-version: "24.08"
 sdk: org.freedesktop.Sdk
 command: gifmanager
@@ -55,12 +62,18 @@ modules:
       - mkdir -p /app/lib/gifmanager
       - cp -R payload/. /app/lib/gifmanager/
       - chmod +x /app/lib/gifmanager/GIFManager
-      - |
-        cat > /app/bin/gifmanager <<'EOF'
-        #!/bin/sh
-        exec /app/lib/gifmanager/GIFManager "$@"
-        EOF
-        chmod +x /app/bin/gifmanager
+      # `/app/bin` must be created EXPLICITLY, and the launcher installed from a real file.
+      #
+      # The first CI attempt wrote the launcher with an inline heredoc and never created the directory, so
+      # `flatpak-builder` reported
+      #     /bin/sh: line 1: /app/bin/gifmanager: No such file or directory
+      # `install -D` creates the parent directory, which removes the ordering question entirely.
+      # `/app/bin` 必须"显式"创建，启动器也要从真实文件安装。
+      #
+      # 第一次 CI 尝试用内联 heredoc 写启动器且从未创建该目录，于是 `flatpak-builder` 报
+      #     /bin/sh: line 1: /app/bin/gifmanager: No such file or directory
+      # `install -D` 会创建父目录，把顺序问题整个消掉。
+      - install -Dm755 gifmanager.sh /app/bin/gifmanager
       # The desktop file is installed under the name Qt registers as its app id, because the portal looks
       # the entry up BY THAT NAME. It is ALSO installed under the flatpak app id, which is what `flatpak`
       # and software centres list.

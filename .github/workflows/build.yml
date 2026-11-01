@@ -34,6 +34,21 @@ on:
         description: "Publish a GitHub Release with these files / 用这些文件发布 GitHub Release"
         type: boolean
         default: false
+      # Flatpak is OFF by default.
+      #
+      # Its first CI run failed inside `flatpak-builder`, and because it was the LAST step of the linux job,
+      # that failure also discarded the `.deb`, `.AppImage` and `.bin` that had already been built: one
+      # optional format cost three required ones. Flatpak is now its own job, skipped unless asked for, so a
+      # Flatpak problem can never block a release again.
+      # Flatpak 默认"关闭"。
+      #
+      # 它的第一次 CI 运行在 `flatpak-builder` 内失败，而由于它是 linux 任务的"最后一步"，这次失败还顺带
+      # 丢掉了已经构建好的 `.deb`、`.AppImage` 与 `.bin`：一个可选格式赔掉了三个必需格式。现在 Flatpak 是
+      # 独立任务，不主动要求就跳过，因此 Flatpak 的问题再也不会阻塞发布。
+      build_flatpak:
+        description: "Also build the Flatpak (experimental) / 同时构建 Flatpak（实验性）"
+        type: boolean
+        default: false
 
 env:
   PYTHONUTF8: "1"
@@ -342,42 +357,35 @@ jobs:
             "GIFManager-${VERSION}-linux-x86_64.bin" \
             "GIFManager ${VERSION} installer" ./install.sh
 
-      # ------------------------------------------------------------ Flatpak
-      - name: Build the Flatpak
-        run: |
-          set -euo pipefail
-          VERSION="${{ needs.version.outputs.version }}"
-          MANIFEST_DIR=packaging/linux/flatpak
-
-          # The manifest installs a PREBUILT bundle (see its header for why), so the payload and the
-          # small assets are staged beside it.
-          # 该清单安装"预构建"包（理由见其文件头），因此负载与小资产都放在它旁边。
-          rm -rf "$MANIFEST_DIR/payload"
-          cp -R dist/GIFManager "$MANIFEST_DIR/payload"
-          cp packaging/gifmanager.desktop "$MANIFEST_DIR/gifmanager.desktop"
-          cp resources/icons/gifmanager.png "$MANIFEST_DIR/gifmanager.png"
-          cp LICENSE "$MANIFEST_DIR/LICENSE"
-          sed -i "s|__VERSION__|${VERSION}|g; s|__DATE__|$(date -u +%Y-%m-%d)|g" \
-            "$MANIFEST_DIR/org.lwosnow.GIFManager.metainfo.xml"
-
-          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder
-          flatpak remote-add --user --if-not-exists flathub \
-            https://flathub.org/repo/flathub.flatpakrepo
-
-          # `--disable-rofiles-fuse` because the runner's kernel often lacks /dev/fuse.
-          # 用 `--disable-rofiles-fuse`，因为运行器内核通常没有 /dev/fuse。
-          flatpak-builder --user --disable-rofiles-fuse \
-            --install-deps-from=flathub --repo=repo --force-clean \
-            builddir "$MANIFEST_DIR/org.lwosnow.GIFManager.yml"
-          flatpak build-bundle repo "GIFManager-${VERSION}-x86_64.flatpak" org.lwosnow.GIFManager
-
+      # `if: always()` and an explicit file list, because this step is what turns three successful builds into
+      # three downloadable files. The previous version also globbed `*.flatpak`, so removing the Flatpak step
+      # would have made `cp` fail on a missing match and thrown everything away a second time.
+      # `if: always()` 加上显式文件名，因为这一步才是把三次成功构建变成三个可下载文件的地方。上一版还把
+      # `*.flatpak` 一并 glob，因此一旦去掉 Flatpak 步骤，`cp` 就会因匹配不到文件而失败，再次把一切丢掉。
       - name: Collect the artifacts
+        if: always()
         run: |
           mkdir -p out
-          cp *.deb *.AppImage *.bin *.flatpak out/
+          # An explicit `if` rather than `[ -e "$file" ] && cp ...`: GitHub runs steps with `bash -e`, and a
+          # bare AND-list whose test fails returns non-zero. Bash exempts that case (the failure is in a
+          # non-final command of the list), which was verified - but relying on a `set -e` exemption for the
+          # step whose entire job is "never lose a built file" is the wrong kind of clever.
+          # 用显式的 `if`，而不是 `[ -e "$file" ] && cp ...`：GitHub 以 `bash -e` 运行步骤，而条件失败的裸
+          # AND 列表会返回非零。bash 对该情形是豁免的（失败发生在列表的非末尾命令），这一点已实测——但为
+          # 一个"绝不丢掉已构建文件"的步骤去依赖 `set -e` 的豁免规则，属于错误的小聪明。
+          for file in *.deb *.AppImage *.bin; do
+            if [ -e "$file" ]; then
+              cp "$file" out/
+            fi
+          done
           ls -l out
 
+      # `if: always()` so a late failure cannot cost the files that were already built - which is exactly the
+      # damage the removed Flatpak step did on the first run.
+      # `if: always()` 使后续失败不能再赔掉已经构建好的文件——而那正是被移除的 Flatpak 步骤在第一次运行中
+      # 造成的损害。
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: linux
           path: out/*
@@ -452,7 +460,92 @@ jobs:
           path: "*.pkg.tar.zst"
           if-no-files-found: error
 
+  # ------------------------------------------------------------------- flatpak
+  #
+  # OFF BY DEFAULT, and separate from the linux job for a concrete reason: on the first CI run the Flatpak
+  # step failed (`module gifmanager: Child process exited with code 1` - the manifest never created
+  # `/app/bin`), and because it was the last step of that job, the `.deb`, `.AppImage` and `.bin` that had
+  # already been built successfully were never uploaded. One experimental format destroyed three working
+  # ones. The manifest is fixed, but the rule stands: this format must not be able to block a release.
+  #
+  # 默认"关闭"，且与 linux 任务分开，理由很具体：第一次 CI 运行中 Flatpak 步骤失败（
+  # `module gifmanager: Child process exited with code 1`——清单从未创建 `/app/bin`），而由于它是该任务的
+  # 最后一步，已经构建成功的 `.deb`、`.AppImage` 与 `.bin` 全都没被上传。一个实验性格式毁掉了三个可用格式。
+  # 清单已修复，但这条规则仍然成立：这个格式不得有能力阻塞发布。
+  flatpak:
+    name: flatpak
+    needs: [version, verify]
+    if: ${{ inputs.build_flatpak }}
+    runs-on: ubuntu-latest
+    # A failure is reported without failing the run: the format is experimental and its build has not
+    # completed successfully yet.
+    # 失败会被报告，但不会让整轮失败：该格式属实验性，其构建尚未成功过。
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libegl1 libxkbcommon0 libfontconfig1 libdbus-1-3 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 \
+            libxcb-xkb1 libxcb-render-util0 libxcb-image0 libxi6
+
+      - name: Build the bundle
+        run: python -m PyInstaller --noconfirm --clean packaging/GIFManagerQml.spec
+
+      - name: Build the Flatpak
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.version.outputs.version }}"
+          MANIFEST_DIR=packaging/linux/flatpak
+
+          # The manifest installs a PREBUILT bundle (see its header for why), so the payload and the small
+          # assets are staged beside it.
+          # 该清单安装"预构建"包（理由见其文件头），因此负载与小资产都放在它旁边。
+          rm -rf "$MANIFEST_DIR/payload"
+          cp -R dist/GIFManager "$MANIFEST_DIR/payload"
+          cp packaging/gifmanager.desktop "$MANIFEST_DIR/gifmanager.desktop"
+          cp resources/icons/gifmanager.png "$MANIFEST_DIR/gifmanager.png"
+          cp LICENSE "$MANIFEST_DIR/LICENSE"
+          sed -i "s|__VERSION__|${VERSION}|g; s|__DATE__|$(date -u +%Y-%m-%d)|g" \
+            "$MANIFEST_DIR/org.lwosnow.GIFManager.metainfo.xml"
+
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder
+          flatpak remote-add --user --if-not-exists flathub \
+            https://flathub.org/repo/flathub.flatpakrepo
+
+          # `--disable-rofiles-fuse` because the runner's kernel often lacks /dev/fuse.
+          # 用 `--disable-rofiles-fuse`，因为运行器内核通常没有 /dev/fuse。
+          flatpak-builder --user --disable-rofiles-fuse \
+            --install-deps-from=flathub --repo=repo --force-clean \
+            builddir "$MANIFEST_DIR/org.lwosnow.GIFManager.yml"
+          flatpak build-bundle repo "GIFManager-${VERSION}-x86_64.flatpak" org.lwosnow.GIFManager
+          ls -l ./*.flatpak
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak
+          path: "*.flatpak"
+          if-no-files-found: error
+
   # ------------------------------------------------------------------- release
+  #
+  # `flatpak` is deliberately NOT in `needs`: it is optional, and a skipped `needs` job would skip the
+  # release along with it. When the Flatpak build is switched on for real, add it here (and to the download
+  # step's expectations) as part of that change.
+  # `flatpak` 刻意"不"在 `needs` 里：它是可选的，而一个被跳过的 `needs` 任务会让发布一并被跳过。等 Flatpak
+  # 构建真正启用时，再在这次改动里把它加进来。
   release:
     name: release
     needs: [version, windows, linux, arch]
